@@ -14,7 +14,9 @@ import type { Api } from "@earendil-works/pi-ai";
 import {
 	buildMessages,
 	buildTranscript,
+	DEFAULT_ACCEPT_KEY,
 	decideInput,
+	humanizeKey,
 	isPrintable,
 	loadConfig,
 	overlayGhost,
@@ -316,6 +318,36 @@ describe("resolveSuggestionModel", () => {
 		// @ts-expect-error — deliberately malformed
 		const cfg: NextPromptConfig = { model: "claude-haiku" };
 		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual(active);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// acceptKey + humanizeKey
+// ---------------------------------------------------------------------------
+
+describe("acceptKey / humanizeKey", () => {
+	test("DEFAULT_ACCEPT_KEY is \"ctrl+tab\"", () => {
+		expect(DEFAULT_ACCEPT_KEY).toBe("ctrl+tab");
+	});
+
+	test("humanizeKey: ctrl+tab → Ctrl-Tab", () => {
+		expect(humanizeKey("ctrl+tab")).toBe("Ctrl-Tab");
+	});
+
+	test("humanizeKey: tab → Tab", () => {
+		expect(humanizeKey("tab")).toBe("Tab");
+	});
+
+	test("humanizeKey: ctrl+shift+enter → Ctrl-Shift-Enter", () => {
+		expect(humanizeKey("ctrl+shift+enter")).toBe("Ctrl-Shift-Enter");
+	});
+
+	test("humanizeKey: alt+/ → Alt-/", () => {
+		expect(humanizeKey("alt+/")).toBe("Alt-/");
+	});
+
+	test("humanizeKey: empty string → empty", () => {
+		expect(humanizeKey("")).toBe("");
 	});
 });
 
@@ -910,6 +942,31 @@ describe("controller wiring (agent_settled)", () => {
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
+	});
+
+	test("T74d: config acceptKey is passed to the editor", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: "alt+/" }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const acceptKey = (fake.editor as unknown as { acceptKey: string }).acceptKey;
+		expect(acceptKey).toBe("alt+/");
+	});
+
+	test("T74e: no acceptKey config → editor defaults to ctrl+tab", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const acceptKey = (fake.editor as unknown as { acceptKey: string }).acceptKey;
+		expect(acceptKey).toBe("ctrl+tab");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {

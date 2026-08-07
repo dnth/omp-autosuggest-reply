@@ -37,7 +37,15 @@ import {
 	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import {
+	matchesKey,
+	CURSOR_MARKER,
+	truncateToWidth,
+	visibleWidth,
+	type EditorTheme,
+	type KeyId,
+	type TUI,
+} from "@earendil-works/pi-tui";
 import type {
 	Api,
 	AssistantMessage,
@@ -61,6 +69,8 @@ export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
+	/** Key id that accepts the suggestion (e.g. "ctrl+tab", "tab", "alt+enter"). Defaults to "ctrl+tab". */
+	acceptKey?: string;
 	systemPrompt?: string;
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
@@ -98,6 +108,21 @@ export interface SuggestionCtx {
 
 const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
+export const DEFAULT_ACCEPT_KEY = "ctrl+tab";
+
+// ANSI styling for the below-editor widget. Cyan accent for the ↳/next: prefix and
+// the shortcut hint; the suggestion itself is plain (high-contrast default text).
+const ACCENT = "\x1b[36m";
+const DIM = "\x1b[2m";
+const RESET = "\x1b[0m";
+
+/** Humanize a KeyId for display, e.g. "ctrl+tab" → "Ctrl-Tab". */
+export function humanizeKey(key: string): string {
+	return key
+		.split("+")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join("-");
+}
 
 export function loadConfig(cwd: string): NextPromptConfig {
 	const globalPath = join(getAgentDir(), "next-prompt.json");
@@ -489,6 +514,7 @@ class NextPromptEditor extends CustomEditor {
 	lastSuggestion = "";
 	private isIdleGetter: () => boolean;
 	private publishWidget: (content: string[] | undefined) => void;
+	private acceptKey: string;
 
 	constructor(
 		tui: TUI,
@@ -496,15 +522,20 @@ class NextPromptEditor extends CustomEditor {
 		keybindings: KeybindingsManager,
 		isIdleGetter: () => boolean,
 		publishWidget: (content: string[] | undefined) => void,
+		acceptKey: string,
 	) {
 		super(tui, theme, keybindings);
 		this.isIdleGetter = isIdleGetter;
 		this.publishWidget = publishWidget;
+		this.acceptKey = acceptKey;
 	}
 
 	private renderWidget(): void {
 		if (this.ghost) {
-			this.publishWidget([`next: ${this.ghost}  \x1b[2m(Tab to accept)\x1b[22m`]);
+			const hint = humanizeKey(this.acceptKey);
+			this.publishWidget([
+				`${ACCENT}↳ next:${RESET} ${this.ghost}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
+			]);
 		} else {
 			this.publishWidget(undefined);
 		}
@@ -526,31 +557,31 @@ class NextPromptEditor extends CustomEditor {
 		}
 	}
 
-	handleInput(data: string): void {
-		const before = this.getText();
-		const isTab = matchesKey(data, "tab");
-		// Always delegate first so the base editor keeps authority over Tab-autocomplete,
-		// escape, ctrl+d, paste, history, etc.
-		super.handleInput(data);
-		const after = this.getText();
+handleInput(data: string): void {
+const before = this.getText();
+const isAcceptKey = matchesKey(data, this.acceptKey as KeyId);
+// Always delegate first so the base editor keeps authority over Tab-autocomplete,
+// escape, ctrl+d, paste, history, etc.
+super.handleInput(data);
+const after = this.getText();
 
-		const d = decideInput({
-			data,
-			ghost: this.ghost,
-			lastSuggestion: this.lastSuggestion,
-			editorTextBefore: before,
-			editorTextAfter: after,
-			isShowingAutocomplete: this.isShowingAutocomplete(),
-			isTab,
-		});
+const d = decideInput({
+data,
+ghost: this.ghost,
+lastSuggestion: this.lastSuggestion,
+editorTextBefore: before,
+editorTextAfter: after,
+isShowingAutocomplete: this.isShowingAutocomplete(),
+isTab: isAcceptKey,
+});
 
-		if (d.action === "accept" && d.acceptText != null) {
-			this.insertTextAtCursor(d.acceptText);
-		}
-		const changed = this.ghost !== d.ghost;
-		this.ghost = d.ghost;
-		if (changed) this.renderWidget();
-	}
+if (d.action === "accept" && d.acceptText != null) {
+this.insertTextAtCursor(d.acceptText);
+}
+const changed = this.ghost !== d.ghost;
+this.ghost = d.ghost;
+if (changed) this.renderWidget();
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +617,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			const publishWidget = (content: string[] | undefined) => {
 				ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
 			};
-			const editor = new NextPromptEditor(tui, theme, kb, () => ctx.isIdle(), publishWidget);
+			const editor = new NextPromptEditor(
+				tui,
+				theme,
+				kb,
+				() => ctx.isIdle(),
+				publishWidget,
+				config.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			);
 			ref.editor = editor;
 			return editor;
 		});
@@ -603,9 +641,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 
 	// Clear ghost + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => { reset(); });
-	pi.on("turn_start", () => { reset(); });
-	pi.on("agent_start", () => { reset(); });
+	pi.on("input", () => {
+		reset();
+	});
+	pi.on("turn_start", () => {
+		reset();
+	});
+	pi.on("agent_start", () => {
+		reset();
+	});
 
 	pi.on("session_shutdown", () => {
 		reset();
