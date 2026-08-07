@@ -37,15 +37,16 @@ import {
 	type ExtensionContext,
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
-import {
-	CURSOR_MARKER,
-	matchesKey,
-	truncateToWidth,
-	visibleWidth,
-	type EditorTheme,
-	type TUI,
-} from "@earendil-works/pi-tui";
-import type { Api, AssistantMessage, Context, Message, Model, UserMessage } from "@earendil-works/pi-ai";
+import { matchesKey, CURSOR_MARKER, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Message,
+	Model,
+	ThinkingLevel,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,13 +59,13 @@ export interface NextPromptModelConfig {
 
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
+	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
+	thinking?: ThinkingLevel;
 	systemPrompt?: string;
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
 	debounceMs?: number;
 	allowCrossProvider?: boolean;
-	/** Reserved for v2: render the suggestion below the editor instead of inline. */
-	belowEditorFallback?: boolean;
 }
 
 export type TriggerDecision = "compute" | "skip";
@@ -109,14 +110,18 @@ export function loadConfig(cwd: string): NextPromptConfig {
 		try {
 			globalCfg = parseConfig(readFileSync(globalPath, "utf-8"));
 		} catch (err) {
-			console.warn(`next-prompt: failed to read global config ${globalPath}: ${err}`);
+			console.warn(
+				`next-prompt: failed to read global config ${globalPath}: ${err}`,
+			);
 		}
 	}
 	if (existsSync(projectPath)) {
 		try {
 			projectCfg = parseConfig(readFileSync(projectPath, "utf-8"));
 		} catch (err) {
-			console.warn(`next-prompt: failed to read project config ${projectPath}: ${err}`);
+			console.warn(
+				`next-prompt: failed to read project config ${projectPath}: ${err}`,
+			);
 		}
 	}
 	return { ...globalCfg, ...projectCfg };
@@ -125,9 +130,17 @@ export function loadConfig(cwd: string): NextPromptConfig {
 function parseConfig(text: string): NextPromptConfig {
 	// pi-lens-ignore: unchecked-throwing-call
 	const parsed = JSON.parse(text) as NextPromptConfig;
-	if (parsed && typeof parsed !== "object") throw new Error("config is not an object");
-	if (parsed.model != null && (typeof parsed.model !== "object" || typeof parsed.model.provider !== "string" || typeof parsed.model.model !== "string")) {
-		console.warn("next-prompt: config.model must be { provider, model }; ignoring");
+	if (parsed && typeof parsed !== "object")
+		throw new Error("config is not an object");
+	if (
+		parsed.model != null &&
+		(typeof parsed.model !== "object" ||
+			typeof parsed.model.provider !== "string" ||
+			typeof parsed.model.model !== "string")
+	) {
+		console.warn(
+			"next-prompt: config.model must be { provider, model }; ignoring",
+		);
 		return { ...parsed, model: undefined };
 	}
 	return parsed;
@@ -147,10 +160,17 @@ export function resolveSuggestionModel(
 	if (config.model && config.model.provider && config.model.model) {
 		// allowCrossProvider guard: if false and the configured provider differs from the
 		// active one, fall back to the active model silently (do not notify).
-		if (config.allowCrossProvider === false && active && config.model.provider !== active.provider) {
+		if (
+			config.allowCrossProvider === false &&
+			active &&
+			config.model.provider !== active.provider
+		) {
 			return active;
 		}
-		const found = ctx.modelRegistry.find(config.model.provider, config.model.model);
+		const found = ctx.modelRegistry.find(
+			config.model.provider,
+			config.model.model,
+		);
 		if (found) return found;
 		if (!notifiedRef.value) {
 			notifiedRef.value = true;
@@ -216,7 +236,10 @@ function joinAssistantText(content: unknown): string {
 	return parts.join("");
 }
 
-export function buildTranscript(branch: BranchEntry[], config: NextPromptConfig = {}): string {
+export function buildTranscript(
+	branch: BranchEntry[],
+	config: NextPromptConfig = {},
+): string {
 	const max = config.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT;
 	const lines: string[] = [];
 
@@ -252,7 +275,10 @@ export function buildMessages(transcript: string): Message[] {
 // Suggestion sanitization
 // ---------------------------------------------------------------------------
 
-export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): string {
+export function sanitizeSuggestion(
+	raw: string,
+	config: NextPromptConfig = {},
+): string {
 	const max = config.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION;
 	let s = raw.trim();
 
@@ -266,7 +292,11 @@ export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): 
 	if (s.length >= 2) {
 		const first = s[0]!;
 		const last = s[s.length - 1]!;
-		if ((first === '"' && last === '"') || (first === "'" && last === "'") || (first === "`" && last === "`")) {
+		if (
+			(first === '"' && last === '"') ||
+			(first === "'" && last === "'") ||
+			(first === "`" && last === "`")
+		) {
 			s = s.slice(1, -1).trim();
 		}
 	}
@@ -282,7 +312,8 @@ export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): 
 
 	// Cap at a grapheme-safe boundary; truncateToWidth appends a trailing \x1b[0m reset,
 	// strip it so the suggestion is clean text.
-	if (visibleWidth(s) > max) s = truncateToWidth(s, max, "").replace(/\x1b\[[0-9;]*m$/g, "");
+	if (visibleWidth(s) > max)
+		s = truncateToWidth(s, max, "").replace(/\x1b\[[0-9;]*m$/g, "");
 	return s;
 }
 
@@ -302,7 +333,8 @@ export function shouldTrigger(
 		const entry = branch[i]!;
 		if (entry.type === "message" && entry.message) {
 			const msg = entry.message;
-			if (msg.role === "assistant" && msg.stopReason === "stop") return "compute";
+			if (msg.role === "assistant" && msg.stopReason === "stop")
+				return "compute";
 			return "skip";
 		}
 	}
@@ -322,9 +354,17 @@ export function decideInput(opts: {
 	isShowingAutocomplete: boolean;
 	isTab: boolean;
 }): InputDecision {
-	const { ghost, lastSuggestion, editorTextBefore, editorTextAfter, isShowingAutocomplete, isTab } = opts;
+	const {
+		ghost,
+		lastSuggestion,
+		editorTextBefore,
+		editorTextAfter,
+		isShowingAutocomplete,
+		isTab,
+	} = opts;
 
-	const backspaceToEmpty = editorTextBefore.length > 0 && editorTextAfter.length === 0;
+	const backspaceToEmpty =
+		editorTextBefore.length > 0 && editorTextAfter.length === 0;
 
 	// 1. Accept on Tab, but only when autocomplete is NOT open (so we never clobber
 	//    /template or path completion).
@@ -337,7 +377,10 @@ export function decideInput(opts: {
 		// The editor text may have changed (e.g. the printable char was inserted, or
 		// escape did nothing). Re-arm check below only applies when text became empty.
 		const newGhost = backspaceToEmpty && lastSuggestion ? lastSuggestion : "";
-		return { action: backspaceToEmpty && lastSuggestion ? "rearm" : "dismiss", ghost: newGhost };
+		return {
+			action: backspaceToEmpty && lastSuggestion ? "rearm" : "dismiss",
+			ghost: newGhost,
+		};
 	}
 	// 3. No ghost: re-arm if the user just backspaced down to empty and we have a
 	//    cached suggestion.
@@ -366,7 +409,11 @@ const DIM_START = "\x1b[2m";
 const DIM_END = "\x1b[22m";
 const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor
 
-export function overlayGhost(lines: string[], ghost: string, width: number): string[] {
+export function overlayGhost(
+	lines: string[],
+	ghost: string,
+	width: number,
+): string[] {
 	if (!ghost || lines.length === 0) return lines;
 
 	// Find the cursor line by locating CURSOR_MARKER. Bail if unfocused (no marker).
@@ -386,7 +433,10 @@ export function overlayGhost(lines: string[], ghost: string, width: number): str
 	// Locate the first \x1b[0m after the CURSOR_MARKER to find the end of the cursor block.
 	const markerIdx = line.indexOf(CURSOR_MARKER);
 	if (markerIdx === -1) return lines; // defensive (already checked)
-	const cursorBlockEnd = line.indexOf(CURSOR_BLOCK_END, markerIdx + CURSOR_MARKER.length);
+	const cursorBlockEnd = line.indexOf(
+		CURSOR_BLOCK_END,
+		markerIdx + CURSOR_MARKER.length,
+	);
 	if (cursorBlockEnd === -1) return lines; // unexpected structure; leave unchanged
 	const insertAt = cursorBlockEnd + CURSOR_BLOCK_END.length;
 
@@ -398,14 +448,25 @@ export function overlayGhost(lines: string[], ghost: string, width: number): str
 	const trailingPart = line.slice(insertAt);
 	// Strip trailing whitespace (the padding the base editor appends) to measure real width.
 	const trailingTrimmed = trailingPart.replace(/\s+$/, "");
-	const leftVisible = visibleWidth(stripAnsi(leftPart) + stripAnsi(trailingTrimmed));
+	const leftVisible = visibleWidth(
+		stripAnsi(leftPart) + stripAnsi(trailingTrimmed),
+	);
 	const remaining = Math.max(0, contentWidth - leftVisible);
 
-	const ghostSlice = visibleWidth(ghost) > remaining ? truncateToWidth(ghost, remaining, "") : ghost;
+	const ghostSlice =
+		visibleWidth(ghost) > remaining
+			? truncateToWidth(ghost, remaining, "")
+			: ghost;
 	if (!ghostSlice) return lines; // nothing fits
 
 	const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
-	const newLine = leftPart + ghostStyled + trailingTrimmed + " ".repeat(Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)));
+	const newLine =
+		leftPart +
+		ghostStyled +
+		trailingTrimmed +
+		" ".repeat(
+			Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)),
+		);
 	result[cursorLineIdx] = newLine;
 	return result;
 }
@@ -413,26 +474,40 @@ export function overlayGhost(lines: string[], ghost: string, width: number): str
 /** Strip ANSI escape sequences for width measurement. */
 function stripAnsi(s: string): string {
 	// eslint-disable-next-line no-control-regex
-	return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").replace(/\x1b[2-]m/g, "").replace(CURSOR_MARKER, "");
+	return s
+		.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+		.replace(/\x1b[2-]m/g, "")
+		.replace(CURSOR_MARKER, "");
 }
 
 // ---------------------------------------------------------------------------
-// Editor component (thin shell over decideInput + overlayGhost)
+// Editor component (thin shell over decideInput; suggestion shown via setWidget)
 // ---------------------------------------------------------------------------
 
 class NextPromptEditor extends CustomEditor {
 	ghost = "";
 	lastSuggestion = "";
 	private isIdleGetter: () => boolean;
+	private publishWidget: (content: string[] | undefined) => void;
 
 	constructor(
 		tui: TUI,
 		theme: EditorTheme,
 		keybindings: KeybindingsManager,
 		isIdleGetter: () => boolean,
+		publishWidget: (content: string[] | undefined) => void,
 	) {
 		super(tui, theme, keybindings);
 		this.isIdleGetter = isIdleGetter;
+		this.publishWidget = publishWidget;
+	}
+
+	private renderWidget(): void {
+		if (this.ghost) {
+			this.publishWidget([`next: ${this.ghost}  \x1b[2m(Tab to accept)\x1b[22m`]);
+		} else {
+			this.publishWidget(undefined);
+		}
 	}
 
 	setGhost(text: string): void {
@@ -440,14 +515,14 @@ class NextPromptEditor extends CustomEditor {
 		if (this.getText().length === 0 && this.isIdleGetter()) {
 			this.ghost = text;
 			this.lastSuggestion = text;
-			this.tui?.requestRender();
+			this.renderWidget();
 		}
 	}
 
 	clearGhost(): void {
 		if (this.ghost) {
 			this.ghost = "";
-			this.tui?.requestRender();
+			this.renderWidget();
 		}
 	}
 
@@ -472,12 +547,9 @@ class NextPromptEditor extends CustomEditor {
 		if (d.action === "accept" && d.acceptText != null) {
 			this.insertTextAtCursor(d.acceptText);
 		}
+		const changed = this.ghost !== d.ghost;
 		this.ghost = d.ghost;
-		this.tui?.requestRender();
-	}
-
-	render(width: number): string[] {
-		return overlayGhost(super.render(width), this.ghost, width);
+		if (changed) this.renderWidget();
 	}
 }
 
@@ -511,7 +583,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		reset();
 		config = loadConfig(ctx.cwd);
 		ctx.ui.setEditorComponent((tui, theme, kb) => {
-			const editor = new NextPromptEditor(tui, theme, kb, () => ctx.isIdle());
+			const publishWidget = (content: string[] | undefined) => {
+				ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
+			};
+			const editor = new NextPromptEditor(tui, theme, kb, () => ctx.isIdle(), publishWidget);
 			ref.editor = editor;
 			return editor;
 		});
@@ -519,7 +594,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_settled", async (_e, ctx) => {
 		try {
-			if (!ref.editor || !ctx.isIdle() || ref.editor.getText().length > 0) return;
+			if (!ref.editor || !ctx.isIdle() || ref.editor.getText().length > 0)
+				return;
 			await maybeCompute(ctx);
 		} catch (err) {
 			console.warn("next-prompt: agent_settled handler failed", err);
@@ -541,7 +617,13 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const ac = new AbortController();
 		ref.inflight = ac;
 
-		if (shouldTrigger(ctx.sessionManager.getBranch(), ctx.isIdle(), ref.editor!.getText()) !== "compute") {
+		if (
+			shouldTrigger(
+				ctx.sessionManager.getBranch(),
+				ctx.isIdle(),
+				ref.editor!.getText(),
+			) !== "compute"
+		) {
 			return;
 		}
 		const model = resolveSuggestionModel(ctx, config, notifiedFallback);
@@ -556,7 +638,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		let resp: AssistantMessage;
 		try {
-			resp = await ctx.modelRegistry.complete(model, context, { signal: ac.signal });
+			resp = await ctx.modelRegistry.complete(model, context, {
+				signal: ac.signal,
+				reasoning: config.thinking,
+			});
 		} catch (err) {
 			if (!ac.signal.aborted) {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
