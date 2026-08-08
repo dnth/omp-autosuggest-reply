@@ -1,6 +1,7 @@
-// Ambient shim so the TypeScript LSP can resolve `bun:test` without a local
-// @types/bun install. Bun provides these at runtime; this only satisfies the
-// type-checker for editor diagnostics. Do not import this from source code.
+// Ambient shim for `bun:test` typings. @types/bun is now a devDependency that
+// provides these at type-check time; this shim remains as a belt-and-suspenders
+// fallback for editors that cannot resolve the package. Do not import this from
+// source code.
 declare module "bun:test" {
 	export function describe(name: string, fn: () => void): void;
 	export function test(name: string, fn: () => void | Promise<void>): void;

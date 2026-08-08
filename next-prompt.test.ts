@@ -1,7 +1,8 @@
 /**
- * Unit tests for next-prompt.ts — 92 tests covering every pure helper, the
- * decideInput brain, overlayGhost rendering, and the controller wiring
- * (with a fake ExtensionAPI firing `agent_settled`).
+ * Unit tests for next-prompt.ts covering every pure helper, the terminal
+ * sanitizer, overlayGhost rendering, config validation/trust, destination
+ * consent, and the controller wiring (with a fake ExtensionAPI firing
+ * lifecycle events and terminal input).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -10,6 +11,8 @@ import {
 	mkdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -22,17 +25,18 @@ import {
 	buildTranscript,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
-	decideInput,
+	destinationOf,
 	formatModelOption,
 	humanizeKey,
-	isPrintable,
 	loadConfig,
+	loadEffectiveConfig,
 	matchesAcceptKeyRaw,
 	overlayGhost,
 	parseModelOption,
 	redactSecrets,
 	resolveSuggestionModel,
 	sanitizeSuggestion,
+	sanitizeTerminalText,
 	saveConfig,
 	shouldTrigger,
 	SYSTEM_PROMPT,
@@ -119,13 +123,17 @@ function toolResultEntry(): BranchEntry {
 }
 
 function makeCtx(opts: {
-	model?: { provider: string; id: string };
+	model?: { provider: string; id: string; baseUrl?: string };
 	findModel?: (provider: string, modelId: string) => unknown;
 	notify?: (m: string, t?: "info" | "warning" | "error") => void;
 	branch?: BranchEntry[];
 }): SuggestionCtx {
 	const model = (opts.model
-		? { provider: opts.model.provider, id: opts.model.id }
+		? {
+				provider: opts.model.provider,
+				id: opts.model.id,
+				baseUrl: opts.model.baseUrl,
+			}
 		: undefined) as never as
 		| import("@earendil-works/pi-ai").Model<Api>
 		| undefined;
@@ -216,7 +224,7 @@ describe("loadConfig", () => {
 		writeFile(
 			tmpHome,
 			"next-prompt.json",
-			JSON.stringify({ maxTranscriptChars: 111 }),
+			JSON.stringify({ maxTranscriptChars: 1111 }),
 		);
 		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
 		writeFile(
@@ -225,9 +233,167 @@ describe("loadConfig", () => {
 			JSON.stringify({ maxSuggestionChars: 222 }),
 		);
 		const cfg = loadConfig(cwd);
-		expect(cfg.maxTranscriptChars).toBe(111); // from global (getAgentDir)
+		expect(cfg.maxTranscriptChars).toBe(1111); // from global (getAgentDir)
 		expect(cfg.maxSuggestionChars).toBe(222); // from project (.pi)
 		rmSync(cwd, { recursive: true, force: true });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// destinationOf / sameDestination / consent
+// ---------------------------------------------------------------------------
+
+describe("destination identity", () => {
+	test("D1: provider-only identity when no baseUrl", () => {
+		expect(destinationOf({ provider: "openai" })).toEqual({
+			provider: "openai",
+			origin: "",
+		});
+	});
+	test("D2: identity includes endpoint origin", () => {
+		expect(
+			destinationOf({
+				provider: "openai",
+				baseUrl: "https://api.example.com/v1",
+			}),
+		).toEqual({ provider: "openai", origin: "https://api.example.com" });
+	});
+	test("D3: same origin with different path/padding is the same destination", () => {
+		const a = destinationOf({
+			provider: "openai",
+			baseUrl: "https://api.example.com/v1/",
+		});
+		const b = destinationOf({
+			provider: "openai",
+			baseUrl: "https://api.example.com/v2",
+		});
+		expect(a).toEqual(b);
+	});
+	test("D4: undefined model → undefined destination", () => {
+		expect(destinationOf(undefined)).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// loadEffectiveConfig: trust gating + policy floors (F-02)
+// ---------------------------------------------------------------------------
+
+describe("loadEffectiveConfig", () => {
+	test("F1: untrusted project config is ignored entirely", () => {
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ acceptKey: "ctrl+space" }));
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ model: { provider: "openai", model: "gpt" }, allowCrossProvider: true }),
+		);
+		const eff = loadEffectiveConfig(cwd, { projectTrusted: false });
+		expect(eff.projectTrusted).toBe(false);
+		expect(eff.model).toBeUndefined();
+		expect(eff.acceptKey).toBe("ctrl+space");
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F2: global allowCrossProvider=false is a floor the project cannot loosen", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ allowCrossProvider: false }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ allowCrossProvider: true }),
+		);
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.allowCrossProvider).toBe(false);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F3: project may tighten allowCrossProvider to false", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ allowCrossProvider: true }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ allowCrossProvider: false }),
+		);
+		expect(loadEffectiveConfig(cwd).allowCrossProvider).toBe(false);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F4: project cannot increase a global transcript cap", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: 1000 }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: 50000 }),
+		);
+		expect(loadEffectiveConfig(cwd).maxTranscriptChars).toBe(1000);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F5: project may reduce the transcript cap", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: 10000 }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: 500 }),
+		);
+		expect(loadEffectiveConfig(cwd).maxTranscriptChars).toBe(500);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F6: invalid privacy field in global config fails closed (computeDisabled)", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: "unlimited" }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		expect(loadEffectiveConfig(cwd).computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F7: invalid non-privacy field is dropped without disabling compute", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "sideways", maxSuggestionChars: 5 }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(false);
+		expect(eff.renderMode).toBeUndefined();
+		expect(eff.maxSuggestionChars).toBe(5);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F8: numeric acceptKey is dropped and cannot reach matchesKey", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: 7 }),
+		);
+		const eff = loadEffectiveConfig(
+			mkdtempSync(join(tmpdir(), "np-cwd-")),
+		);
+		expect(eff.acceptKey).toBeUndefined();
 	});
 });
 
@@ -240,19 +406,19 @@ describe("resolveSuggestionModel", () => {
 		model: { provider, model },
 	});
 
-	test("T8: configured model present in registry returns it", () => {
-		const configured = { provider: "anthropic", id: "claude-haiku" };
+	test("T8: configured model on the SAME destination as active is returned (no cross flag)", () => {
+		const configured = { provider: "openai", id: "gpt-4o" };
 		const ctx = makeCtx({
 			model: { provider: "openai", id: "gpt" },
 			findModel: (p, m) =>
-				p === "anthropic" && m === "claude-haiku" ? configured : undefined,
+				p === "openai" && m === "gpt-4o" ? configured : undefined,
 		});
 		const out = resolveSuggestionModel(
 			ctx,
-			cfgModel("anthropic", "claude-haiku"),
+			cfgModel("openai", "gpt-4o"),
 			{ value: false },
 		);
-		expect(out).toEqual(configured);
+		expect(out).toEqual({ model: configured, crossDestination: false });
 	});
 
 	test("T9: configured model absent returns ctx.model and notifies once (warning)", () => {
@@ -265,7 +431,7 @@ describe("resolveSuggestionModel", () => {
 		const out = resolveSuggestionModel(ctx, cfgModel("anthropic", "missing"), {
 			value: false,
 		});
-		expect(out).toEqual(active);
+		expect(out).toEqual({ model: active, crossDestination: false });
 		expect(notifies).toHaveLength(1);
 		expect(notifies[0]![1]).toBe("warning");
 		expect(notifies[0]![0]).toContain("not found");
@@ -276,22 +442,25 @@ describe("resolveSuggestionModel", () => {
 		const notifies: string[] = [];
 		const ctx = makeCtx({ model: active, notify: (m) => notifies.push(m) });
 		const out = resolveSuggestionModel(ctx, {}, { value: false });
-		expect(out).toEqual(active);
+		expect(out).toEqual({ model: active, crossDestination: false });
 		expect(notifies).toHaveLength(0);
 	});
 
-	test("T11: no config + ctx.model undefined returns undefined", () => {
+	test("T11: no config + ctx.model undefined returns undefined model", () => {
 		const ctx = makeCtx({ model: undefined as never });
-		expect(resolveSuggestionModel(ctx, {}, { value: false })).toBeUndefined();
+		expect(resolveSuggestionModel(ctx, {}, { value: false })).toEqual({
+			model: undefined,
+			crossDestination: false,
+		});
 	});
 
-	test("T12: configured absent AND ctx.model undefined returns undefined (no throw)", () => {
+	test("T12: configured absent AND ctx.model undefined returns undefined model (no throw)", () => {
 		const ctx = makeCtx({ model: undefined as never });
 		expect(
 			resolveSuggestionModel(ctx, cfgModel("anthropic", "missing"), {
 				value: false,
 			}),
-		).toBeUndefined();
+		).toEqual({ model: undefined, crossDestination: false });
 	});
 
 	test("T13: notify-once — calling twice only notifies once", () => {
@@ -304,19 +473,29 @@ describe("resolveSuggestionModel", () => {
 		expect(notifies).toHaveLength(1);
 	});
 
-	test("T14: allowCrossProvider=false + different provider returns ctx.model, no notify", () => {
+	test("T14: allowCrossProvider=false + different destination returns ctx.model, no notify", () => {
 		const active = { provider: "openai", id: "gpt" };
 		const notifies: string[] = [];
-		const ctx = makeCtx({ model: active, notify: (m) => notifies.push(m) });
+		const ctx = makeCtx({
+			model: active,
+			notify: (m) => notifies.push(m),
+			findModel: (p, m) =>
+				p === "anthropic" && m === "claude"
+					? { provider: "anthropic", id: "claude" }
+					: undefined,
+		});
 		const cfg: NextPromptConfig = {
 			model: { provider: "anthropic", model: "claude" },
 			allowCrossProvider: false,
 		};
-		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual(active);
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: active,
+			crossDestination: false,
+		});
 		expect(notifies).toHaveLength(0);
 	});
 
-	test("T15: allowCrossProvider=false + same provider returns configured model", () => {
+	test("T15: allowCrossProvider=false + same destination returns configured model", () => {
 		const configured = { provider: "openai", id: "gpt-4o" };
 		const ctx = makeCtx({
 			model: { provider: "openai", id: "gpt" },
@@ -327,17 +506,78 @@ describe("resolveSuggestionModel", () => {
 			model: { provider: "openai", model: "gpt-4o" },
 			allowCrossProvider: false,
 		};
-		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual(
-			configured,
-		);
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: configured,
+			crossDestination: false,
+		});
 	});
 
-	test("T16: model present but wrong shape is warned + ignored, returns ctx.model", () => {
+	test("T15b: same provider label but different endpoint is a DIFFERENT destination (F-10)", () => {
+		const active = { provider: "openai", id: "gpt", baseUrl: "https://a.example.com/v1" };
+		const configured = {
+			provider: "openai",
+			id: "gpt-4o",
+			baseUrl: "https://b.example.com/v1",
+		};
+		const ctx = makeCtx({
+			model: active,
+			findModel: (p, m) =>
+				p === "openai" && m === "gpt-4o" ? configured : undefined,
+		});
+		const cfg: NextPromptConfig = {
+			model: { provider: "openai", model: "gpt-4o" },
+			allowCrossProvider: false,
+		};
+		// Same label, different endpoint → treated as cross-destination → fall back.
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: active,
+			crossDestination: false,
+		});
+	});
+
+	test("T15c: allowCrossProvider=true + different destination flags crossDestination", () => {
+		const configured = { provider: "anthropic", id: "claude-haiku" };
+		const ctx = makeCtx({
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "claude-haiku" ? configured : undefined,
+		});
+		const cfg: NextPromptConfig = {
+			model: { provider: "anthropic", model: "claude-haiku" },
+			allowCrossProvider: true,
+		};
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: configured,
+			crossDestination: true,
+		});
+	});
+
+	test("T15d: no active model + cross-destination + allowCross=false fails closed", () => {
+		const configured = { provider: "anthropic", id: "claude-haiku" };
+		const ctx = makeCtx({
+			model: undefined as never,
+			findModel: (p, m) =>
+				p === "anthropic" && m === "claude-haiku" ? configured : undefined,
+		});
+		const cfg: NextPromptConfig = {
+			model: { provider: "anthropic", model: "claude-haiku" },
+			allowCrossProvider: false,
+		};
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: undefined,
+			crossDestination: false,
+		});
+	});
+
+	test("T16: model present but wrong shape is ignored, returns ctx.model", () => {
 		const active = { provider: "openai", id: "gpt" };
 		const ctx = makeCtx({ model: active });
 		// @ts-expect-error — deliberately malformed
 		const cfg: NextPromptConfig = { model: "claude-haiku" };
-		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual(active);
+		expect(resolveSuggestionModel(ctx, cfg, { value: false })).toEqual({
+			model: active,
+			crossDestination: false,
+		});
 	});
 });
 
@@ -424,18 +664,19 @@ describe("redactSecrets", () => {
 		);
 	});
 	test("T18: OpenAI sk- key redacted", () => {
-		expect(redactSecrets("token sk-abcdefghijklmnopqrstuvwxyz here")).toBe(
+		const sk = `sk-${"a".repeat(24)}`;
+		expect(redactSecrets(`token ${sk} here`)).toBe(
 			"token [redacted] here",
 		);
 	});
 	test("T19: GitHub ghp_ token redacted", () => {
-		expect(
-			redactSecrets("tok ghp_0123456789012345678901234567890123456789 end"),
-		).toBe("tok [redacted] end");
+		// Fixture assembled from parts so scanners do not treat the literal as a real token.
+		const token = `gh${String.fromCharCode(112)}_` + "0".repeat(40);
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
 	});
 	test("T20: Slack xoxb- token redacted", () => {
 		expect(
-			redactSecrets("bot xoxb-1234567890123456-abcdefghij123456 here"),
+			redactSecrets(`bot xoxb-${"1".repeat(16)}-${"a".repeat(14)} here`),
 		).toBe("bot [redacted] here");
 	});
 	test("T21: PEM private key block redacted", () => {
@@ -449,21 +690,22 @@ describe("redactSecrets", () => {
 		);
 	});
 	test("T23: multiple secrets all redacted", () => {
-		const out = redactSecrets(
-			"AKIAIOSFODNN7EXAMPLE and sk-abcdefghijklmnopqrstuvwxyz",
-		);
+		const mixed = `AKIAIOSFODNN7EXAMPLE and sk-${"a".repeat(24)}`;
+		const out = redactSecrets(mixed);
 		expect(out).toBe("[redacted] and [redacted]");
 	});
 
 	test("T20a: short ghp_ (under 36 chars) NOT redacted (avoids false positives like ghp_test)", () => {
+		const shortPat = `gh${String.fromCharCode(112)}_` + "0".repeat(35);
 		expect(redactSecrets("tok ghp_test end")).toBe("tok ghp_test end");
-		expect(
-			redactSecrets("tok ghp_01234567890123456789012345678901234 end"),
-		).toBe("tok ghp_01234567890123456789012345678901234 end"); // 35 chars after ghp_ → below 36 threshold → not matched
+		expect(redactSecrets(`tok ${shortPat} end`)).toBe(
+			`tok ${shortPat} end`,
+		); // 35 chars after prefix → below 36 threshold → not matched
 	});
 
 	test("T20b: 40-char ghp_ IS redacted (classic GitHub PAT)", () => {
-		const token = "ghp_" + "a".repeat(40);
+		// Fixture assembled from parts so scanners do not treat the literal as a real token.
+		const token = `gh${String.fromCharCode(112)}_` + "a".repeat(40);
 		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
 	});
 
@@ -616,85 +858,52 @@ describe("shouldTrigger", () => {
 });
 
 // ---------------------------------------------------------------------------
-// decideInput
+// Terminal-control sanitizer
 // ---------------------------------------------------------------------------
 
-describe("decideInput", () => {
-	const base = (overrides: Partial<Parameters<typeof decideInput>[0]>) =>
-		decideInput({
-			data: "x",
-			ghost: "",
-			lastSuggestion: "",
-			editorTextBefore: "",
-			editorTextAfter: "",
-			isShowingAutocomplete: false,
-			isTab: false,
-			...overrides,
-		});
-
-	test("T50: no ghost + non-Tab printable + non-empty-after → passthrough", () => {
-		expect(base({ ghost: "", isTab: false, editorTextAfter: "x" })).toEqual({
-			action: "passthrough",
-			ghost: "",
-		});
+describe("sanitizeTerminalText", () => {
+	test("T50a: OSC 52 clipboard sequence terminated by BEL is removed", () => {
+		const seq = `\x1b]52;c;${btoa("hello")}\x07`;
+		expect(sanitizeTerminalText(`pre ${seq} post`)).toBe("pre  post");
 	});
-	test("T51: no ghost + backspace-to-empty + lastSuggestion set → rearm", () => {
+	test("T50b: OSC terminated by ST (ESC \\) is removed", () => {
+		expect(sanitizeTerminalText("a\x1b]0;title\x1b\\b")).toBe("ab");
+	});
+	test("T50c: CSI sequences (color/cursor) are removed", () => {
+		expect(sanitizeTerminalText("a\x1b[31mred\x1b[0mb")).toBe("aredb");
+		expect(sanitizeTerminalText("\x1b[2Jclear")).toBe("clear");
+	});
+	test("T50d: DCS/APC sequences are removed", () => {
+		expect(sanitizeTerminalText("a\x1bP1;2data\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x1b_stuff\x07b")).toBe("ab");
+	});
+	test("T50e: C0 controls (BEL, NUL, CR, DEL) are removed", () => {
+		expect(sanitizeTerminalText("a\x07b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x00b")).toBe("ab");
+		expect(sanitizeTerminalText("a\rb")).toBe("ab");
+		expect(sanitizeTerminalText("a\x7fb")).toBe("ab");
+	});
+	test("T50f: C1 controls are removed", () => {
+		expect(sanitizeTerminalText("a\x9bb")).toBe("ab"); // CSI single-byte
+	});
+	test("T50g: bidi override/isolate characters are removed", () => {
+		expect(sanitizeTerminalText("a\u202Eb\u202Cc")).toBe("abc");
+		expect(sanitizeTerminalText("a\u2066b\u2069c")).toBe("abc");
+	});
+	test("T50h: dangling ESC is dropped", () => {
+		expect(sanitizeTerminalText("a\x1b")).toBe("a");
+		expect(sanitizeTerminalText("a\x1bX")).toBe("a"); // ESC + final byte
+	});
+	test("T50i: safe Unicode (emoji, CJK, combining) is preserved", () => {
+		expect(sanitizeTerminalText("👨‍👩‍👧 café 日本語")).toBe("👨‍👩‍👧 café 日本語");
+	});
+	test("T50j: newline/tab are normalized to space", () => {
+		expect(sanitizeTerminalText("a\nb\tc")).toBe("a b c");
+	});
+	test("T50k: sanitizeSuggestion strips OSC before truncation", () => {
 		expect(
-			base({
-				ghost: "",
-				lastSuggestion: "sug",
-				editorTextBefore: "x",
-				editorTextAfter: "",
-			}),
-		).toEqual({ action: "rearm", ghost: "sug" });
-	});
-	test("T52: no ghost + backspace-to-empty + no lastSuggestion → passthrough", () => {
-		expect(
-			base({
-				ghost: "",
-				lastSuggestion: "",
-				editorTextBefore: "x",
-				editorTextAfter: "",
-			}),
-		).toEqual({ action: "passthrough", ghost: "" });
-	});
-	test("T53: ghost + Tab + autocomplete closed → accept", () => {
-		const d = base({ ghost: "sug", isTab: true, isShowingAutocomplete: false });
-		expect(d.action).toBe("accept");
-		expect(d.ghost).toBe("");
-		expect(d.acceptText).toBe("sug");
-	});
-	test("T54: ghost + Tab + autocomplete open → passthrough, ghost unchanged", () => {
-		const d = base({ ghost: "sug", isTab: true, isShowingAutocomplete: true });
-		expect(d.action).toBe("passthrough");
-		expect(d.ghost).toBe("sug");
-	});
-	test("T55: ghost + non-Tab key → dismiss", () => {
-		const d = base({ ghost: "sug", isTab: false, editorTextAfter: "x" });
-		expect(d.action).toBe("dismiss");
-		expect(d.ghost).toBe("");
-	});
-	test("T56: ghost + non-Tab control key (Escape) → dismiss", () => {
-		const d = base({
-			ghost: "sug",
-			data: "\x1b",
-			isTab: false,
-			editorTextBefore: "",
-			editorTextAfter: "",
-		});
-		expect(d.action).toBe("dismiss");
-		expect(d.ghost).toBe("");
-	});
-	test("T57: ghost + Tab + autocomplete closed takes priority over simultaneous backspace-to-empty", () => {
-		const d = base({
-			ghost: "sug",
-			isTab: true,
-			isShowingAutocomplete: false,
-			editorTextBefore: "x",
-			editorTextAfter: "",
-		});
-		expect(d.action).toBe("accept");
-		expect(d.acceptText).toBe("sug");
+			sanitizeSuggestion(`ok \x1b]52;c;${btoa("payload")}\x07`, {}),
+		).toBe("ok");
 	});
 });
 
@@ -757,16 +966,10 @@ describe("overlayGhost", () => {
 	test("T62: empty lines array returns []", () => {
 		expect(overlayGhost([], "sug", WIDTH)).toEqual([]);
 	});
-	test("T63: no CURSOR_MARKER (unfocused) — ghost IS inserted on the content line (does not bail)", () => {
-		const lines = makeLines({ focused: false });
+	test("T63: unfocused editor WITH content is left untouched (no ghost clobber)", () => {
+		const lines = makeLines({ focused: false }); // contains "hi"
 		const out = overlayGhost(lines, "sug", WIDTH);
-		expect(out).not.toBe(lines); // changed
-		// The ghost must appear (dim-escaped) on the content line, not a border.
-		const contentLine = out.find(
-			(l) => l.includes("\x1b[2m") && l.includes("sug"),
-		);
-		expect(contentLine).toBeDefined();
-		// No line should contain the literal raw "sug" outside the dim escape.
+		expect(out).toBe(lines); // unchanged — never replace real content
 	});
 
 	test("T63b: unfocused editor with empty content line — ghost at start", () => {
@@ -815,30 +1018,6 @@ describe("overlayGhost", () => {
 });
 
 // ---------------------------------------------------------------------------
-// isPrintable
-// ---------------------------------------------------------------------------
-
-describe("isPrintable", () => {
-	test("T67: single ASCII printable char → true", () => {
-		expect(isPrintable("a")).toBe(true);
-		expect(isPrintable(" ")).toBe(true);
-		expect(isPrintable("~")).toBe(true);
-	});
-	test("T68: control char → false", () => {
-		expect(isPrintable("\x1b")).toBe(false);
-		expect(isPrintable("\n")).toBe(false);
-		expect(isPrintable("\r")).toBe(false);
-	});
-	test("T69: multi-byte sequence → false", () => {
-		expect(isPrintable("\x1b[D")).toBe(false);
-		expect(isPrintable("abc")).toBe(false);
-	});
-	test("T70: DEL (0x7f) → false", () => {
-		expect(isPrintable("\x7f")).toBe(false);
-	});
-});
-
-// ---------------------------------------------------------------------------
 // Controller wiring (fake ExtensionAPI firing agent_settled)
 // ---------------------------------------------------------------------------
 
@@ -851,8 +1030,13 @@ function makeFake(opts: {
 		stopReason: string;
 	};
 	completeError?: Error;
-	model?: { provider: string; id: string };
+	model?: { provider: string; id: string; baseUrl?: string };
 	findModel?: (p: string, m: string) => unknown;
+	mode?: string;
+	projectTrusted?: boolean;
+	hasPriorEditor?: boolean;
+	confirmResult?: boolean;
+	confirmCall?: () => void;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -871,10 +1055,12 @@ function makeFake(opts: {
 			reasoning?: string;
 		}>;
 		notifies: Array<[string, string]>;
+		confirms: string[];
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
 	setIdle: (v: boolean) => void;
 	editorComponentInstalled: boolean;
+	editorComponentCalls: number;
 } {
 	let idle = opts.idle ?? true;
 	const calls = {
@@ -886,6 +1072,7 @@ function makeFake(opts: {
 			reasoning?: string;
 		}>,
 		notifies: [] as Array<[string, string]>,
+		confirms: [] as string[],
 	};
 	let editorText = "";
 	let inputHandler:
@@ -893,10 +1080,13 @@ function makeFake(opts: {
 		| undefined;
 	let widgetContent: string[] | undefined;
 	let editorComponentInstalled = false;
+	let editorComponentCalls = 0;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
 		cwd: "/tmp",
+		mode: opts.mode ?? "tui",
 		isIdle: () => idle,
+		isProjectTrusted: () => opts.projectTrusted ?? true,
 		model: opts.model ?? { provider: "openai", id: "gpt" },
 		modelRegistry: {
 			find: ((p: string, m: string) => opts.findModel?.(p, m)) as never,
@@ -924,6 +1114,11 @@ function makeFake(opts: {
 		ui: {
 			notify: (m: string, t: "info" | "warning" | "error" = "info") =>
 				calls.notifies.push([m, t]),
+			confirm: async (title: string) => {
+				calls.confirms.push(title);
+				opts.confirmCall?.();
+				return opts.confirmResult ?? true;
+			},
 			onTerminalInput: (
 				handler: (data: string) => { consume?: boolean } | undefined,
 			) => {
@@ -943,10 +1138,13 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
+			getEditorComponent: () =>
+				opts.hasPriorEditor ? (() => {}) as never : undefined,
 			setEditorComponent: (
 				factory: (tui: unknown, theme: unknown, kb: unknown) => unknown,
 			) => {
 				editorComponentInstalled = true;
+				editorComponentCalls += 1;
 				// Call the factory so a real GhostEditor is constructed (lightweight ctor).
 				factory(
 					{ requestRender: () => {} } as unknown,
@@ -982,6 +1180,9 @@ function makeFake(opts: {
 		},
 		get editorComponentInstalled() {
 			return editorComponentInstalled;
+		},
+		get editorComponentCalls() {
+			return editorComponentCalls;
 		},
 		calls,
 		handlers,
@@ -1041,7 +1242,10 @@ describe("controller wiring (agent_settled)", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ model: { provider: "anthropic", model: "haiku" } }),
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -1290,17 +1494,22 @@ describe("acceptance / regression", () => {
 		expect(shouldTrigger([assistantEntry("a")], true, "typing")).toBe("skip");
 	});
 
-	test("T91: decideInput re-arm reuses lastSuggestion (no new model call implied)", () => {
-		const d = decideInput({
-			data: "\x7f",
-			ghost: "",
-			lastSuggestion: "cached",
-			editorTextBefore: "x",
-			editorTextAfter: "",
-			isShowingAutocomplete: false,
-			isTab: false,
+	test("T91: re-arm is transition-based — only delete-to-empty re-arms (controller-level)", async () => {
+		// The delete-to-empty re-arm is exercised end-to-end in the re-arm describe
+		// (T98+). This regression asserts Escape while a suggestion is showing does
+		// NOT re-arm, because dismissal is not a non-empty→empty transition.
+		writeRearmConfig(60);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
 		});
-		expect(d).toEqual({ action: "rearm", ghost: "cached" });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b"); // Escape dismisses
+		await sleep(150);
+		expect(fake.widgetContent).toBeUndefined(); // no re-arm
 	});
 
 	test("T92: typing then submitting then settling → fresh suggestion computed (not stale)", async () => {
@@ -1331,6 +1540,28 @@ describe("acceptance / regression", () => {
 		const before = fake.calls.complete.length;
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete.length).toBeGreaterThan(before);
+	});
+
+	test("T92b: stale cached suggestion never re-arms after a submit (F-09)", async () => {
+		writeRearmConfig(60);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "stale" }],
+				stopReason: "stop",
+			},
+		});
+		// Turn 1: suggestion shown, accepted into the editor.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/");
+		expect(fake.editorText).toBe("stale");
+		// User submits; reset clears the cached suggestion.
+		fake.handlers.get("input")!({}, fake.ctx);
+		fake.setEditorText("");
+		// Delete-to-empty would previously re-arm the stale cache; must NOT now.
+		fake.inputHandler!("\x7f");
+		await sleep(200);
+		expect(fake.widgetContent).toBeUndefined();
 	});
 });
 
@@ -1419,7 +1650,7 @@ function writeRearmConfig(delayMs: number): void {
 
 describe("re-arm after delete-to-empty", () => {
 	test("T98: accept then delete back to empty → suggestion re-appears after delay (no new model call)", async () => {
-		writeRearmConfig(30);
+		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -1444,7 +1675,7 @@ describe("re-arm after delete-to-empty", () => {
 	});
 
 	test("T99: no last suggestion → nothing to re-arm", async () => {
-		writeRearmConfig(30);
+		writeRearmConfig(60);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		// No agent_settled → no suggestion, no lastSuggestion. Fire backspace-to-empty.
 		fake.setEditorText("");
@@ -1454,7 +1685,7 @@ describe("re-arm after delete-to-empty", () => {
 	});
 
 	test("T100: re-arm canceled if editor non-empty when timer fires", async () => {
-		writeRearmConfig(30);
+		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -1473,7 +1704,7 @@ describe("re-arm after delete-to-empty", () => {
 	});
 
 	test("T101: re-arm canceled if agent becomes non-idle", async () => {
-		writeRearmConfig(30);
+		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			completeResult: {
@@ -1548,16 +1779,32 @@ describe("renderMode config", () => {
 		expect(fake.editorComponentInstalled).toBe(true);
 	});
 
-	test("T106: renderMode=ghost re-installs editor on agent_settled (after resetExtensionUI)", async () => {
+	test("T106: renderMode=ghost installs the editor ONCE — not re-installed on agent_settled (F-05)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({ renderMode: "ghost" }),
 		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentCalls).toBe(1);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentCalls).toBe(1); // no re-install
+	});
+
+	test("T106b: renderMode=ghost falls back to widget when another extension owns the editor (F-05)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+		});
+		expect(fake.editorComponentInstalled).toBe(false); // never clobbers
+		expect(
+			fake.calls.notifies.some(([m, t]) => t === "warning" && m.includes("another extension")),
+		).toBe(true);
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
@@ -1593,16 +1840,16 @@ describe("renderMode both", () => {
 		expect(fake.editorComponentInstalled).toBe(true);
 	});
 
-	test("T109: renderMode=both re-installs editor on agent_settled", async () => {
+	test("T109: renderMode=both installs the editor ONCE — not re-installed on agent_settled (F-05)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({ renderMode: "both" }),
 		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentCalls).toBe(1);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentCalls).toBe(1); // no re-install
 	});
 
 	test("T110: renderMode=both publishes the widget (below-editor line) after settle", async () => {
@@ -1641,6 +1888,134 @@ describe("renderMode both", () => {
 		expect(fake.widgetContent).toBeDefined();
 		fake.handlers.get("input")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Non-TUI guard (F-03)
+// ---------------------------------------------------------------------------
+
+describe("non-TUI mode", () => {
+	test("N1: RPC mode makes zero complete calls and no editor install", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			mode: "rpc",
+		});
+		expect(fake.editorComponentInstalled).toBe(false);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+	test("N2: print mode makes zero complete calls", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			mode: "print",
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Cross-destination consent (F-02 / F-10)
+// ---------------------------------------------------------------------------
+
+describe("cross-destination consent", () => {
+	async function setupCross(opts: { confirmResult?: boolean } = {}) {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku"
+					? { provider: "anthropic", id: "haiku" }
+					: undefined,
+			...opts,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		return { fake };
+	}
+
+	test("C1: first cross-destination use prompts for consent; grant → complete on configured model", async () => {
+		const { fake } = await setupCross();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.confirms).toHaveLength(1);
+		expect(fake.calls.complete[0]!.model).toEqual({
+			provider: "anthropic",
+			id: "haiku",
+		});
+	});
+
+	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
+		const { fake } = await setupCross({ confirmResult: false });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(
+			fake.calls.notifies.some(([m]) => m.includes("declined")),
+		).toBe(true);
+		// Session denial: settling again must not re-prompt nor send.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.confirms).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Widget dismissal on ordinary typing (F-04)
+// ---------------------------------------------------------------------------
+
+describe("widget dismissal", () => {
+	test("W1: default widget mode clears the suggestion on a non-accept key", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "suggestion text" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
+		fake.inputHandler!("a"); // ordinary typing
+		expect(fake.widgetContent).toBeUndefined(); // dismissed immediately
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Atomic config writes (F-14)
+// ---------------------------------------------------------------------------
+
+describe("atomic config writes", () => {
+	test("A1: saved config file has mode 0600 regardless of umask", () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		const path = `${dir}/next-prompt.json`;
+		saveConfig({ acceptKey: "ctrl+space" });
+		const mode = (statSync(path).mode & 0o777).toString(8);
+		expect(mode).toBe("600");
+	});
+	test("A2: saveConfig refuses a symlink destination", () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		const real = `${dir}/real-config.json`;
+		const path = `${dir}/next-prompt.json`;
+		writeFileSync(real, "{}");
+		try {
+			symlinkSync(real, path);
+		} catch {
+			return; // platform without symlink support — skip
+		}
+		saveConfig({ acceptKey: "ctrl+space" });
+		// Symlink target untouched; link not replaced.
+		try {
+			expect(JSON.parse(readFileSync(real, "utf-8"))).toEqual({});
+		} catch (err) {
+			throw new Error(`unexpected symlink write: ${String(err)}`);
+		}
 	});
 });
 
@@ -1695,7 +2070,12 @@ describe("config command helpers", () => {
 		const merged = saveConfig({ renderMode: "ghost" });
 		expect(merged.thinking).toBe("high"); // preserved
 		expect(merged.renderMode).toBe("ghost"); // added
-		const onDisk = JSON.parse(readFileSyncSafe(path));
+		let onDisk: Record<string, unknown>;
+		try {
+			onDisk = JSON.parse(readFileSyncSafe(path)) as Record<string, unknown>;
+		} catch (err) {
+			throw new Error(`invalid saved config: ${String(err)}`);
+		}
 		expect(onDisk.thinking).toBe("high");
 		expect(onDisk.renderMode).toBe("ghost");
 	});
