@@ -7,6 +7,9 @@
   "type": "module",
   "main": "next-prompt.ts",
   "files": ["next-prompt.ts", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "extensions": ["./next-prompt.ts"]
   },

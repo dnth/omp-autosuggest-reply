@@ -227,6 +227,26 @@ When publishing, include the updated `README.md`, `package.json`, `next-prompt.t
 and any release metadata in the npm package. The `files` field in `package.json`
 controls the published contents.
 
+### Publishing from CI (GitHub Actions)
+
+Publishing happens automatically from a GitHub Actions workflow when a `v*` tag is
+pushed to `main` (`.github/workflows/publish.yml`). The workflow uses the
+`NODE_AUTH_TOKEN` repository secret (an npm automation token with publish permission
+for the `@gamaraan` scope).
+
+To publish a release:
+
+```bash
+npm version patch   # or minor / major — bumps package.json
+npm publish --dry-run   # optional sanity check
+
+git push origin main
+git push origin v0.1.0   # push the tag; CI publishes
+```
+
+`publishConfig.access` is set to `"public"` so the scoped package publishes
+publicly from CI.
+
 ## Design & development
 
 Source and design discussion live in the
