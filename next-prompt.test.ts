@@ -1709,7 +1709,7 @@ describe("configureInteractively", () => {
 			models: [{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" }],
 			answers: {
 				model: "anthropic/claude-haiku — Claude Haiku",
-				renderMode: "ghost",
+				renderMode: "ghost — inline greyed text in the input box",
 				thinking: "low",
 				acceptKey: "ctrl+space",
 				rearmDelayMs: "1500",
@@ -1750,7 +1750,7 @@ describe("configureInteractively", () => {
 		const ctx = makeConfigCtx({
 			answers: {
 				model: "(use current model)",
-				renderMode: "widget",
+				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
 				acceptKey: "alt+/",
 				rearmDelayMs: "2000",
@@ -1767,7 +1767,7 @@ describe("configureInteractively", () => {
 		const ctx = makeConfigCtx({
 			answers: {
 				model: "(use current model)",
-				renderMode: "widget",
+				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
 				acceptKey: "alt+/",
 				rearmDelayMs: "not a number",
@@ -1781,4 +1781,27 @@ describe("configureInteractively", () => {
 		expect(out?.maxTranscriptChars).toBeUndefined();
 		expect(out?.maxSuggestionChars).toBe(200);
 	});
+});
+
+test("T124: renderMode picker lists ghost first with descriptions", async () => {
+	const seenRenderOptions: string[] = [];
+	const ctx = {
+		modelRegistry: { getAvailable: () => [] },
+		ui: {
+			select: async (_title: string, options: string[]) => {
+				// Capture render-mode options (those starting with ghost/widget/both).
+				if (options.some((o) => o.startsWith("ghost") || o.startsWith("widget") || o.startsWith("both"))) {
+					seenRenderOptions.push(...options);
+					return undefined; // cancel at render picker
+				}
+				return "(use current model)"; // proceed past model picker
+			},
+			input: async () => undefined,
+			confirm: async () => false,
+		},
+	} as unknown as Parameters<typeof configureInteractively>[0];
+	await configureInteractively(ctx, {});
+	expect(seenRenderOptions[0]).toContain("ghost");
+	expect(seenRenderOptions.some((o) => o.startsWith("widget"))).toBe(true);
+	expect(seenRenderOptions.some((o) => o.startsWith("both"))).toBe(true);
 });

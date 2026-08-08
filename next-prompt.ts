@@ -213,7 +213,9 @@ function parseConfig(text: string): NextPromptConfig {
 }
 
 /** Merge a partial config update into the existing global config file, preserving unspecified keys. */
-export function saveConfig(update: Partial<NextPromptConfig>): NextPromptConfig {
+export function saveConfig(
+	update: Partial<NextPromptConfig>,
+): NextPromptConfig {
 	const path = join(getAgentDir(), "next-prompt.json");
 	let existing: NextPromptConfig = {};
 	if (existsSync(path)) {
@@ -226,19 +228,26 @@ export function saveConfig(update: Partial<NextPromptConfig>): NextPromptConfig 
 	const merged: NextPromptConfig = { ...existing, ...update };
 	// Drop undefined values so the file stays clean.
 	const clean: Record<string, unknown> = {};
-	for (const [k, v] of Object.entries(merged)) if (v !== undefined) clean[k] = v;
+	for (const [k, v] of Object.entries(merged))
+		if (v !== undefined) clean[k] = v;
 	mkdirSync(dirname(path), { recursive: true });
 	writeFileSync(path, `${JSON.stringify(clean, null, 2)}\n`);
 	return merged;
 }
 
 /** Format a model for the config-command picker: "provider/model — name". */
-export function formatModelOption(model: { provider: string; id: string; name?: string }): string {
+export function formatModelOption(model: {
+	provider: string;
+	id: string;
+	name?: string;
+}): string {
 	return `${model.provider}/${model.id} — ${model.name ?? model.id}`;
 }
 
 /** Parse a picked option (from formatModelOption) back into {provider, model}. */
-export function parseModelOption(picked: string): NextPromptModelConfig | undefined {
+export function parseModelOption(
+	picked: string,
+): NextPromptModelConfig | undefined {
 	const m = picked.match(/^(.+?)\/(.+?) — /);
 	if (!m || !m[1] || !m[2]) return undefined;
 	return { provider: m[1], model: m[2] };
@@ -254,7 +263,6 @@ export const THINKING_OPTIONS = [
 	"xhigh",
 	"max",
 ] as const;
-
 
 // ---------------------------------------------------------------------------
 // Model resolution
@@ -988,7 +996,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		description: "Configure the next-prompt suggestion extension",
 		handler: async (_args, ctx) => {
 			if (ctx.mode !== "tui") {
-				ctx.ui.notify("next-prompt: /next-prompt-config requires interactive mode", "error");
+				ctx.ui.notify(
+					"next-prompt: /next-prompt-config requires interactive mode",
+					"error",
+				);
 				return;
 			}
 			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
@@ -1010,18 +1021,27 @@ export async function configureInteractively(
 	ctx: {
 		ui: {
 			select: (title: string, options: string[]) => Promise<string | undefined>;
-			input: (title: string, placeholder?: string) => Promise<string | undefined>;
+			input: (
+				title: string,
+				placeholder?: string,
+			) => Promise<string | undefined>;
 			confirm: (title: string, message: string) => Promise<boolean>;
 		};
-		modelRegistry: { getAvailable(): Array<{ provider: string; id: string; name?: string }> };
+		modelRegistry: {
+			getAvailable(): Array<{ provider: string; id: string; name?: string }>;
+		};
 	},
 	current: NextPromptConfig,
 ): Promise<Partial<NextPromptConfig> | undefined> {
 	const update: Partial<NextPromptConfig> = {};
 
 	// 1. Suggestion model (picker over all available models, or "use current").
-	const models = ctx.modelRegistry.getAvailable().map((m) => formatModelOption(m));
-	const currentLabel = current.model ? formatModelOption({ ...current.model, id: current.model.model }) : "(use current model)";
+	const models = ctx.modelRegistry
+		.getAvailable()
+		.map((m) => formatModelOption(m));
+	const currentLabel = current.model
+		? formatModelOption({ ...current.model, id: current.model.model })
+		: "(use current model)";
 	const modelPick = await ctx.ui.select(
 		`next-prompt: suggestion model [${currentLabel}]`,
 		["(use current model)", ...models],
@@ -1030,19 +1050,30 @@ export async function configureInteractively(
 	if (modelPick === "(use current model)") update.model = undefined;
 	else update.model = parseModelOption(modelPick);
 
-	// 2. renderMode
+	// 2. renderMode — ghost first (nicer, inline in the box), then widget (reliable
+	// below-editor line), then both.
+	const renderOptions = [
+		"ghost — inline greyed text in the input box",
+		"widget — colored line below the input box",
+		"both — inline ghost AND the below-editor line",
+	];
+	const currentRenderLabel = current.renderMode ?? "widget";
 	const renderPick = await ctx.ui.select(
-		`next-prompt: render mode [${current.renderMode ?? "widget"}]`,
-		["widget", "ghost", "both"],
+		`next-prompt: render mode [${currentRenderLabel}]`,
+		renderOptions,
 	);
-	if (renderPick) update.renderMode = renderPick as RenderMode;
+	if (renderPick) update.renderMode = renderPick.split(" — ")[0] as RenderMode;
 
 	// 3. thinking level
 	const thinkPick = await ctx.ui.select(
 		`next-prompt: thinking level [${current.thinking ?? "(unset)"}]`,
 		[...THINKING_OPTIONS],
 	);
-	if (thinkPick) update.thinking = thinkPick === THINKING_OPTIONS[0] ? undefined : (thinkPick as ThinkingLevel);
+	if (thinkPick)
+		update.thinking =
+			thinkPick === THINKING_OPTIONS[0]
+				? undefined
+				: (thinkPick as ThinkingLevel);
 
 	// 4. acceptKey (free text)
 	const acceptPick = await ctx.ui.input(
