@@ -415,9 +415,9 @@ describe("redactSecrets", () => {
 		).toBe("tok [redacted] end");
 	});
 	test("T20: Slack xoxb- token redacted", () => {
-		expect(redactSecrets("bot xoxb-1234567890123456-abcdefghij123456 here")).toBe(
-			"bot [redacted] here",
-		);
+		expect(
+			redactSecrets("bot xoxb-1234567890123456-abcdefghij123456 here"),
+		).toBe("bot [redacted] here");
 	});
 	test("T21: PEM private key block redacted", () => {
 		const pem =
@@ -438,9 +438,9 @@ describe("redactSecrets", () => {
 
 	test("T20a: short ghp_ (under 36 chars) NOT redacted (avoids false positives like ghp_test)", () => {
 		expect(redactSecrets("tok ghp_test end")).toBe("tok ghp_test end");
-		expect(redactSecrets("tok ghp_01234567890123456789012345678901234 end")).toBe(
-			"tok ghp_01234567890123456789012345678901234 end",
-		); // 35 chars after ghp_ → below 36 threshold → not matched
+		expect(
+			redactSecrets("tok ghp_01234567890123456789012345678901234 end"),
+		).toBe("tok ghp_01234567890123456789012345678901234 end"); // 35 chars after ghp_ → below 36 threshold → not matched
 	});
 
 	test("T20b: 40-char ghp_ IS redacted (classic GitHub PAT)", () => {
@@ -738,9 +738,35 @@ describe("overlayGhost", () => {
 	test("T62: empty lines array returns []", () => {
 		expect(overlayGhost([], "sug", WIDTH)).toEqual([]);
 	});
-	test("T63: no CURSOR_MARKER (unfocused) returns lines unchanged (no crash)", () => {
+	test("T63: no CURSOR_MARKER (unfocused) — ghost IS inserted on the content line (does not bail)", () => {
 		const lines = makeLines({ focused: false });
-		expect(overlayGhost(lines, "sug", WIDTH)).toBe(lines);
+		const out = overlayGhost(lines, "sug", WIDTH);
+		expect(out).not.toBe(lines); // changed
+		// The ghost must appear (dim-escaped) on the content line, not a border.
+		const contentLine = out.find((l) => l.includes("\x1b[2m") && l.includes("sug"));
+		expect(contentLine).toBeDefined();
+		// No line should contain the literal raw "sug" outside the dim escape.
+	});
+
+	test("T63b: unfocused editor with empty content line — ghost at start", () => {
+		// Simulate a fully unfocused empty editor: top border, blank content, bottom border.
+		const border = "─".repeat(WIDTH);
+		const blank = " ".repeat(WIDTH);
+		const lines = [border, blank, border];
+		const out = overlayGhost(lines, "hello", WIDTH);
+		expect(out[0]).toBe(border); // top border untouched
+		expect(out[2]).toBe(border); // bottom border untouched
+		expect(out[1]).toContain("\x1b[2mhello\x1b[22m");
+	});
+
+	test("T63c: unfocused editor — ghost truncated to contentWidth, no overflow", () => {
+		const border = "─".repeat(WIDTH);
+		const blank = " ".repeat(WIDTH);
+		const lines = [border, blank, border];
+		const out = overlayGhost(lines, "x".repeat(WIDTH * 2), WIDTH);
+		// The content line must contain the dim ghost but not exceed visible width.
+		expect(out[1]).toContain("\x1b[2m");
+		expect(out[1]).toContain("\x1b[22m");
 	});
 	test("T64: output contains raw ANSI dim escapes (not theme.fg)", () => {
 		const lines = makeLines({ text: "hi" });
@@ -1477,7 +1503,10 @@ describe("renderMode config", () => {
 	test("T104: renderMode=widget uses setWidget (below-editor line)", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			completeResult: { content: [{ type: "text", text: "widget suggestion" }], stopReason: "stop" },
+			completeResult: {
+				content: [{ type: "text", text: "widget suggestion" }],
+				stopReason: "stop",
+			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("↳ next:");
@@ -1486,13 +1515,21 @@ describe("renderMode config", () => {
 	});
 
 	test("T105: renderMode=ghost installs custom editor on session_start", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		expect(fake.editorComponentInstalled).toBe(true);
 	});
 
 	test("T106: renderMode=ghost re-installs editor on agent_settled (after resetExtensionUI)", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		expect(fake.editorComponentInstalled).toBe(true);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -1500,10 +1537,17 @@ describe("renderMode config", () => {
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			completeResult: { content: [{ type: "text", text: "ghost suggestion" }], stopReason: "stop" },
+			completeResult: {
+				content: [{ type: "text", text: "ghost suggestion" }],
+				stopReason: "stop",
+			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();

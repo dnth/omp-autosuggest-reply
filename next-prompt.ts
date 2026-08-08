@@ -490,9 +490,34 @@ export function overlayGhost(
 			break;
 		}
 	}
-	if (cursorLineIdx === -1) return lines; // unfocused: no marker, do nothing.
-
+	const contentWidth = Math.max(1, width);
 	const result = lines.slice();
+
+	if (cursorLineIdx === -1) {
+		// Unfocused (e.g. user switched tabs/apps): CURSOR_MARKER is absent. The empty
+		// editor renders a single padded content line between top/bottom border rules.
+		// Insert the ghost at the start of that content line so the suggestion still shows.
+		let contentIdx = -1;
+		for (let i = 0; i < lines.length; i++) {
+			const stripped = stripAnsi(lines[i]!).trim();
+			if (!stripped.startsWith("─")) {
+				contentIdx = i;
+				break;
+			}
+		}
+		if (contentIdx === -1) return lines;
+		const line = result[contentIdx]!;
+		const ghostSlice =
+			visibleWidth(ghost) > contentWidth ? truncateToWidth(ghost, contentWidth, "") : ghost;
+		if (!ghostSlice) return lines;
+		const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
+		result[contentIdx] =
+			ghostStyled +
+			line.slice(visibleWidth(ghostSlice)) +
+			" ".repeat(Math.max(0, contentWidth - visibleWidth(ghostSlice)));
+		return result;
+	}
+
 	const line = result[cursorLineIdx]!;
 
 	// The cursor block is: <before><CURSOR_MARKER>\x1b[7m<grapheme or space>\x1b[0m<rest>
@@ -509,7 +534,6 @@ export function overlayGhost(
 	// Compute the visible width of the line content (excluding ANSI + the marker) so we
 	// can size the ghost to fit within the editor content width without overflowing the
 	// border.
-	const contentWidth = Math.max(1, width);
 	const leftPart = line.slice(0, insertAt);
 	const trailingPart = line.slice(insertAt);
 	// Strip trailing whitespace (the padding the base editor appends) to measure real width.
@@ -708,7 +732,11 @@ class GhostEditor extends CustomEditor {
 	}
 
 	render(width: number): string[] {
-		return overlayGhost(super.render(width), this.suggestionState.suggestion, width);
+		return overlayGhost(
+			super.render(width),
+			this.suggestionState.suggestion,
+			width,
+		);
 	}
 
 	handleInput(data: string): void {
@@ -830,9 +858,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 
 	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => { reset(); });
-	pi.on("turn_start", () => { reset(); });
-	pi.on("agent_start", () => { reset(); });
+	pi.on("input", () => {
+		reset();
+	});
+	pi.on("turn_start", () => {
+		reset();
+	});
+	pi.on("agent_start", () => {
+		reset();
+	});
 
 	pi.on("session_shutdown", () => {
 		reset();
