@@ -65,7 +65,7 @@ export interface NextPromptModelConfig {
 	model: string;
 }
 
-export type RenderMode = "widget" | "ghost";
+export type RenderMode = "widget" | "ghost" | "both";
 
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
@@ -508,7 +508,9 @@ export function overlayGhost(
 		if (contentIdx === -1) return lines;
 		const line = result[contentIdx]!;
 		const ghostSlice =
-			visibleWidth(ghost) > contentWidth ? truncateToWidth(ghost, contentWidth, "") : ghost;
+			visibleWidth(ghost) > contentWidth
+				? truncateToWidth(ghost, contentWidth, "")
+				: ghost;
 		if (!ghostSlice) return lines;
 		const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
 		result[contentIdx] =
@@ -589,12 +591,9 @@ export interface SuggestionState {
 	renderGhost: (() => void) | undefined;
 }
 
-function renderSuggestion(state: SuggestionState): void {
-	if (state.renderMode === "ghost") {
-		// Ghost mode: the custom editor overlays this.ghost in its render(). We only need
-		// to trigger a render of the editor so the overlay picks up the new ghost value.
-		state.renderGhost?.();
-	} else if (state.suggestion) {
+/** Publish the below-editor widget (or clear it when there's no suggestion). */
+function renderWidget(state: SuggestionState): void {
+	if (state.suggestion) {
 		const hint = humanizeKey(state.acceptKey);
 		state.publishWidget([
 			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
@@ -602,6 +601,14 @@ function renderSuggestion(state: SuggestionState): void {
 	} else {
 		state.publishWidget(undefined);
 	}
+}
+
+function renderSuggestion(state: SuggestionState): void {
+	const mode = state.renderMode;
+	const showGhost = mode === "ghost" || mode === "both";
+	const showWidget = mode === "widget" || mode === "both";
+	if (showGhost) state.renderGhost?.();
+	if (showWidget) renderWidget(state);
 }
 
 /** Show a suggestion. Race-guarded: only if the editor is empty and the agent is idle. */
@@ -825,9 +832,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		ref.state = state;
 
-		// In ghost mode, install the custom editor (and remember how, so agent_settled
-		// can re-install it after pi's resetExtensionUI swaps the editor back to default).
-		if (renderMode === "ghost") {
+		// In ghost or both mode, install the custom editor (and remember how, so
+		// agent_settled can re-install it after pi's resetExtensionUI swaps the editor
+		// back to default).
+		if (renderMode === "ghost" || renderMode === "both") {
 			const install = () => {
 				ctx.ui.setEditorComponent((tui, theme, kb) => {
 					const ed = new GhostEditor(tui, theme, kb, state);

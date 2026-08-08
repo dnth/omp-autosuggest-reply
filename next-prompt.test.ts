@@ -743,7 +743,9 @@ describe("overlayGhost", () => {
 		const out = overlayGhost(lines, "sug", WIDTH);
 		expect(out).not.toBe(lines); // changed
 		// The ghost must appear (dim-escaped) on the content line, not a border.
-		const contentLine = out.find((l) => l.includes("\x1b[2m") && l.includes("sug"));
+		const contentLine = out.find(
+			(l) => l.includes("\x1b[2m") && l.includes("sug"),
+		);
 		expect(contentLine).toBeDefined();
 		// No line should contain the literal raw "sug" outside the dim escape.
 	});
@@ -1550,6 +1552,50 @@ describe("renderMode config", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// renderMode "both" — inline ghost + below-editor widget simultaneously
+// ---------------------------------------------------------------------------
+
+describe("renderMode both", () => {
+	test("T108: renderMode=both installs custom editor on session_start", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(true);
+	});
+
+	test("T109: renderMode=both re-installs editor on agent_settled", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(true);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(true);
+	});
+
+	test("T110: renderMode=both publishes the widget (below-editor line) after settle", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: { content: [{ type: "text", text: "both suggestion" }], stopReason: "stop" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// In "both" mode the widget is published (ghost renders in the editor separately).
+		expect(fake.widgetContent?.[0] ?? "").toContain("↳ next:");
+		expect(fake.widgetContent?.[0] ?? "").toContain("both suggestion");
+	});
+
+	test("T111: renderMode=both clears the widget on input (and the ghost via reset)", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: { content: [{ type: "text", text: "x" }], stopReason: "stop" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeDefined();
+		fake.handlers.get("input")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 });
