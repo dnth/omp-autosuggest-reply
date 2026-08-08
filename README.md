@@ -21,16 +21,16 @@ Pi auto-discovers extensions from standard locations.
 
 ### From npm / the pi package gallery
 
-The published package is `next-prompt`, published under the npm account `gamaraan`:
+The published package is `@gamaraan/next-prompt`, published under the npm account `gamaraan`:
 
 ```bash
-pi install npm:next-prompt
+pi install npm:@gamaraan/next-prompt
 ```
 
 A specific release can be pinned with:
 
 ```bash
-pi install npm:next-prompt@0.1.0
+pi install npm:@gamaraan/next-prompt@0.1.0
 ```
 
 ### From GitHub
@@ -184,7 +184,7 @@ Edit `next-prompt.ts` in place and restart pi to pick up changes.
 
 ## Publish to npm and pi.dev/packages
 
-The package is named `next-prompt` and is published under the npm account
+The package is named `@gamaraan/next-prompt` and is published under the npm account
 [`gamaraan`](https://www.npmjs.com/~gamaraan). Its source repository is
 [`gamaraan/next-prompt-extension`](https://github.com/gamaraan/next-prompt-extension).
 
@@ -192,7 +192,7 @@ The repository includes the required pi package manifest in [`package.json`](./p
 
 ```json
 {
-  "name": "next-prompt",
+  "name": "@gamaraan/next-prompt",
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./next-prompt.ts"]
@@ -209,12 +209,12 @@ npm version patch          # or minor / major
 npm publish
 ```
 
-For a first release, the package is published as `next-prompt@0.1.0`. After npm
+For a first release, the package is published as `@gamaraan/next-prompt@0.1.0`. After npm
 publishes it, pi's package gallery can discover it through the `pi-package` keyword.
 Users install it with:
 
 ```bash
-pi install npm:next-prompt
+pi install npm:@gamaraan/next-prompt
 ```
 
 A GitHub-based installation is also available independently of npm:
