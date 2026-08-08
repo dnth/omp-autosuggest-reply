@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "main": "next-prompt.ts",
-  "files": ["next-prompt.ts", "README.md", "PLAN.md", "LICENSE"],
+  "files": ["next-prompt.ts", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./next-prompt.ts"]
   },

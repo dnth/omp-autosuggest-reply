@@ -227,11 +227,12 @@ When publishing, include the updated `README.md`, `package.json`, `next-prompt.t
 and any release metadata in the npm package. The `files` field in `package.json`
 controls the published contents.
 
-## Design doc
+## Design & development
 
-See [`PLAN.md`](./PLAN.md) for the full oracle-reviewed design, including the audit
-trail of blockers found and fixed during adversarial review.
+The design went through an adversarial review by an oracle subagent during
+development — see the [GitHub repository](https://github.com/gamaraan/next-prompt-extension)
+for the full commit history and design discussion.
 
 ## License
 
-MIT.
+MIT — see [LICENSE](./LICENSE).
