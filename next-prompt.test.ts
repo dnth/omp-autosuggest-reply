@@ -326,8 +326,8 @@ describe("resolveSuggestionModel", () => {
 // ---------------------------------------------------------------------------
 
 describe("acceptKey / humanizeKey", () => {
-	test("DEFAULT_ACCEPT_KEY is \"ctrl+tab\"", () => {
-		expect(DEFAULT_ACCEPT_KEY).toBe("ctrl+tab");
+	test('DEFAULT_ACCEPT_KEY is "alt+/"', () => {
+		expect(DEFAULT_ACCEPT_KEY).toBe("alt+/");
 	});
 
 	test("humanizeKey: ctrl+tab → Ctrl-Tab", () => {
@@ -955,18 +955,20 @@ describe("controller wiring (agent_settled)", () => {
 			JSON.stringify({ acceptKey: "alt+/" }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const acceptKey = (fake.editor as unknown as { acceptKey: string }).acceptKey;
+		const acceptKey = (fake.editor as unknown as { acceptKey: string })
+			.acceptKey;
 		expect(acceptKey).toBe("alt+/");
 	});
 
-	test("T74e: no acceptKey config → editor defaults to ctrl+tab", async () => {
+	test("T74e: no acceptKey config → editor defaults to alt+/", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
 		});
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const acceptKey = (fake.editor as unknown as { acceptKey: string }).acceptKey;
-		expect(acceptKey).toBe("ctrl+tab");
+		const acceptKey = (fake.editor as unknown as { acceptKey: string })
+			.acceptKey;
+		expect(acceptKey).toBe("alt+/");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {

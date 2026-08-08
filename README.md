@@ -1,19 +1,23 @@
-# next-prompt — inline ghost-text next-prompt suggestions for pi
+# next-prompt — next-prompt suggestions for pi
 
 A pi coding-agent extension that, after an agent turn fully settles and the input
 editor is empty, computes the single most logical next instruction you'd type and
-shows it as **inline greyed ghost text** after the caret.
+shows it as a **colored below-editor suggestion widget**:
 
-- **Tab** (when the autocomplete dropdown is closed) → accept the suggestion.
-- **Any other key** → dismiss the ghost immediately; it's re-armed from the last
-  computed suggestion when you backspace down to empty (no new model call).
-- **No ghost while streaming** — only when the agent is idle and the editor is empty.
-- **No stale suggestions** — the ghost is cleared and any in-flight model call aborted
-  the instant you submit, start a new turn, or the agent starts.
+```
+↳ next: Show me the diff of the skill file you just patched  (Alt-/ to accept)
+```
 
-The built-in `addAutocompleteProvider` API only produces a dropdown; it cannot do inline
-ghost text, so this extension replaces the editor via `setEditorComponent` + a thin
-`CustomEditor` subclass that overlays the suggestion in `render(width)`.
+- **`Alt-/`** (default; configurable) → accept the suggestion: it fills the input box.
+- **Any other key** → dismiss the suggestion; it's re-armed from the last computed one
+  when you backspace down to empty (no new model call).
+- **No suggestion while streaming** — only when the agent is idle and the editor is empty.
+- **No stale suggestions** — the suggestion is cleared and any in-flight model call
+  aborted the instant you submit, start a new turn, or the agent starts.
+
+The suggestion is rendered as a below-editor widget via `ctx.ui.setWidget` (the
+idiomatic pi mechanism), with the `↳ next:` prefix and the accept-key hint colored
+cyan.
 
 ## Install
 
@@ -50,11 +54,11 @@ collisions):
 
 ```json
 {
-  "model": { "provider": "anthropic", "model": "claude-haiku-4-5" },
-  "systemPrompt": "...override the default extractor prompt...",
+  "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
+  "thinking": "low",
+  "acceptKey": "alt+/",
   "maxTranscriptChars": 12000,
   "maxSuggestionChars": 240,
-  "debounceMs": 400,
   "allowCrossProvider": true
 }
 ```
@@ -62,11 +66,21 @@ collisions):
 | Field | Default | Notes |
 | --- | --- | --- |
 | `model` | current model (`ctx.model`) | The model used to generate the suggestion. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
+| `thinking` | unset | Reasoning/thinking level for the suggestion model (`"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`). Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
+| `acceptKey` | `"alt+/"` | Key id that accepts the suggestion (any pi-tui `KeyId`, e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). The accept key is intercepted **before** the base editor sees it, so keys like `ctrl+space` (which sends `\x00`) won't pollute the editor. Accept only fires when the suggestion is showing and the autocomplete dropdown is closed. |
 | `systemPrompt` | built-in extractor | See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length. |
-| `debounceMs` | `400` | Largely redundant with the `agent_settled` trigger; reserved. |
 | `allowCrossProvider` | `true` | When `false`, fall back to the current model if the configured suggestion model is on a **different** provider than the active one. See Security below. |
+
+### Why `alt+/` is the default accept key
+
+- **`tab`** — conflicts with pi's path-autocomplete and `/template` dropdown.
+- **`ctrl+tab`** — many terminals send it as a plain `tab`/`\t` or swallow it (window/tab switcher), so it's unreliable.
+- **`ctrl+space`** — works (sends `\x00`, which pi-tui maps to `ctrl+space`), but the extension intercepts it before the base editor so it no longer pollutes; still, some terminals remap Ctrl-Space to IME toggle.
+- **`alt+/`** — sends an unambiguous `\x1b/` sequence, not bound by pi or most terminals, and is memorable ("accept the suggested next command"). Recommended.
+
+You can always override with any `KeyId`, e.g. `"acceptKey": "ctrl+space"`.
 
 ## Security: cross-provider transcript disclosure
 
@@ -81,8 +95,7 @@ Mitigations:
 
 - `buildTranscript` redacts obvious high-entropy secrets (AWS `AKIA…`, OpenAI `sk-…`,
   GitHub `ghp_…`, Slack `xoxb-…`, PEM private key blocks) before sending. This is
-  defense-in-depth, not a guarantee — the active model may already have seen secrets in
-  the turn, and the model may quote file contents in its text.
+  defense-in-depth, not a guarantee.
 - Set `"allowCrossProvider": false` to force same-provider suggestions silently.
 - The redaction patterns are in `redactSecrets()`; extend them if you handle other
   secret formats.
@@ -93,21 +106,20 @@ Mitigations:
    the default editor.
 2. On `agent_settled` (one event per user-initiated turn, after the agent is truly
    idle), if the editor is empty, the controller calls
-   `ctx.modelRegistry.complete(model, { systemPrompt, messages }, { signal })` with the
-   resolved model and the (redacted, tail-truncated) transcript.
+   `ctx.modelRegistry.complete(model, { systemPrompt, messages }, { signal, reasoning })`
+   with the resolved model, the configured thinking level, and the (redacted,
+   tail-truncated) transcript.
 3. The returned text is sanitized (trimmed, de-quoted, de-fenced, collapsed to one
-   line, capped) and shown as ghost text via `setGhost`.
-4. `decideInput` (a pure function — unit-tested in isolation) decides what each
-   keystroke does: Tab-accept (only when autocomplete is closed), dismiss-on-any-other
-   key, re-arm-on-backspace-to-empty.
-5. `overlayGhost` (pure) inserts the ghost as raw ANSI dim text (`\x1b[2m…\x1b[22m`)
-   immediately after the cursor block, preserving the `CURSOR_MARKER`→cursor offset for
-   IME safety, and bails when the editor is unfocused (no marker emitted).
+   line, capped) and shown via `setWidget("next-prompt", [...], { placement: "belowEditor" })`.
+4. `handleInput` intercepts the configured `acceptKey` **before** delegating to the
+   base editor: if a suggestion is showing and autocomplete is closed, it inserts the
+   suggestion and swallows the key (so `ctrl+space`'s `\x00` never pollutes the box).
+   Any other key delegates to the base editor and dismisses/re-arms the suggestion.
 
 ## Design doc
 
 See [`PLAN.md`](./PLAN.md) for the full oracle-reviewed design, including the audit
-trail of 9 blockers found and fixed during adversarial review.
+trail of blockers found and fixed during adversarial review.
 
 ## License
 

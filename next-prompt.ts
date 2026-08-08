@@ -108,7 +108,7 @@ export interface SuggestionCtx {
 
 const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
-export const DEFAULT_ACCEPT_KEY = "ctrl+tab";
+export const DEFAULT_ACCEPT_KEY = "alt+/";
 
 // ANSI styling for the below-editor widget. Cyan accent for the ↳/next: prefix and
 // the shortcut hint; the suggestion itself is plain (high-contrast default text).
@@ -557,31 +557,41 @@ class NextPromptEditor extends CustomEditor {
 		}
 	}
 
-handleInput(data: string): void {
-const before = this.getText();
-const isAcceptKey = matchesKey(data, this.acceptKey as KeyId);
-// Always delegate first so the base editor keeps authority over Tab-autocomplete,
-// escape, ctrl+d, paste, history, etc.
-super.handleInput(data);
-const after = this.getText();
+	handleInput(data: string): void {
+		const isAcceptKey = matchesKey(data, this.acceptKey as KeyId);
 
-const d = decideInput({
-data,
-ghost: this.ghost,
-lastSuggestion: this.lastSuggestion,
-editorTextBefore: before,
-editorTextAfter: after,
-isShowingAutocomplete: this.isShowingAutocomplete(),
-isTab: isAcceptKey,
-});
+		// Intercept the accept key BEFORE delegating to super so the base editor
+		// doesn't insert the key's raw byte (e.g. \x00 for ctrl+space) and pollute
+		// the editor text. Only accept when a ghost is showing and autocomplete is
+		// NOT open (so we never clobber /template or path completion).
+		if (isAcceptKey && this.ghost && !this.isShowingAutocomplete()) {
+			this.insertTextAtCursor(this.ghost);
+			this.ghost = "";
+			this.renderWidget();
+			return; // swallow the key — super never sees it
+		}
 
-if (d.action === "accept" && d.acceptText != null) {
-this.insertTextAtCursor(d.acceptText);
-}
-const changed = this.ghost !== d.ghost;
-this.ghost = d.ghost;
-if (changed) this.renderWidget();
-}
+		const before = this.getText();
+		// Delegate everything else to the base editor first so it keeps authority
+		// over Tab-autocomplete, escape, ctrl+d, paste, history, etc.
+		super.handleInput(data);
+		const after = this.getText();
+
+		const d = decideInput({
+			data,
+			ghost: this.ghost,
+			lastSuggestion: this.lastSuggestion,
+			editorTextBefore: before,
+			editorTextAfter: after,
+			isShowingAutocomplete: this.isShowingAutocomplete(),
+			isTab: isAcceptKey,
+		});
+
+		// After delegating, only dismiss/rearm/passthrough remain (accept handled above).
+		const changed = this.ghost !== d.ghost;
+		this.ghost = d.ghost;
+		if (changed) this.renderWidget();
+	}
 }
 
 // ---------------------------------------------------------------------------
