@@ -5,7 +5,7 @@
  * lifecycle events and terminal input).
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import {
 	mkdtempSync,
 	mkdirSync,
@@ -17,7 +17,13 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	CURSOR_MARKER,
+	Editor,
+	getKeybindings,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
+import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import type { Api } from "@earendil-works/pi-ai";
 
 import {
@@ -25,8 +31,10 @@ import {
 	buildTranscript,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
+	destinationKey,
 	destinationOf,
 	formatModelOption,
+	GhostEditor,
 	humanizeKey,
 	loadConfig,
 	loadEffectiveConfig,
@@ -39,11 +47,13 @@ import {
 	sanitizeTerminalText,
 	saveConfig,
 	shouldTrigger,
+	suggestionCodePointCap,
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
 	type NextPromptConfig,
 	type SuggestionCtx,
+	type SuggestionState,
 } from "./next-prompt.ts";
 
 // ---------------------------------------------------------------------------
@@ -63,6 +73,8 @@ afterEach(() => {
 	if (origEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = origEnv;
 	rmSync(tmpHome, { recursive: true, force: true });
+	// F-13: never leak fake timers across tests.
+	vi.useRealTimers();
 });
 
 function writeFile(dir: string, path: string, content: string): void {
@@ -245,32 +257,81 @@ describe("loadConfig", () => {
 
 describe("destination identity", () => {
 	test("D1: provider-only identity when no baseUrl", () => {
-		expect(destinationOf({ provider: "openai" })).toEqual({
+		expect(destinationOf({ provider: "openai", id: "gpt" })).toEqual({
 			provider: "openai",
 			origin: "",
+			model: "gpt",
 		});
 	});
 	test("D2: identity includes endpoint origin", () => {
 		expect(
 			destinationOf({
 				provider: "openai",
+				id: "gpt",
 				baseUrl: "https://api.example.com/v1",
 			}),
-		).toEqual({ provider: "openai", origin: "https://api.example.com" });
+		).toEqual({
+			provider: "openai",
+			origin: "https://api.example.com",
+			model: "gpt",
+		});
+	});
+	test("D2b: identity includes the model routing id (F-02/F-10)", () => {
+		expect(
+			destinationOf({
+				provider: "openai",
+				id: "gpt-4o",
+				baseUrl: "https://gateway.example.com/v1",
+			}),
+		).toEqual({
+			provider: "openai",
+			origin: "https://gateway.example.com",
+			model: "gpt-4o",
+		});
+	});
+	test("D2c: same origin but different model route is a DIFFERENT destination", () => {
+		const a = destinationOf({
+			provider: "openai",
+			id: "gpt-4o",
+			baseUrl: "https://gateway.example.com/v1",
+		});
+		const b = destinationOf({
+			provider: "openai",
+			id: "claude",
+			baseUrl: "https://gateway.example.com/v1",
+		});
+		expect(a).not.toEqual(b);
 	});
 	test("D3: same origin with different path/padding is the same destination", () => {
 		const a = destinationOf({
 			provider: "openai",
+			id: "gpt",
 			baseUrl: "https://api.example.com/v1/",
 		});
 		const b = destinationOf({
 			provider: "openai",
+			id: "gpt",
 			baseUrl: "https://api.example.com/v2",
 		});
 		expect(a).toEqual(b);
 	});
 	test("D4: undefined model → undefined destination", () => {
 		expect(destinationOf(undefined)).toBeUndefined();
+	});
+	test("D5: destinationKey includes model; legacy (no model) key can never match (F-02)", () => {
+		const d = destinationOf({
+			provider: "openai",
+			id: "gpt-4o",
+			baseUrl: "https://gateway.example.com/v1",
+		});
+		expect(destinationKey(d!)).toBe("openai@https://gateway.example.com#gpt-4o");
+		// Legacy consent record without a model id → its key never equals a real one.
+		expect(destinationKey({ provider: "openai", origin: "", model: "" })).toBe(
+			"openai",
+		);
+		expect(destinationKey({ provider: "openai", origin: "", model: "" })).not.toBe(
+			destinationKey(d!),
+		);
 	});
 });
 
@@ -280,12 +341,19 @@ describe("destination identity", () => {
 
 describe("loadEffectiveConfig", () => {
 	test("F1: untrusted project config is ignored entirely", () => {
-		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ acceptKey: "ctrl+space" }));
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: "ctrl+space" }),
+		);
 		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
 		writeFile(
 			cwd,
 			".pi/next-prompt.json",
-			JSON.stringify({ model: { provider: "openai", model: "gpt" }, allowCrossProvider: true }),
+			JSON.stringify({
+				model: { provider: "openai", model: "gpt" },
+				allowCrossProvider: true,
+			}),
 		);
 		const eff = loadEffectiveConfig(cwd, { projectTrusted: false });
 		expect(eff.projectTrusted).toBe(false);
@@ -384,15 +452,56 @@ describe("loadEffectiveConfig", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
-	test("F8: numeric acceptKey is dropped and cannot reach matchesKey", () => {
+	test("F7b: malformed global JSON fails closed (computeDisabled) — F-07", () => {
+		writeFile(tmpHome, "next-prompt.json", "{ broken");
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F7c: malformed project JSON fails closed (computeDisabled) — F-07", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", "{ broken");
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F7d: unreadable global config fails closed (computeDisabled) — F-07", () => {
+		// Directory at the config path: readFileSync throws EISDIR.
+		mkdirSync(join(tmpHome, "next-prompt.json"));
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F7e: both configs malformed fails closed (computeDisabled) — F-07", () => {
+		writeFile(tmpHome, "next-prompt.json", "{ broken");
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", "{ also broken");
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F7f: valid project config cannot rescue an invalid global config — F-07", () => {
+		writeFile(tmpHome, "next-prompt.json", "{ broken");
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
 		writeFile(
-			tmpHome,
-			"next-prompt.json",
-			JSON.stringify({ acceptKey: 7 }),
+			cwd,
+			".pi/next-prompt.json",
+			JSON.stringify({ maxSuggestionChars: 7 }),
 		);
-		const eff = loadEffectiveConfig(
-			mkdtempSync(join(tmpdir(), "np-cwd-")),
-		);
+		const eff = loadEffectiveConfig(cwd);
+		expect(eff.computeDisabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("F8: numeric acceptKey is dropped and cannot reach matchesKey", () => {
+		writeFile(tmpHome, "next-prompt.json", JSON.stringify({ acceptKey: 7 }));
+		const eff = loadEffectiveConfig(mkdtempSync(join(tmpdir(), "np-cwd-")));
 		expect(eff.acceptKey).toBeUndefined();
 	});
 });
@@ -409,16 +518,52 @@ describe("resolveSuggestionModel", () => {
 	test("T8: configured model on the SAME destination as active is returned (no cross flag)", () => {
 		const configured = { provider: "openai", id: "gpt-4o" };
 		const ctx = makeCtx({
-			model: { provider: "openai", id: "gpt" },
+			model: { provider: "openai", id: "gpt-4o" },
 			findModel: (p, m) =>
 				p === "openai" && m === "gpt-4o" ? configured : undefined,
 		});
-		const out = resolveSuggestionModel(
-			ctx,
-			cfgModel("openai", "gpt-4o"),
-			{ value: false },
-		);
+		const out = resolveSuggestionModel(ctx, cfgModel("openai", "gpt-4o"), {
+			value: false,
+		});
 		expect(out).toEqual({ model: configured, crossDestination: false });
+	});
+
+	test("T8b: same provider+endpoint but DIFFERENT model route is a DIFFERENT destination (F-02/F-10)", () => {
+		// Two downstream models behind one gateway: active gateway/openai,
+		// configured gateway/claude — same origin, different route.
+		const active = {
+			provider: "openai",
+			id: "gpt",
+			baseUrl: "https://gateway.example.com/v1",
+		};
+		const configured = {
+			provider: "openai",
+			id: "claude",
+			baseUrl: "https://gateway.example.com/v1",
+		};
+		const ctx = makeCtx({
+			model: active,
+			findModel: (p, m) =>
+				p === "openai" && m === "claude" ? configured : undefined,
+		});
+		// Deny path: cross-destination use disabled → falls back to active, no consent.
+		const deny: NextPromptConfig = {
+			model: { provider: "openai", model: "claude" },
+			allowCrossProvider: false,
+		};
+		expect(resolveSuggestionModel(ctx, deny, { value: false })).toEqual({
+			model: active,
+			crossDestination: false,
+		});
+		// Consent path: cross-destination use enabled → flags crossDestination.
+		const allow: NextPromptConfig = {
+			model: { provider: "openai", model: "claude" },
+			allowCrossProvider: true,
+		};
+		expect(resolveSuggestionModel(ctx, allow, { value: false })).toEqual({
+			model: configured,
+			crossDestination: true,
+		});
 	});
 
 	test("T9: configured model absent returns ctx.model and notifies once (warning)", () => {
@@ -498,7 +643,7 @@ describe("resolveSuggestionModel", () => {
 	test("T15: allowCrossProvider=false + same destination returns configured model", () => {
 		const configured = { provider: "openai", id: "gpt-4o" };
 		const ctx = makeCtx({
-			model: { provider: "openai", id: "gpt" },
+			model: { provider: "openai", id: "gpt-4o" },
 			findModel: (p, m) =>
 				p === "openai" && m === "gpt-4o" ? configured : undefined,
 		});
@@ -513,7 +658,11 @@ describe("resolveSuggestionModel", () => {
 	});
 
 	test("T15b: same provider label but different endpoint is a DIFFERENT destination (F-10)", () => {
-		const active = { provider: "openai", id: "gpt", baseUrl: "https://a.example.com/v1" };
+		const active = {
+			provider: "openai",
+			id: "gpt",
+			baseUrl: "https://a.example.com/v1",
+		};
 		const configured = {
 			provider: "openai",
 			id: "gpt-4o",
@@ -665,9 +814,7 @@ describe("redactSecrets", () => {
 	});
 	test("T18: OpenAI sk- key redacted", () => {
 		const sk = `sk-${"a".repeat(24)}`;
-		expect(redactSecrets(`token ${sk} here`)).toBe(
-			"token [redacted] here",
-		);
+		expect(redactSecrets(`token ${sk} here`)).toBe("token [redacted] here");
 	});
 	test("T19: GitHub ghp_ token redacted", () => {
 		// Fixture assembled from parts so scanners do not treat the literal as a real token.
@@ -698,9 +845,7 @@ describe("redactSecrets", () => {
 	test("T20a: short ghp_ (under 36 chars) NOT redacted (avoids false positives like ghp_test)", () => {
 		const shortPat = `gh${String.fromCharCode(112)}_` + "0".repeat(35);
 		expect(redactSecrets("tok ghp_test end")).toBe("tok ghp_test end");
-		expect(redactSecrets(`tok ${shortPat} end`)).toBe(
-			`tok ${shortPat} end`,
-		); // 35 chars after prefix → below 36 threshold → not matched
+		expect(redactSecrets(`tok ${shortPat} end`)).toBe(`tok ${shortPat} end`); // 35 chars after prefix → below 36 threshold → not matched
 	});
 
 	test("T20b: 40-char ghp_ IS redacted (classic GitHub PAT)", () => {
@@ -714,6 +859,68 @@ describe("redactSecrets", () => {
 		expect(redactSecrets("bot xoxb-1234567890-abc here")).toBe(
 			"bot xoxb-1234567890-abc here",
 		); // second group only 3 chars → not matched
+	});
+	test("T20d: sk-proj- OpenAI project key redacted (positive + near-miss)", () => {
+		const token = `sk-proj-${("A1b2" + "C3d4").repeat(5)}`; // 40 chars after prefix
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+		// Near-miss: too short.
+		expect(redactSecrets("tok sk-proj-short end")).toBe(
+			"tok sk-proj-short end",
+		);
+	});
+	test("T20e: sk-ant- Anthropic key redacted (positive + near-miss)", () => {
+		const token = `sk-ant-${("aB12" + "cD34").repeat(6)}`; // 48 chars
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+		expect(redactSecrets("tok sk-ant-x end")).toBe("tok sk-ant-x end");
+	});
+	test("T20f: github_pat_ fine-grained PAT redacted (positive + near-miss)", () => {
+		const token = `github_pat_${("a1B" + "2cD").repeat(7)}_abc`; // 25+ chars
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+		expect(redactSecrets("tok github_pat_short end")).toBe(
+			"tok github_pat_short end",
+		);
+	});
+	test("T20g: glpat- GitLab PAT redacted (positive + near-miss)", () => {
+		const token = `glpat-${("a1b" + "2C").repeat(5)}xyz`; // 21+ chars
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+		expect(redactSecrets("tok glpat-short end")).toBe("tok glpat-short end");
+	});
+	test("T20h: AIza Google API key redacted (positive + near-miss)", () => {
+		const token = `AIza${("aB1" + "2Cd").repeat(9)}x`; // 31+ chars after prefix
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+		expect(redactSecrets("tok AIza-xxx end")).toBe("tok AIza-xxx end");
+	});
+	test("T20i: JWT redacted (positive + near-miss)", () => {
+		const jwt = `eyJhbGciOiJIUzI1NiJ9.${("abc" + "123").repeat(4)}.${("sig" + "456").repeat(4)}`;
+		expect(redactSecrets(`tok ${jwt} end`)).toBe("tok [redacted] end");
+		// Near-miss: two segments only.
+		expect(redactSecrets("tok eyJhbGciOiJIUzI1NiJ9.abc end")).toBe(
+			"tok eyJhbGciOiJIUzI1NiJ9.abc end",
+		);
+	});
+	test("T20j: assignment forms redacted (positive + near-miss)", () => {
+		expect(redactSecrets("password=hunter2!")).toBe("[redacted]");
+		expect(redactSecrets("API_KEY: \"abc123\"")).toBe("[redacted]");
+		expect(redactSecrets("client_secret='s3cr3t'")).toBe("[redacted]");
+		// Near-miss: key without a value separator.
+		expect(redactSecrets("the password is hunter2")).toBe(
+			"the password is hunter2",
+		);
+	});
+	test("T20k: secrets echoed in ASSISTANT text are redacted (F-11)", () => {
+		const branch = [
+			assistantEntry(
+				`here is the key: sk-proj-${("A1b2" + "C3d4").repeat(5)} and sk-ant-${("aB12" + "cD34").repeat(6)}`,
+			),
+		];
+		const out = buildTranscript(branch, {});
+		expect(out).toBe("Assistant: here is the key: [redacted] and [redacted]");
+	});
+	test("T20l: secrets echoed in USER text are redacted (F-11)", () => {
+		const branch = [userEntry(`gitlab token glpat-${("a1b" + "2C").repeat(5)}xyz`)];
+		expect(buildTranscript(branch, {})).toBe(
+			"User: gitlab token [redacted]",
+		);
 	});
 });
 
@@ -760,6 +967,58 @@ describe("buildTranscript", () => {
 	test("T32: multi-line user content preserves internal newlines", () => {
 		const branch = [userEntry("line1\nline2")];
 		expect(buildTranscript(branch, {})).toBe("User: line1\nline2");
+	});
+	test("T32b: maxRecentTurns keeps only the last N message entries (F-11)", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolResultEntry(),
+			userEntry("q2"),
+			assistantEntry("a2"),
+		];
+		const out = buildTranscript(branch, { maxRecentTurns: 2 });
+		expect(out).toBe("User: q2\nAssistant: a2");
+	});
+	test("T32c: maxRecentTurns larger than branch keeps everything (F-11)", () => {
+		const branch = [userEntry("q1"), assistantEntry("a1")];
+		expect(buildTranscript(branch, { maxRecentTurns: 10 })).toBe(
+			"User: q1\nAssistant: a1",
+		);
+	});
+	test("T32d: maxRecentTurns=1 keeps the single newest entry (F-11)", () => {
+		const branch = [userEntry("q1"), assistantEntry("a1"), userEntry("q2")];
+		expect(buildTranscript(branch, { maxRecentTurns: 1 })).toBe("User: q2");
+	});
+	test("T32e: toolResult entries between kept messages stay excluded (F-11)", () => {
+		const branch = [
+			userEntry("q1"),
+			assistantEntry("a1"),
+			toolResultEntry(),
+			userEntry("q2"),
+		];
+		expect(buildTranscript(branch, { maxRecentTurns: 2 })).toBe(
+			"Assistant: a1\nUser: q2",
+		);
+	});
+	test("T32f: invalid maxRecentTurns in config fails closed (F-11)", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ maxRecentTurns: 0 }),
+		);
+		expect(
+			loadEffectiveConfig(mkdtempSync(join(tmpdir(), "np-cwd-")))
+				.computeDisabled,
+		).toBe(true);
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ maxRecentTurns: 201 }),
+		);
+		expect(
+			loadEffectiveConfig(mkdtempSync(join(tmpdir(), "np-cwd-")))
+				.computeDisabled,
+		).toBe(true);
 	});
 });
 
@@ -830,6 +1089,31 @@ describe("sanitizeSuggestion", () => {
 		const out = sanitizeSuggestion("ab👨‍👩‍👧cd", { maxSuggestionChars: 2 });
 		expect(out).toBe("ab");
 	});
+	test("T44b: zero-width payload cannot bypass the code-point cap (F-01)", () => {
+		const zwj = "\u200d".repeat(10_000);
+		const out = sanitizeSuggestion(zwj, { maxSuggestionChars: 1 });
+		// Bounded by the code-point cap (max*4 = 4), and no dangling ZWJ remains.
+		expect(out.length).toBeLessThanOrEqual(4);
+		expect(out.endsWith("\u200d")).toBe(false);
+	});
+	test("T44c: mixed zero-width + text is bounded by the code-point cap (F-01)", () => {
+		const raw = `run ${("\u200d").repeat(10_000)} tail`;
+		const out = sanitizeSuggestion(raw, { maxSuggestionChars: 5 });
+		expect(out.length).toBeLessThanOrEqual(20); // 5*4 codepoints
+		expect(out.endsWith("\u200d")).toBe(false);
+	});
+	test("T44d: default cap also bounds a huge zero-width payload (F-01)", () => {
+		const out = sanitizeSuggestion("\u200d".repeat(50_000), {});
+		expect(out.length).toBeLessThanOrEqual(suggestionCodePointCap(240));
+	});
+	test("T44e: emoji, CJK, combining, RTL text stay usable under the caps (F-01)", () => {
+		const text = "👨‍👩‍👧 café 日本語 مرحبا e\u0301";
+		const out = sanitizeSuggestion(text, { maxSuggestionChars: 240 });
+		expect(out).toBe(text); // unchanged at generous width
+		// Wide CJK under a small width cap still truncates at grapheme boundary.
+		const small = sanitizeSuggestion("日本語", { maxSuggestionChars: 2 });
+		expect(visibleWidth(small)).toBeLessThanOrEqual(2);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -884,7 +1168,9 @@ describe("sanitizeTerminalText", () => {
 		expect(sanitizeTerminalText("a\x7fb")).toBe("ab");
 	});
 	test("T50f: C1 controls are removed", () => {
-		expect(sanitizeTerminalText("a\x9bb")).toBe("ab"); // CSI single-byte
+		// 0x9B is CSI: the sequence (including its final byte) is consumed.
+		expect(sanitizeTerminalText("a\x9bb")).toBe("a");
+		expect(sanitizeTerminalText("a\x9b31mred\x9b0mb")).toBe("aredb");
 	});
 	test("T50g: bidi override/isolate characters are removed — including consecutive controls (P1-2)", () => {
 		expect(sanitizeTerminalText("a\u202Eb\u202Cc")).toBe("abc");
@@ -898,15 +1184,17 @@ describe("sanitizeTerminalText", () => {
 		expect(sanitizeTerminalText("a\x1bX")).toBe("a"); // ESC + final byte
 	});
 	test("T50i: safe Unicode (emoji, CJK, combining) is preserved", () => {
-		expect(sanitizeTerminalText("👨‍👩‍👧 café 日本語")).toBe("👨‍👩‍👧 café 日本語");
+		expect(sanitizeTerminalText("👨‍👩‍👧 café 日本語")).toBe(
+			"👨‍👩‍👧 café 日本語",
+		);
 	});
 	test("T50j: newline/tab are normalized to space", () => {
 		expect(sanitizeTerminalText("a\nb\tc")).toBe("a b c");
 	});
 	test("T50k: sanitizeSuggestion strips OSC before truncation", () => {
-		expect(
-			sanitizeSuggestion(`ok \x1b]52;c;${btoa("payload")}\x07`, {}),
-		).toBe("ok");
+		expect(sanitizeSuggestion(`ok \x1b]52;c;${btoa("payload")}\x07`, {})).toBe(
+			"ok",
+		);
 	});
 	test("T50l: OSC terminated by C1 ST (0x9C) is removed without eating following text (P2-2)", () => {
 		expect(sanitizeTerminalText("a\x1b]0;title\x9cb")).toBe("ab");
@@ -921,6 +1209,34 @@ describe("sanitizeTerminalText", () => {
 	test("T50n: DCS/APC also terminated by C1 ST", () => {
 		expect(sanitizeTerminalText("a\x1bP1;2data\x9cb")).toBe("ab");
 		expect(sanitizeTerminalText("a\x1b_stuff\x9cb")).toBe("ab");
+	});
+	test("T50o: PM (ESC ^) and SOS (ESC X) sequences are removed (F-01)", () => {
+		expect(sanitizeTerminalText("a\x1b^payload\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x1b^payload\x07b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x1bXpayload\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x1bXpayload\x9cb")).toBe("ab");
+	});
+	test("T50p: 8-bit CSI (0x9B) consumes its full sequence (F-01)", () => {
+		expect(sanitizeTerminalText("a\x9b31mred\x9b0mb")).toBe("aredb");
+		expect(sanitizeTerminalText("a\x9b2Jb")).toBe("ab");
+	});
+	test("T50q: 8-bit OSC/DCS/PM/SOS/APC introducers consume payload to terminator (F-01)", () => {
+		// 0x9D OSC, 0x90 DCS, 0x9E PM, 0x98 SOS, 0x9F APC — each with ESC\\ ST.
+		expect(sanitizeTerminalText("a\x9d0;title\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x9d52;c;xyz\x07b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x90data\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x9epayload\x1b\\b")).toBe("ab");
+		expect(sanitizeTerminalText("a\x98payload\x9cb")).toBe("ab");
+		expect(sanitizeTerminalText("a\x9fpayload\x07b")).toBe("ab");
+	});
+	test("T50r: 8-bit OSC payload longer than the scan cap is fully consumed (F-01)", () => {
+		const payload = "A".repeat(4200);
+		expect(sanitizeTerminalText(`a\x9d${payload}\x07b`)).toBe("a");
+	});
+	test("T50s: lone surrogates dropped, valid pairs preserved (F-01)", () => {
+		expect(sanitizeTerminalText("a\ud800b")).toBe("ab");
+		expect(sanitizeTerminalText("a\udc00b")).toBe("ab");
+		expect(sanitizeTerminalText("a\ud83d\ude00b")).toBe("a😀b");
 	});
 });
 
@@ -1009,7 +1325,8 @@ describe("overlayGhost", () => {
 		expect(out[1]).toContain("\x1b[2m");
 		expect(out[1]).toContain("\x1b[22m");
 		// P2-4: every returned line is width-exact.
-		for (const line of out) expect(visibleWidth(line)).toBeLessThanOrEqual(WIDTH);
+		for (const line of out)
+			expect(visibleWidth(line)).toBeLessThanOrEqual(WIDTH);
 	});
 	test("T64: output contains raw ANSI dim escapes (not theme.fg)", () => {
 		const lines = makeLines({ text: "hi" });
@@ -1037,6 +1354,236 @@ describe("overlayGhost", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Real pi-tui editor integration (F-13)
+// ---------------------------------------------------------------------------
+// Uses the actual pi-tui Editor/CustomEditor/GhostEditor classes with a stub
+// TUI so rendering, focus, cursor, undo/history, and autocomplete contracts
+// are exercised against the real implementation, not a callback fake.
+
+describe("real pi-tui editor integration", () => {
+	const mkTui = () =>
+		({
+			requestRender: () => {},
+			terminal: { rows: 24, cols: 80 },
+		}) as never;
+	const mkTheme = () =>
+		({
+			borderColor: (s: string) => s,
+			selectList: {
+				selectedPrefix: (s: string) => s,
+				selectedText: (s: string) => s,
+				description: (s: string) => s,
+				scrollInfo: (s: string) => s,
+				noMatch: (s: string) => s,
+			},
+		}) as never;
+
+	function mkGhostState(
+		over: Partial<SuggestionState> = {},
+	): SuggestionState {
+		return {
+			suggestion: "",
+			lastSuggestion: "",
+			acceptKey: "alt+/",
+			renderMode: "ghost",
+			rearmDelayMs: 2000,
+			rearmTimer: undefined,
+			rearmCheckTimer: undefined,
+			inputGeneration: 0,
+			isIdleGetter: () => true,
+			getEditorText: () => "",
+			setEditorText: () => {},
+			publishWidget: () => {},
+			renderGhost: undefined,
+			abortInflight: () => {},
+			...over,
+		};
+	}
+
+	test("E1: ghost overlay renders width-safe, focused and unfocused, at 1/2/10/40/120", () => {
+		for (const width of [1, 2, 10, 40, 120]) {
+			const state = mkGhostState({ suggestion: "suggestion text" });
+			const ed = new GhostEditor(mkTui(), mkTheme(), {} as never, state);
+			ed.focused = true;
+			const focused = ed.render(width);
+			for (const line of focused)
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			const focusedJoin = focused.join("\n");
+			// The ghost only fits when the editor content width allows it; at
+			// width 1-2 nothing can render. Width-safety holds at every width.
+			if (width >= 10) {
+				expect(focusedJoin).toContain("\x1b[2m");
+			}
+			expect(focusedJoin).toContain(CURSOR_MARKER);
+
+			const unfocused = new GhostEditor(mkTui(), mkTheme(), {} as never, state);
+			unfocused.focused = false;
+			const unfocusedLines = unfocused.render(width);
+			for (const line of unfocusedLines)
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			const unfocusedJoin = unfocusedLines.join("\n");
+			if (width >= 10) {
+				expect(unfocusedJoin).toContain("\x1b[2m");
+			}
+			expect(unfocusedJoin).not.toContain(CURSOR_MARKER);
+		}
+	});
+
+	test("E2: ghost overlay never emits partial ANSI fragments", () => {
+		const state = mkGhostState({ suggestion: "suggestion" });
+		const ed = new GhostEditor(mkTui(), mkTheme(), {} as never, state);
+		ed.focused = true;
+		for (const line of ed.render(40)) {
+			// After stripping all known ANSI sequences and the (zero-width)
+			// cursor marker, no ESC may remain.
+			const stripped = line
+				.replace(CURSOR_MARKER, "")
+				.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+				.replace(/\x1b\[[0-9;]*m/g, "");
+			expect(stripped).not.toContain("\x1b");
+		}
+	});
+
+	test("E3: ghost preserves base text and mid-line cursor position", () => {
+		const state = mkGhostState({ suggestion: "ghost" });
+		const ed = new GhostEditor(mkTui(), mkTheme(), getKeybindings() as never, state);
+		ed.focused = true;
+		ed.setText("abc");
+		// Move cursor to the start: left, left, left.
+		ed.handleInput("\x1b[D");
+		ed.handleInput("\x1b[D");
+		ed.handleInput("\x1b[D");
+		const lines = ed.render(40).join("\n");
+		// Cursor sits on the first grapheme: highlighted "a", then ghost, then "bc".
+		expect(lines).toContain("\x1b[7ma\x1b[0m");
+		expect(lines).toContain("\x1b[2mghost\x1b[22mbc");
+		expect(ed.getText()).toBe("abc");
+	});
+
+	test("E4: base editor handles real input: typing, backspace, history, undo", () => {
+		const kb = getKeybindings();
+		const ed = new CustomEditor(mkTui(), mkTheme(), kb as never);
+		ed.focused = true;
+		for (const ch of ["a", "b", "c"]) ed.handleInput(ch);
+		expect(ed.getText()).toBe("abc");
+		ed.handleInput("\x7f"); // backspace
+		expect(ed.getText()).toBe("ab");
+		ed.handleInput("\x1f"); // ctrl+- (undo)
+		expect(ed.getText()).toBe("abc");
+		// History browsing.
+		ed.setText("prompt one");
+		ed.addToHistory(ed.getText());
+		ed.setText("");
+		ed.handleInput("\x1b[A"); // up arrow
+		expect(ed.getText()).toBe("prompt one");
+	});
+
+	test("E5: autocomplete dropdown renders width-safe and Tab applies the selection", async () => {
+		const ed = new Editor(mkTui(), mkTheme());
+		ed.focused = true;
+		let requested = 0;
+		ed.setAutocompleteProvider({
+			triggerCharacters: ["/"],
+			getSuggestions: async () => {
+				requested += 1;
+				return { items: [{ value: "bar", label: "bar" }], prefix: "/" };
+			},
+			applyCompletion: (lines, cursorLine, _cursorCol) => {
+				lines[cursorLine] = "/bar";
+				return { lines, cursorLine, cursorCol: 4 };
+			},
+		});
+		ed.handleInput("/");
+		await sleep(200); // debounce + async resolve
+		expect(requested).toBeGreaterThan(0);
+		const rendered = ed.render(40).join("\n");
+		expect(rendered).toContain("bar"); // dropdown visible
+		ed.handleInput("\t"); // accept highlighted completion
+		expect(ed.getText()).toBe("/bar");
+	});
+
+	test("E6: terminal listeners run before focused editor input; consume stops the chain (F-13)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "accept me" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("accept me");
+		// A second, later-registered listener observes the chain after ours.
+		let spyCalls = 0;
+		fake.inputListeners.push(() => {
+			spyCalls += 1;
+			return undefined;
+		});
+		// Accept key: our handler consumes → later listener and editor never see it.
+		fake.deliverInput("\x1b/");
+		expect(spyCalls).toBe(0);
+		expect(fake.editor.getText()).toBe("");
+		expect(fake.editorText).toBe("accept me");
+		// Non-accept key: our handler dismisses but does NOT consume → editor gets it.
+		fake.deliverInput("x");
+		expect(spyCalls).toBe(1);
+		expect(fake.editor.getText()).toBe("x");
+	});
+
+	test("E7: conflicting acceptKey 'tab' is rejected and tab passes through unconsumed", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: "tab" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "sug" }],
+				stopReason: "stop",
+			},
+		});
+		// Config was rejected → hint shows the DEFAULT key, not Tab.
+		expect(fake.widgetContent?.[0] ?? "").not.toContain("Tab to accept");
+		// Tab is never consumed and never fills the editor.
+		fake.deliverInput("\t");
+		expect(fake.editor.getText()).toBe("");
+		expect(fake.editorText).toBe("");
+		expect(fake.widgetContent).toBeUndefined(); // dismissed
+	});
+
+	test("E8: lifecycle — reload/new/resume/fork keep exactly one listener per session and no duplicate installs", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		let starts = 1;
+		for (const reason of ["reload", "new", "resume", "fork"]) {
+			starts += 1;
+			await fake.handlers.get("session_start")!(
+				{ type: "session_start", reason },
+				fake.ctx,
+			);
+			// pi clears extension listeners + custom editors on reset; a fresh
+			// session_start unsubscribes the old listener and (re)installs the
+			// editor exactly once for that session.
+			expect(fake.inputListeners).toHaveLength(1);
+			expect(fake.unsubInputCalls).toBe(starts - 1);
+			expect(fake.editorComponentCalls).toBe(starts);
+		}
+	});
+
+	test("E9: session_shutdown unsubscribes the terminal listener", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.inputListeners).toHaveLength(1);
+		fake.handlers.get("session_shutdown")!({}, fake.ctx);
+		expect(fake.inputListeners).toHaveLength(0);
+		expect(fake.unsubInputCalls).toBe(1);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Controller wiring (fake ExtensionAPI firing agent_settled)
 // ---------------------------------------------------------------------------
 
@@ -1054,7 +1601,7 @@ function makeFake(opts: {
 	mode?: string;
 	projectTrusted?: boolean;
 	hasPriorEditor?: boolean;
-	confirmResult?: boolean;
+	confirmResult?: boolean | Promise<boolean> | (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
@@ -1065,6 +1612,14 @@ function makeFake(opts: {
 	inputHandler:
 		| ((data: string) => { consume?: boolean } | undefined)
 		| undefined;
+	/** Registered terminal-input listeners, in order (model of pi's listener chain). */
+	inputListeners: Array<(data: string) => { consume?: boolean } | undefined>;
+	/** Deliver raw input through the listener chain (consume stops dispatch). */
+	deliverInput: (data: string) => void;
+	/** Number of listener unsubscriptions (pi clears listeners on reset). */
+	unsubInputCalls: number;
+	/** The focused editor component (real pi-tui Editor) receiving non-consumed input. */
+	editor: import("@earendil-works/pi-tui").Editor;
 	calls: {
 		complete: Array<{
 			model: unknown;
@@ -1097,9 +1652,19 @@ function makeFake(opts: {
 	let inputHandler:
 		| ((data: string) => { consume?: boolean } | undefined)
 		| undefined;
+	const inputListeners: Array<
+		(data: string) => { consume?: boolean } | undefined
+	> = [];
+	let unsubInputCalls = 0;
 	let widgetContent: string[] | undefined;
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
+	// Real pi-tui Editor as the focused component (F-13: real editor input).
+	const editor = new Editor(
+		{ requestRender: () => {}, terminal: { rows: 24, cols: 80 } } as unknown as never,
+		{ borderColor: (s: string) => s, selectList: {} } as unknown as never,
+	);
+	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
 		cwd: "/tmp",
@@ -1136,14 +1701,22 @@ function makeFake(opts: {
 			confirm: async (title: string) => {
 				calls.confirms.push(title);
 				opts.confirmCall?.();
-				return opts.confirmResult ?? true;
+				const result =
+					typeof opts.confirmResult === "function"
+						? opts.confirmResult()
+						: (opts.confirmResult ?? true);
+				return typeof result === "boolean" ? result : await result;
 			},
 			onTerminalInput: (
 				handler: (data: string) => { consume?: boolean } | undefined,
 			) => {
 				inputHandler = handler;
+				inputListeners.push(handler);
 				return () => {
-					inputHandler = undefined;
+					const idx = inputListeners.indexOf(handler);
+					if (idx >= 0) inputListeners.splice(idx, 1);
+					if (inputHandler === handler) inputHandler = undefined;
+					unsubInputCalls += 1;
 				};
 			},
 			getEditorText: () => editorText,
@@ -1158,7 +1731,7 @@ function makeFake(opts: {
 				widgetContent = content;
 			},
 			getEditorComponent: () =>
-				opts.hasPriorEditor ? (() => {}) as never : undefined,
+				opts.hasPriorEditor ? ((() => {}) as never) : undefined,
 			setEditorComponent: (
 				factory: (tui: unknown, theme: unknown, kb: unknown) => unknown,
 			) => {
@@ -1196,6 +1769,24 @@ function makeFake(opts: {
 		},
 		get inputHandler() {
 			return inputHandler;
+		},
+		get inputListeners() {
+			return inputListeners;
+		},
+		deliverInput: (data: string) => {
+			// pi invokes terminal listeners BEFORE the focused component; a
+			// { consume: true } result stops the chain (F-13).
+			for (const listener of [...inputListeners]) {
+				const result = listener(data);
+				if (result?.consume) return;
+			}
+			editor.handleInput(data);
+		},
+		get unsubInputCalls() {
+			return unsubInputCalls;
+		},
+		get editor() {
+			return editor;
 		},
 		get editorComponentInstalled() {
 			return editorComponentInstalled;
@@ -1440,20 +2031,47 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T84: loadConfig failure at session_start → extension still installs, falls back to ctx.model", async () => {
-		// Malformed global config.
+	test("T84: loadConfig failure at session_start → computeDisabled, zero complete calls (F-07)", async () => {
+		// Malformed global config must fail closed: no suggestion model request.
 		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", "{ broken");
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
 		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		// The TUI warning is surfaced.
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("suggestions disabled"),
+			),
+		).toBe(true);
+	});
+
+	test("T84b: malformed PROJECT config → computeDisabled, zero complete calls (F-07)", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", "{ broken");
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		(fake.ctx as { cwd: string }).cwd = cwd;
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(fake.calls.complete[0]!.model).toEqual({
-			provider: "openai",
-			id: "gpt",
-		});
+		expect(fake.calls.complete).toHaveLength(0);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("T84c: invalid privacy field (maxTranscriptChars) → zero complete calls", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: "unlimited" }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
 	});
 
 	test("T85: input event → inflight aborted + ghost cleared", async () => {
@@ -1517,6 +2135,7 @@ describe("acceptance / regression", () => {
 		// The delete-to-empty re-arm is exercised end-to-end in the re-arm describe
 		// (T98+). This regression asserts Escape while a suggestion is showing does
 		// NOT re-arm, because dismissal is not a non-empty→empty transition.
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -1527,7 +2146,7 @@ describe("acceptance / regression", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.inputHandler!("\x1b"); // Escape dismisses
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent).toBeUndefined(); // no re-arm
 	});
 
@@ -1562,6 +2181,7 @@ describe("acceptance / regression", () => {
 	});
 
 	test("T92b: stale cached suggestion never re-arms after a submit (F-09)", async () => {
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -1579,7 +2199,7 @@ describe("acceptance / regression", () => {
 		fake.setEditorText("");
 		// Delete-to-empty would previously re-arm the stale cache; must NOT now.
 		fake.inputHandler!("\x7f");
-		await sleep(200);
+		vi.advanceTimersByTime(200);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 });
@@ -1669,6 +2289,7 @@ function writeRearmConfig(delayMs: number): void {
 
 describe("re-arm after delete-to-empty", () => {
 	test("T98: accept then delete back to empty → suggestion re-appears after delay (no new model call)", async () => {
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -1687,23 +2308,25 @@ describe("re-arm after delete-to-empty", () => {
 		fake.inputHandler!("\x7f");
 		fake.setEditorText("");
 		// After the deferred check + rearmDelayMs, the suggestion re-appears.
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
 		// No new model call — the complete call count is unchanged.
 		expect(fake.calls.complete.length).toBe(1);
 	});
 
 	test("T99: no last suggestion → nothing to re-arm", async () => {
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		// No agent_settled → no suggestion, no lastSuggestion. Fire backspace-to-empty.
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T100: re-arm canceled if editor non-empty when timer fires", async () => {
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -1718,11 +2341,12 @@ describe("re-arm after delete-to-empty", () => {
 		fake.inputHandler!("\x7f");
 		// Type something before the rearm timer fires.
 		fake.setEditorText("new text");
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T101: re-arm canceled if agent becomes non-idle", async () => {
+		vi.useFakeTimers();
 		writeRearmConfig(60);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -1736,11 +2360,12 @@ describe("re-arm after delete-to-empty", () => {
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
 		fake.setIdle(false);
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T102: config rearmDelayMs default is 2000 when unconfigured", async () => {
+		vi.useFakeTimers();
 		// No config file → default 2000. We don't wait 2s; just assert the re-arm does
 		// NOT fire within a short window (proving it's not the tiny default).
 		const { fake } = await setup({
@@ -1754,7 +2379,7 @@ describe("re-arm after delete-to-empty", () => {
 		fake.inputHandler!("\x1b/");
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
-		await sleep(150);
+		vi.advanceTimersByTime(150);
 		expect(fake.widgetContent).toBeUndefined(); // hasn't fired yet (default is 2000ms)
 	});
 });
@@ -1826,7 +2451,9 @@ describe("renderMode config", () => {
 		});
 		expect(fake.editorComponentInstalled).toBe(false); // never clobbers
 		expect(
-			fake.calls.notifies.some(([m, t]) => t === "warning" && m.includes("another extension")),
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("another extension"),
+			),
 		).toBe(true);
 		// P1-1: the fallback must actually render the widget, not silently compute.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -1948,13 +2575,23 @@ describe("non-TUI mode", () => {
 // ---------------------------------------------------------------------------
 
 describe("cross-destination consent", () => {
-	async function setupCross(opts: { confirmResult?: boolean } = {}) {
+	async function setupCross(opts: {
+		confirmResult?:
+			| boolean
+			| Promise<boolean>
+			| (() => boolean | Promise<boolean>);
+		baseUrl?: string;
+	} = {}) {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt" },
+			model: {
+				provider: "openai",
+				id: "gpt",
+				baseUrl: opts.baseUrl,
+			},
 			findModel: (p, m) =>
 				p === "anthropic" && m === "haiku"
-					? { provider: "anthropic", id: "haiku" }
+					? { provider: "anthropic", id: "haiku", baseUrl: opts.baseUrl }
 					: undefined,
 			...opts,
 		});
@@ -1970,6 +2607,15 @@ describe("cross-destination consent", () => {
 		return { fake };
 	}
 
+	function consentsOnDisk(): unknown[] {
+		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`;
+		try {
+			return JSON.parse(readFileSync(path, "utf-8")) as unknown[];
+		} catch {
+			return [];
+		}
+	}
+
 	test("C1: first cross-destination use prompts for consent; grant → complete on configured model", async () => {
 		const { fake } = await setupCross();
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -1978,19 +2624,171 @@ describe("cross-destination consent", () => {
 			provider: "anthropic",
 			id: "haiku",
 		});
+		expect(consentsOnDisk()).toHaveLength(1);
 	});
 
 	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
 		const { fake } = await setupCross({ confirmResult: false });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
-		expect(
-			fake.calls.notifies.some(([m]) => m.includes("declined")),
-		).toBe(true);
+		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
+			true,
+		);
 		// Session denial: settling again must not re-prompt nor send.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.confirms).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
+		const { fake } = await setupCross();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(consentsOnDisk()).toHaveLength(1);
+		// New session: consent persisted per project+destination.
+		const { fake: fake2 } = await setupCross();
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.confirms).toHaveLength(0);
+		expect(fake2.calls.complete).toHaveLength(1);
+	});
+
+	test("C4: same origin + DIFFERENT model route re-prompts (F-02/F-10)", async () => {
+		// Active gateway/openai, configured gateway/claude — same endpoint.
+		const baseUrl = "https://gateway.example.com/v1";
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt", baseUrl },
+			findModel: (p, m) =>
+				p === "openai" && m === "claude"
+					? { provider: "openai", id: "claude", baseUrl }
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "openai", model: "claude" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.confirms).toHaveLength(1); // consent for gateway/claude
+		expect(fake.calls.complete[0]!.model).toEqual({
+			provider: "openai",
+			id: "claude",
+			baseUrl,
+		});
+		// Grant consent for gateway/claude, then the config switches to
+		// gateway/gpt-4o: different route → consent must be asked again.
+		const { fake: fake2 } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt", baseUrl },
+			findModel: (p, m) =>
+				p === "openai" && m === "gpt-4o"
+					? { provider: "openai", id: "gpt-4o", baseUrl }
+					: undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "openai", model: "gpt-4o" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake2.handlers.get("session_start")!({}, fake2.ctx);
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.confirms).toHaveLength(1);
+	});
+
+	test("C5: legacy consent record WITHOUT model route never matches → re-prompt (F-02/F-10)", async () => {
+		// Persist a legacy record (no model field) for this project+provider.
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		writeFileSync(
+			`${dir}/next-prompt-consent.json`,
+			JSON.stringify([
+				{
+					project: "/tmp",
+					destination: { provider: "anthropic", origin: "" },
+					grantedAt: new Date().toISOString(),
+					modelLabel: "anthropic/haiku",
+				},
+			]),
+		);
+		const { fake } = await setupCross();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Fail closed: the legacy record does not authorize the current route.
+		expect(fake.calls.confirms).toHaveLength(1);
+	});
+
+	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
+		let resolveConfirm!: (v: boolean) => void;
+		const pending = new Promise<boolean>((r) => {
+			resolveConfirm = r;
+		});
+		const { fake } = await setupCross({ confirmResult: pending });
+		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Ordinary typing while the dialog is pending bumps the input generation.
+		fake.deliverInput("x");
+		resolveConfirm(true); // late approval
+		await settle;
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
+	});
+
+	test("F08b: consent resolved AFTER session restart → no grant, no complete (F-08)", async () => {
+		let resolveConfirm!: (v: boolean) => void;
+		const pending = new Promise<boolean>((r) => {
+			resolveConfirm = r;
+		});
+		const { fake } = await setupCross({ confirmResult: pending });
+		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Session restart invalidates state and aborts in-flight work.
+		await fake.handlers.get("session_start")!(
+			{ type: "session_start", reason: "reload" },
+			fake.ctx,
+		);
+		resolveConfirm(true);
+		await settle;
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(consentsOnDisk()).toHaveLength(0);
+	});
+
+	test("F08c: consent resolved AFTER shutdown → no grant, no complete (F-08)", async () => {
+		let resolveConfirm!: (v: boolean) => void;
+		const pending = new Promise<boolean>((r) => {
+			resolveConfirm = r;
+		});
+		const { fake } = await setupCross({ confirmResult: pending });
+		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.handlers.get("session_shutdown")!({}, fake.ctx);
+		resolveConfirm(true);
+		await settle;
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(consentsOnDisk()).toHaveLength(0);
+	});
+
+	test("F08d: consent resolved AFTER a second settle aborts the first → no late disclose (F-08)", async () => {
+		const resolvers: Array<(v: boolean) => void> = [];
+		const { fake } = await setupCross({
+			// Each confirm call gets its own deferred promise.
+			confirmResult: () =>
+				new Promise<boolean>((r) => {
+					resolvers.push(r);
+				}),
+		});
+		const first = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Second settle while the first dialog is pending aborts the first.
+		const second = fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// User approves the SECOND dialog only; the first never resolves.
+		resolvers[resolvers.length - 1]!(true);
+		await second;
+		resolvers[0]!(true); // late approval on the aborted first dialog
+		await first;
+		// The stale first settle must never disclose; only the second may
+		// complete (its own fresh request).
+		expect(fake.calls.complete.length).toBeLessThanOrEqual(1);
 	});
 });
 
@@ -2167,6 +2965,7 @@ describe("configureInteractively", () => {
 				acceptKey: "ctrl+space",
 				rearmDelayMs: "1500",
 				maxTranscriptChars: "8000",
+				maxRecentTurns: "12",
 				maxSuggestionChars: "200",
 				allowCrossProvider: false,
 			},
@@ -2179,6 +2978,7 @@ describe("configureInteractively", () => {
 			acceptKey: "ctrl+space",
 			rearmDelayMs: 1500,
 			maxTranscriptChars: 8000,
+			maxRecentTurns: 12,
 			maxSuggestionChars: 200,
 			allowCrossProvider: false,
 		});
@@ -2208,12 +3008,14 @@ describe("configureInteractively", () => {
 				acceptKey: "alt+/",
 				rearmDelayMs: "2000",
 				maxTranscriptChars: "12000",
+				maxRecentTurns: "",
 				maxSuggestionChars: "240",
 				allowCrossProvider: true,
 			},
 		});
 		const out = await configureInteractively(ctx, {});
 		expect(out?.thinking).toBeUndefined();
+		expect(out?.maxRecentTurns).toBeUndefined(); // empty input keeps all
 	});
 
 	test("T123: invalid numeric input → field not set", async () => {
@@ -2225,6 +3027,7 @@ describe("configureInteractively", () => {
 				acceptKey: "alt+/",
 				rearmDelayMs: "not a number",
 				maxTranscriptChars: "abc",
+				maxRecentTurns: "abc",
 				maxSuggestionChars: "200",
 				allowCrossProvider: true,
 			},
@@ -2232,6 +3035,7 @@ describe("configureInteractively", () => {
 		const out = await configureInteractively(ctx, {});
 		expect(out?.rearmDelayMs).toBeUndefined();
 		expect(out?.maxTranscriptChars).toBeUndefined();
+		expect(out?.maxRecentTurns).toBeUndefined();
 		expect(out?.maxSuggestionChars).toBe(200);
 	});
 });

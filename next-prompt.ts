@@ -24,15 +24,26 @@
  *   <cwd>/.pi/next-prompt.json
  *
  * Cross-destination disclosure (configured suggestion model on a different
- * provider/endpoint than the active model) is opt-in: it requires
+ * provider/endpoint/model-route than the active model) is opt-in: it requires
  * `allowCrossProvider: true` (default false) AND explicit per-project consent,
  * persisted outside the repository in
- * `~/.pi/agent/next-prompt-consent.json`.
+ * `~/.pi/agent/next-prompt-consent.json`. Destination identity is provider +
+ * endpoint origin + resolved model id, so a route/model change behind one
+ * gateway never inherits consent (F-02/F-10).
  *
  * @module next-prompt
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, lstatSync, renameSync, chmodSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	writeFileSync,
+	mkdirSync,
+	lstatSync,
+	renameSync,
+	chmodSync,
+	rmSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
@@ -85,12 +96,19 @@ export interface NextPromptConfig {
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
 	/**
+	 * Only the last N user/assistant message entries are sent in the
+	 * transcript (tool results are never sent). Defaults to ALL entries.
+	 * Smaller values minimize disclosure; invalid values fail closed.
+	 */
+	maxRecentTurns?: number;
+	/**
 	 * Whether a configured suggestion model on a *different destination*
-	 * (provider + endpoint origin) than the active model may receive the
-	 * transcript. Defaults to FALSE. When false, fall back to the active model
-	 * (or, when already on the active destination, use the configured model).
-	 * Cross-destination use additionally requires per-project, per-destination
-	 * consent (see consent flow in the controller).
+	 * (provider + endpoint origin + model route) than the active model may
+	 * receive the transcript. Defaults to FALSE. When false, fall back to the
+	 * active model (or, when already on the active destination, use the
+	 * configured model). Cross-destination use additionally requires
+	 * per-project, per-destination consent (see consent flow in the
+	 * controller).
 	 */
 	allowCrossProvider?: boolean;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
@@ -113,6 +131,8 @@ export interface EffectiveConfig extends NextPromptConfig {
 export interface DestinationIdentity {
 	provider: string;
 	origin: string;
+	/** Routing identity of the resolved model (its registry id) on that endpoint. */
+	model: string;
 }
 
 /** Consent record persisted outside the repository, keyed by project + destination. */
@@ -160,6 +180,8 @@ const MIN_TRANSCRIPT_CHARS = 500;
 const MIN_SUGGESTION_CHARS = 1;
 const MAX_TRANSCRIPT_CHARS = 500_000;
 const MAX_SUGGESTION_CHARS = 10_000;
+const MIN_RECENT_TURNS = 1;
+const MAX_RECENT_TURNS = 200;
 
 /**
  * Keys that change where/whether transcript text is sent. Invalid values here
@@ -247,6 +269,10 @@ export function loadConfigDetailed(
 	let globalInvalid = false;
 	let projectInvalid = false;
 
+	// F-07: an EXISTING but unreadable, syntactically invalid, or root-invalid
+	// config file is privacy-invalid — the controller must not fall back to
+	// defaults (which could silently change where/whether the transcript is
+	// sent). Any parse/read failure sets the fail-closed flag.
 	if (existsSync(globalPath)) {
 		try {
 			const parsed = parseConfig(readFileSync(globalPath, "utf-8"));
@@ -254,8 +280,9 @@ export function loadConfigDetailed(
 			if (parsed.privacyInvalid) globalInvalid = true;
 		} catch (err) {
 			console.warn(
-				`next-prompt: failed to read global config ${globalPath}: ${err}`,
+				`next-prompt: failed to read global config ${globalPath}: ${err}; suggestions disabled`,
 			);
+			globalInvalid = true;
 		}
 	}
 	if (projectTrusted && existsSync(projectPath)) {
@@ -265,8 +292,9 @@ export function loadConfigDetailed(
 			if (parsed.privacyInvalid) projectInvalid = true;
 		} catch (err) {
 			console.warn(
-				`next-prompt: failed to read project config ${projectPath}: ${err}`,
+				`next-prompt: failed to read project config ${projectPath}: ${err}; suggestions disabled`,
 			);
+			projectInvalid = true;
 		}
 	}
 
@@ -310,7 +338,9 @@ function parseConfig(text: string): {
 		const value = raw[key];
 		const failPrivacy = (why: string) => {
 			privacyInvalid = true;
-			console.warn(`next-prompt: invalid ${key} in config (${why}); disabling suggestions`);
+			console.warn(
+				`next-prompt: invalid ${key} in config (${why}); disabling suggestions`,
+			);
 		};
 		switch (key) {
 			case "model": {
@@ -363,6 +393,16 @@ function parseConfig(text: string): {
 					);
 				else cfg.maxSuggestionChars = value;
 				break;
+			case "maxRecentTurns":
+				if (
+					typeof value !== "number" ||
+					!Number.isInteger(value) ||
+					value < MIN_RECENT_TURNS ||
+					value > MAX_RECENT_TURNS
+				)
+					failPrivacy("must be an integer within bounds");
+				else cfg.maxRecentTurns = value;
+				break;
 			case "rearmDelayMs":
 				if (
 					typeof value !== "number" ||
@@ -370,9 +410,7 @@ function parseConfig(text: string): {
 					value < MIN_REARM_DELAY ||
 					value > 60_000
 				)
-					console.warn(
-						`next-prompt: invalid rearmDelayMs in config; ignoring`,
-					);
+					console.warn(`next-prompt: invalid rearmDelayMs in config; ignoring`);
 				else cfg.rearmDelayMs = value;
 				break;
 			case "thinking":
@@ -382,7 +420,9 @@ function parseConfig(text: string): {
 				break;
 			case "renderMode":
 				if (typeof value !== "string" || !RENDER_MODES.includes(value))
-					console.warn(`next-prompt: invalid renderMode in config; using widget`);
+					console.warn(
+						`next-prompt: invalid renderMode in config; using widget`,
+					);
 				else cfg.renderMode = value as RenderMode;
 				break;
 			case "acceptKey":
@@ -450,7 +490,9 @@ export function saveConfig(
 	if (existsSync(path)) {
 		const st = lstatSync(path);
 		if (!st.isFile() || st.isSymbolicLink()) {
-			console.warn(`next-prompt: refusing to overwrite non-regular config ${path}`);
+			console.warn(
+				`next-prompt: refusing to overwrite non-regular config ${path}`,
+			);
 			return { ...merged, saved: false };
 		}
 	}
@@ -486,23 +528,29 @@ export function saveConfig(
 
 /**
  * Normalized destination identity for a model: provider plus endpoint origin
- * when a baseUrl is available. Two models on the same provider label but
- * different endpoints are treated as distinct destinations.
+ * when a baseUrl is available, plus the resolved model's routing id (F-02/F-10).
+ * Two models on the same provider label and endpoint but different routing ids
+ * (e.g. two downstream models behind one gateway) are distinct destinations.
  */
 export function destinationOf(
-	model: { provider: string; baseUrl?: string } | undefined,
+	model: { provider: string; baseUrl?: string; id?: string } | undefined,
 ): DestinationIdentity | undefined {
 	if (!model) return undefined;
 	const provider = model.provider.toLowerCase();
+	const identity: DestinationIdentity = {
+		provider,
+		origin: "",
+		model: model.id ?? "",
+	};
 	if (model.baseUrl) {
 		try {
 			const origin = new URL(model.baseUrl).origin.toLowerCase();
-			if (origin && origin !== "null") return { provider, origin };
+			if (origin && origin !== "null") identity.origin = origin;
 		} catch {
 			/* fall through to provider-only identity */
 		}
 	}
-	return { provider, origin: "" };
+	return identity;
 }
 
 export function sameDestination(
@@ -510,15 +558,27 @@ export function sameDestination(
 	b: DestinationIdentity | undefined,
 ): boolean {
 	if (!a || !b) return false;
-	return a.provider === b.provider && a.origin === b.origin;
+	return (
+		a.provider === b.provider &&
+		a.origin === b.origin &&
+		a.model === b.model
+	);
 }
 
+/**
+ * Consent key for a destination. Includes the model routing id so a route/
+ * model change behind one gateway never inherits consent granted to another
+ * downstream model (F-02/F-10). An empty model id (legacy record) can never
+ * match a real destination key — old records force a fresh consent prompt.
+ */
 export function destinationKey(d: DestinationIdentity): string {
-	return d.origin ? `${d.provider}@${d.origin}` : d.provider;
+	const base = d.origin ? `${d.provider}@${d.origin}` : d.provider;
+	return d.model ? `${base}#${d.model}` : base;
 }
 
 export function describeDestination(d: DestinationIdentity): string {
-	return d.origin ? `${d.provider} (${d.origin})` : d.provider;
+	const base = d.origin ? `${d.provider} (${d.origin})` : d.provider;
+	return d.model ? `${base} — ${d.model}` : base;
 }
 
 function consentsPath(): string {
@@ -543,9 +603,14 @@ export function loadConsents(): ConsentRecord[] {
 	}
 }
 
-export function hasConsent(project: string, destination: DestinationIdentity): boolean {
+export function hasConsent(
+	project: string,
+	destination: DestinationIdentity,
+): boolean {
 	return loadConsents().some(
-		(r) => r.project === project && destinationKey(r.destination) === destinationKey(destination),
+		(r) =>
+			r.project === project &&
+			destinationKey(r.destination) === destinationKey(destination),
 	);
 }
 
@@ -557,7 +622,11 @@ export function grantConsent(
 ): void {
 	const path = consentsPath();
 	const records = loadConsents().filter(
-		(r) => !(r.project === project && destinationKey(r.destination) === destinationKey(destination)),
+		(r) =>
+			!(
+				r.project === project &&
+				destinationKey(r.destination) === destinationKey(destination)
+			),
 	);
 	records.push({
 		project,
@@ -568,24 +637,41 @@ export function grantConsent(
 	try {
 		const dir = dirname(path);
 		mkdirSync(dir, { recursive: true });
-		const tmp = join(dir, `.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`);
-		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 });
+		const tmp = join(
+			dir,
+			`.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`,
+		);
+		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, {
+			mode: 0o600,
+		});
 		renameSync(tmp, path);
 	} catch (err) {
 		console.warn(`next-prompt: failed to persist consent: ${err}`);
 	}
 }
 
-export function revokeConsent(project: string, destination: DestinationIdentity): void {
+export function revokeConsent(
+	project: string,
+	destination: DestinationIdentity,
+): void {
 	const path = consentsPath();
 	const records = loadConsents().filter(
-		(r) => !(r.project === project && destinationKey(r.destination) === destinationKey(destination)),
+		(r) =>
+			!(
+				r.project === project &&
+				destinationKey(r.destination) === destinationKey(destination)
+			),
 	);
 	try {
 		const dir = dirname(path);
 		mkdirSync(dir, { recursive: true });
-		const tmp = join(dir, `.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`);
-		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 });
+		const tmp = join(
+			dir,
+			`.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`,
+		);
+		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, {
+			mode: 0o600,
+		});
 		renameSync(tmp, path);
 	} catch (err) {
 		console.warn(`next-prompt: failed to revoke consent: ${err}`);
@@ -638,7 +724,8 @@ export interface ResolvedModel {
 
 /**
  * Resolve the suggestion model against the active model by *destination*
- * identity (provider + endpoint origin), not label. Fail-closed rules:
+ * identity (provider + endpoint origin + model route), not label. Fail-closed
+ * rules:
  *  - configured model on the same destination as active  → use it
  *  - configured model on a different destination and `allowCrossProvider`
  *    is false (the default)                             → active model, silent
@@ -689,8 +776,8 @@ export function resolveSuggestionModel(
 				notifiedRef.value = true;
 				ctx.ui.notify(
 					`next-prompt: configured model ${config.model.provider}/${config.model.model} is on a different destination than the active model; suggestions disabled`,
-				"warning",
-			);
+					"warning",
+				);
 			}
 			return { model: undefined, crossDestination: false };
 		}
@@ -716,7 +803,7 @@ const SECRET_PATTERNS: RegExp[] = [
 	/xoxb-[0-9a-zA-Z-]{10,}-[0-9a-zA-Z-]{10,}/g, // Slack bot token (xoxb-<10+>-<10+>)
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, // JWT
 	/-----BEGIN [A-Z ]+PRIVATE KEY-----\s*[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, // PEM
-	/\b(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*["']?[^\s"',;]+/gi, // assignment forms
+	/\b(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;]+)/gi, // assignment forms
 ];
 
 export function redactSecrets(text: string): string {
@@ -767,7 +854,28 @@ export function buildTranscript(
 	const max = config.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT;
 	const lines: string[] = [];
 
-	for (const entry of branch) {
+	// F-11: user-configurable recent-turn selection. Only the last N user/
+	// assistant entries are counted; tool results between them stay in the
+	// kept slice but remain excluded from the output.
+	let entries: BranchEntry[] = branch;
+	if (typeof config.maxRecentTurns === "number") {
+		const n = Math.max(1, Math.floor(config.maxRecentTurns));
+		const messages = branch.filter(
+			(entry) =>
+				entry.type === "message" &&
+				(entry.message?.role === "user" ||
+					entry.message?.role === "assistant"),
+		);
+		if (messages.length > n) {
+			const startEntry = messages[messages.length - n];
+			if (startEntry) {
+				const startIdx = branch.indexOf(startEntry);
+				entries = startIdx > 0 ? branch.slice(startIdx) : branch;
+			}
+		}
+	}
+
+	for (const entry of entries) {
 		if (entry.type !== "message" || !entry.message) continue;
 		const msg = entry.message;
 		const role = msg.role;
@@ -806,12 +914,58 @@ export function buildMessages(transcript: string): Message[] {
 const BIDI_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/; // no /g: stateful lastIndex would skip every other control
 
 /**
- * Remove terminal control sequences (OSC/CSI/DCS/APC/PM/SOS), C0/C1 controls,
- * DEL, carriage returns, and bidi override/isolate characters from model
- * output so untrusted text can never execute terminal commands, move the
- * cursor, overwrite the clipboard (OSC 52), or spoof the UI. Safe printable
- * Unicode is preserved.
+ * Remove terminal control sequences (OSC/CSI/DCS/APC/PM/SOS, both ESC-prefixed
+ * and 8-bit C1 introducers), C0/C1 controls, DEL, carriage returns, bidi
+ * override/isolate characters, and unpaired surrogates from model output so
+ * untrusted text can never execute terminal commands, move the cursor,
+ * overwrite the clipboard (OSC 52), or spoof the UI. Safe printable Unicode is
+ * preserved.
  */
+const CONTROL_STRING_CAP = 4096;
+
+/**
+ * Consume a control string (OSC/DCS/APC/PM/SOS) starting at `i` (the byte after
+ * the introducer) until its terminator: BEL (0x07), ST (ESC \\), or C1 ST
+ * (0x9C). Runaway sequences without a terminator within CONTROL_STRING_CAP
+ * bytes consume the remainder of the string so no tail is re-emitted as text.
+ * Returns the index just past the sequence end (or n when un-terminated).
+ */
+function consumeControlString(text: string, i: number, n: number): number {
+	let j = i;
+	const end = Math.min(n, i + CONTROL_STRING_CAP);
+	while (j < end) {
+		const c = text[j];
+		if (c === "\x07") {
+			j += 1;
+			return j;
+		}
+		if (c === "\x1b" && text[j + 1] === "\\") {
+			j += 2;
+			return j;
+		}
+		if (c !== undefined && c.charCodeAt(0) === 0x9c) {
+			j += 1;
+			return j;
+		}
+		j += 1;
+	}
+	return n; // cap hit without a visible terminator: consume to end
+}
+
+/**
+ * Consume a CSI sequence starting at `i` (the byte after the introducer) until
+ * a final byte in 0x40..0x7E. Returns the index just past the final byte.
+ */
+function consumeCsi(text: string, i: number, n: number): number {
+	let j = i;
+	while (j < n) {
+		const c = text.charCodeAt(j);
+		if (c >= 0x40 && c <= 0x7e) break;
+		j += 1;
+	}
+	return Math.min(j + 1, n);
+}
+
 export function sanitizeTerminalText(text: string): string {
 	let out = "";
 	let i = 0;
@@ -819,6 +973,7 @@ export function sanitizeTerminalText(text: string): string {
 	const isFinal = (cp: number) => cp >= 0x40 && cp <= 0x7e;
 	const isC1 = (cp: number) => cp >= 0x80 && cp <= 0x9f;
 	const isC0 = (cp: number) => cp < 0x20 || cp === 0x7f;
+	const isLoneSurrogate = (cp: number) => cp >= 0xd800 && cp <= 0xdfff;
 
 	while (i < n) {
 		const ch = text[i]!;
@@ -828,65 +983,16 @@ export function sanitizeTerminalText(text: string): string {
 			// ESC introduces a control sequence. Consume it fully.
 			const next = text[i + 1];
 			if (next === "[") {
-				// CSI: consume until a final byte in 0x40..0x7E.
-				let j = i + 2;
-				while (j < n) {
-					const c = text.charCodeAt(j);
-					if (c >= 0x40 && c <= 0x7e) break;
-					j += 1;
-				}
-				i = Math.min(j + 1, n);
-			} else if (next === "]") {
-				// OSC: consume until BEL, ST (ESC \), or C1 ST (0x9C). Cap runaway
-				// sequences; on cap-hit without a terminator, consume to end of string.
-				let j = i + 2;
-				let terminated = false;
-				const end = Math.min(n, i + 2 + 4096);
-				while (j < end) {
-					const c = text[j];
-					if (c === "\x07") {
-						j += 1;
-						terminated = true;
-						break;
-					}
-					if (c === "\x1b" && text[j + 1] === "\\") {
-						j += 2;
-						terminated = true;
-						break;
-					}
-					if (c !== undefined && c.charCodeAt(0) === 0x9c) {
-						j += 1;
-						terminated = true;
-						break;
-					}
-					j += 1;
-				}
-				i = terminated ? j : n;
-			} else if (next === "P" || next === "_") {
-				// DCS / APC: consume until ST (ESC \), BEL, or C1 ST. Cap runaway.
-				let j = i + 2;
-				let terminated = false;
-				const end = Math.min(n, i + 2 + 4096);
-				while (j < end) {
-					const c = text[j];
-					if (c === "\x1b" && text[j + 1] === "\\") {
-						j += 2;
-						terminated = true;
-						break;
-					}
-					if (c === "\x07") {
-						j += 1;
-						terminated = true;
-						break;
-					}
-					if (c !== undefined && c.charCodeAt(0) === 0x9c) {
-						j += 1;
-						terminated = true;
-						break;
-					}
-					j += 1;
-				}
-				i = terminated ? j : n;
+				i = consumeCsi(text, i + 2, n);
+			} else if (
+				next === "]" ||
+				next === "P" ||
+				next === "_" ||
+				next === "^" ||
+				next === "X"
+			) {
+				// OSC / DCS / APC / PM / SOS: consume until ST, BEL, or C1 ST.
+				i = consumeControlString(text, i + 2, n);
 			} else if (next !== undefined && isFinal(next.charCodeAt(0))) {
 				// ESC + single final byte (e.g. ESC 7, ESC c): consume both.
 				i += 2;
@@ -896,7 +1002,27 @@ export function sanitizeTerminalText(text: string): string {
 			continue;
 		}
 
-		if (isC0(cp) || isC1(cp)) {
+		if (isC1(cp)) {
+			// 8-bit control-string introducers: consume the whole sequence, not
+			// just the one byte, so their payload never leaks as text (F-01).
+			if (cp === 0x9b) {
+				// CSI
+				i = consumeCsi(text, i + 1, n);
+			} else if (
+				cp === 0x9d || // OSC
+				cp === 0x90 || // DCS
+				cp === 0x9e || // PM
+				cp === 0x9f || // APC
+				cp === 0x98 // SOS
+			) {
+				i = consumeControlString(text, i + 1, n);
+			} else {
+				i += 1; // other C1 (e.g. bare ST 0x9C): drop
+			}
+			continue;
+		}
+
+		if (isC0(cp)) {
 			if (ch === "\n" || ch === "\t") out += " ";
 			i += 1;
 			continue;
@@ -905,10 +1031,48 @@ export function sanitizeTerminalText(text: string): string {
 			i += 1;
 			continue;
 		}
+		if (isLoneSurrogate(cp)) {
+			// Unpaired surrogate (no low partner): drop it. A valid pair is
+			// emitted as two units by the charCodeAt loop, so a high surrogate
+			// followed by its low partner is preserved below.
+			const nextCp = text.charCodeAt(i + 1);
+			const isHigh = cp >= 0xd800 && cp <= 0xdbff;
+			const isLow = cp >= 0xdc00 && cp <= 0xdfff;
+			if (isHigh && nextCp >= 0xdc00 && nextCp <= 0xdfff) {
+				out += ch + text[i + 1]!;
+				i += 2;
+			} else if (isLow) {
+				i += 1; // lone low surrogate
+			} else {
+				i += 1; // lone high surrogate
+			}
+			continue;
+		}
 		out += ch;
 		i += 1;
 	}
 	return out;
+}
+
+/**
+ * Upper bound on UTF-16 code units (≈ code points for well-formed text) for a
+ * suggestion, computed from the visible-width cap. Zero-width characters have
+ * zero display width and can therefore bypass a width-only cap; this bound
+ * guarantees a hard storage/size limit after terminal filtering (F-01).
+ * 4× the width cap is generous enough that CJK (2 columns) and emoji ZWJ
+ * families never hit it before the width truncation does.
+ */
+export function suggestionCodePointCap(maxWidthChars: number): number {
+	return Math.max(1, Math.floor(maxWidthChars * 4));
+}
+
+/**
+ * Strip trailing zero-width / joining / variation / combining characters after
+ * a code-point truncation so a dangling ZWJ or combining mark is not left
+ * behind (F-01).
+ */
+function stripTrailingZeroWidth(s: string): string {
+	return s.replace(/(?:[\u200B-\u200D\u2060\uFE0F\u034F\u180E]|\p{M})+$/u, "");
 }
 
 export function sanitizeSuggestion(
@@ -947,6 +1111,17 @@ export function sanitizeSuggestion(
 
 	// Whitespace / punctuation only => no suggestion.
 	if (/^[\s.,;:!?'"]+$/.test(s)) return "";
+
+	// F-01: hard code-point bound after terminal filtering. Zero-width
+	// sequences (ZWJ, bidi marks, variation selectors) have no visible width
+	// and can never exceed the width cap — this bound is the real size limit
+	// for storage/rendering. Apply it before the width-based truncation and
+	// drop any trailing zero-width characters it might expose.
+	const cps = Array.from(s);
+	const maxCodepoints = suggestionCodePointCap(max);
+	if (cps.length > maxCodepoints) {
+		s = stripTrailingZeroWidth(cps.slice(0, maxCodepoints).join(""));
+	}
 
 	// Cap at a grapheme-safe boundary; truncateToWidth appends a trailing \x1b[0m reset,
 	// strip it so the suggestion is clean text.
@@ -1030,9 +1205,7 @@ export function overlayGhost(
 			visibleWidth(ghost) > cap ? truncateToWidth(ghost, cap, "") : ghost;
 		if (!ghostSlice) return lines;
 		const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
-		const pad = " ".repeat(
-			Math.max(0, lineVisible - visibleWidth(ghostSlice)),
-		);
+		const pad = " ".repeat(Math.max(0, lineVisible - visibleWidth(ghostSlice)));
 		result[contentIdx] = ghostStyled + pad;
 		return result;
 	}
@@ -1205,7 +1378,10 @@ function clearRearmCheckTimer(state: SuggestionState): void {
  * transition arms the timers (F-09); dismissal via Escape/arrows/focus never
  * does. The 50ms outer timer defers until the editor has processed the key.
  */
-function scheduleRearmCheck(state: SuggestionState, editorTextBefore: string): void {
+function scheduleRearmCheck(
+	state: SuggestionState,
+	editorTextBefore: string,
+): void {
 	clearRearmCheckTimer(state);
 	if (editorTextBefore.length === 0) return; // nothing to delete from
 	state.rearmCheckTimer = setTimeout(() => {
@@ -1505,6 +1681,19 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					"next-prompt: send transcript to another provider?",
 					`Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there. Allow for this project?`,
 				);
+				// F-08: the dialog may resolve AFTER an interaction, reset, or
+				// shutdown invalidated this request. Require the original
+				// controller/state identity, request signal, and input generation
+				// to still be current before persisting consent or calling the
+				// model — otherwise return without disclosing anything.
+				if (
+					ac.signal.aborted ||
+					ref.state !== state ||
+					generation !== state.inputGeneration
+				) {
+					if (ref.inflight === ac) ref.inflight = undefined;
+					return;
+				}
 				if (!granted) {
 					deniedConsents.add(key);
 					ctx.ui.notify(
@@ -1513,7 +1702,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				grantConsent(ctx.cwd, dest, `${resolved.model.provider}/${resolved.model.id}`);
+				grantConsent(
+					ctx.cwd,
+					dest,
+					`${resolved.model.provider}/${resolved.model.id}`,
+				);
 			}
 		}
 
@@ -1557,9 +1750,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 
-	// Interactive config command: `/next-prompt-config`. Walks the user through every
-	// configurable option with model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json,
-	// and reloads so changes take effect immediately.
+	// Interactive config command: `/next-prompt-config`. Walks the user through
+	// every configurable option EXCEPT systemPrompt (config-file only, F-15) with
+	// model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json, and reloads
+	// so changes take effect immediately.
 	pi.registerCommand("next-prompt-config", {
 		description: "Configure the next-prompt suggestion extension",
 		handler: async (_args, ctx) => {
@@ -1683,7 +1877,24 @@ export async function configureInteractively(
 			update.maxTranscriptChars = n;
 	}
 
-	// 7. maxSuggestionChars (numeric text)
+	// 7. maxRecentTurns (numeric text; disclosure minimization — empty keeps all)
+	const rtPick = await ctx.ui.input(
+		`next-prompt: max recent turns sent in transcript (empty = all) [${current.maxRecentTurns ?? "all"}]`,
+		current.maxRecentTurns === undefined
+			? ""
+			: String(current.maxRecentTurns),
+	);
+	if (rtPick && rtPick.trim().length > 0) {
+		const n = Number(rtPick.trim());
+		if (
+			Number.isInteger(n) &&
+			n >= MIN_RECENT_TURNS &&
+			n <= MAX_RECENT_TURNS
+		)
+			update.maxRecentTurns = n;
+	}
+
+	// 8. maxSuggestionChars (numeric text)
 	const sgPick = await ctx.ui.input(
 		`next-prompt: max suggestion chars [${current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION}]`,
 		String(current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION),
@@ -1698,7 +1909,7 @@ export async function configureInteractively(
 			update.maxSuggestionChars = n;
 	}
 
-	// 8. allowCrossProvider (confirm)
+	// 9. allowCrossProvider (confirm)
 	const cross = await ctx.ui.confirm(
 		`next-prompt: allow cross-provider suggestion (sends transcript to a different provider)? [${current.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER}]`,
 		"Yes = use the configured model even if it's on a different provider (requires per-project consent). No = fall back to the current model.",
