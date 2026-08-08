@@ -26,7 +26,7 @@
  * @module next-prompt
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -122,6 +122,40 @@ export function humanizeKey(key: string): string {
 		.split("+")
 		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
 		.join("-");
+}
+
+/**
+ * Raw-byte fallback for accept-key detection, for terminals where pi-tui's
+ * matchesKey() doesn't recognize a legacy alt+symbol sequence. Handles the
+ * common forms an Alt+key or Ctrl+Alt+key can arrive in:
+ *   alt+/   → "\x1b/"  (or sometimes "\x1bO/" / kitty CSI-u)
+ *   ctrl+space → "\x00"
+ * Only the last modifier+key segment is considered. Returns true if `data`
+ * matches any of the candidate byte forms for the configured key.
+ */
+export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
+	const parts = acceptKey.split("+");
+	if (parts.length === 0) return false;
+	const keyPart = parts[parts.length - 1]!;
+	const modifiers = parts.slice(0, -1);
+	const hasAlt = modifiers.includes("alt");
+	const hasCtrl = modifiers.includes("ctrl");
+
+	// ctrl+space special-case: legacy terminals send NUL.
+	if (hasCtrl && !hasAlt && keyPart === "space" && data === "\x00") return true;
+
+	// alt + single printable char: legacy form is ESC + char (both cases).
+	if (hasAlt && !hasCtrl && keyPart.length === 1) {
+		const cp = keyPart.codePointAt(0) ?? 0;
+		const printable = cp >= 0x20 && cp <= 0x7e;
+		if (printable) {
+			if (data === `\x1b${keyPart}`) return true;
+			if (data === `\x1b${keyPart.toUpperCase()}`) return true;
+			// Some terminals prefix with SS3 ('O') for numpad/symbol variants.
+			if (data === `\x1bO${keyPart}`) return true;
+		}
+	}
+	return false;
 }
 
 export function loadConfig(cwd: string): NextPromptConfig {
@@ -558,7 +592,18 @@ class NextPromptEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		const isAcceptKey = matchesKey(data, this.acceptKey as KeyId);
+		const isAcceptKey =
+			matchesKey(data, this.acceptKey as KeyId) ||
+			matchesAcceptKeyRaw(data, this.acceptKey);
+
+		// TEMP DIAGNOSTIC: log the raw bytes so we can see exactly what the
+		// terminal sends for the configured accept key. Remove once stable.
+		try {
+			appendFileSync(
+				join(getAgentDir(), "next-prompt-keys.log"),
+				`data=${JSON.stringify(data)} acceptKey=${JSON.stringify(this.acceptKey)} isAcceptKey=${isAcceptKey} ghostLen=${this.ghost.length} autocomplete=${this.isShowingAutocomplete()}\n`,
+			);
+		} catch { /* ignore */ }
 
 		// Intercept the accept key BEFORE delegating to super so the base editor
 		// doesn't insert the key's raw byte (e.g. \x00 for ctrl+space) and pollute

@@ -19,6 +19,7 @@ import {
 	humanizeKey,
 	isPrintable,
 	loadConfig,
+	matchesAcceptKeyRaw,
 	overlayGhost,
 	redactSecrets,
 	resolveSuggestionModel,
@@ -348,6 +349,48 @@ describe("acceptKey / humanizeKey", () => {
 
 	test("humanizeKey: empty string → empty", () => {
 		expect(humanizeKey("")).toBe("");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// matchesAcceptKeyRaw (raw-byte fallback for terminals where matchesKey fails)
+// ---------------------------------------------------------------------------
+
+describe("matchesAcceptKeyRaw", () => {
+	test('alt+/ matches legacy "\x1b/"', () => {
+		expect(matchesAcceptKeyRaw("\x1b/", "alt+/")).toBe(true);
+	});
+
+	test('alt+/ matches uppercase "\x1bO/" (SS3 variant)', () => {
+		expect(matchesAcceptKeyRaw("\x1bO/", "alt+/")).toBe(true);
+	});
+
+	test('alt+/ does NOT match bare "/" (no ESC prefix)', () => {
+		expect(matchesAcceptKeyRaw("/", "alt+/")).toBe(false);
+	});
+
+	test('alt+e matches "\x1be"', () => {
+		expect(matchesAcceptKeyRaw("\x1be", "alt+e")).toBe(true);
+	});
+
+	test('ctrl+space matches NUL "\x00"', () => {
+		expect(matchesAcceptKeyRaw("\x00", "ctrl+space")).toBe(true);
+	});
+
+	test('ctrl+space does NOT match plain space', () => {
+		expect(matchesAcceptKeyRaw(" ", "ctrl+space")).toBe(false);
+	});
+
+	test('alt+/ does NOT match "\x1b" alone (split ESC)', () => {
+		expect(matchesAcceptKeyRaw("\x1b", "alt+/")).toBe(false);
+	});
+
+	test('plain "tab" (no modifiers) → false (no raw form handled)', () => {
+		expect(matchesAcceptKeyRaw("\t", "tab")).toBe(false);
+	});
+
+	test('empty acceptKey → false', () => {
+		expect(matchesAcceptKeyRaw("\x1b/", "")).toBe(false);
 	});
 });
 
