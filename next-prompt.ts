@@ -559,9 +559,7 @@ export function sameDestination(
 ): boolean {
 	if (!a || !b) return false;
 	return (
-		a.provider === b.provider &&
-		a.origin === b.origin &&
-		a.model === b.model
+		a.provider === b.provider && a.origin === b.origin && a.model === b.model
 	);
 }
 
@@ -863,8 +861,7 @@ export function buildTranscript(
 		const messages = branch.filter(
 			(entry) =>
 				entry.type === "message" &&
-				(entry.message?.role === "user" ||
-					entry.message?.role === "assistant"),
+				(entry.message?.role === "user" || entry.message?.role === "assistant"),
 		);
 		if (messages.length > n) {
 			const startEntry = messages[messages.length - n];
@@ -1880,17 +1877,11 @@ export async function configureInteractively(
 	// 7. maxRecentTurns (numeric text; disclosure minimization — empty keeps all)
 	const rtPick = await ctx.ui.input(
 		`next-prompt: max recent turns sent in transcript (empty = all) [${current.maxRecentTurns ?? "all"}]`,
-		current.maxRecentTurns === undefined
-			? ""
-			: String(current.maxRecentTurns),
+		current.maxRecentTurns === undefined ? "" : String(current.maxRecentTurns),
 	);
 	if (rtPick && rtPick.trim().length > 0) {
 		const n = Number(rtPick.trim());
-		if (
-			Number.isInteger(n) &&
-			n >= MIN_RECENT_TURNS &&
-			n <= MAX_RECENT_TURNS
-		)
+		if (Number.isInteger(n) && n >= MIN_RECENT_TURNS && n <= MAX_RECENT_TURNS)
 			update.maxRecentTurns = n;
 	}
 

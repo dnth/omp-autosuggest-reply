@@ -3,7 +3,7 @@
 Terminal-rendering and live-interaction behavior cannot be fully verified in
 unit tests (the automated suite covers the editor/rendering contracts via real
 pi-tui `Editor`/`CustomEditor` integration tests, but not a live terminal).
-Before any release, run every check below in a real pi session (0.80.10+,
+Before any release, run every check below in a real pi session (0.84.0+,
 ideally on **at least two terminal emulators**) and record the result.
 
 **Status legend:** `[ ]` not run · `[x]` passed · `[!]` failed (blocker: fix

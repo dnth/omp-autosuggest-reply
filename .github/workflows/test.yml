@@ -43,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi-version: ["0.80.10", "0.84.1"] # oldest supported / latest published
+        pi-version: ["0.84.0", "0.84.1"] # oldest supported / latest published
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

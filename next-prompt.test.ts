@@ -324,14 +324,16 @@ describe("destination identity", () => {
 			id: "gpt-4o",
 			baseUrl: "https://gateway.example.com/v1",
 		});
-		expect(destinationKey(d!)).toBe("openai@https://gateway.example.com#gpt-4o");
+		expect(destinationKey(d!)).toBe(
+			"openai@https://gateway.example.com#gpt-4o",
+		);
 		// Legacy consent record without a model id → its key never equals a real one.
 		expect(destinationKey({ provider: "openai", origin: "", model: "" })).toBe(
 			"openai",
 		);
-		expect(destinationKey({ provider: "openai", origin: "", model: "" })).not.toBe(
-			destinationKey(d!),
-		);
+		expect(
+			destinationKey({ provider: "openai", origin: "", model: "" }),
+		).not.toBe(destinationKey(d!));
 	});
 });
 
@@ -900,7 +902,7 @@ describe("redactSecrets", () => {
 	});
 	test("T20j: assignment forms redacted (positive + near-miss)", () => {
 		expect(redactSecrets("password=hunter2!")).toBe("[redacted]");
-		expect(redactSecrets("API_KEY: \"abc123\"")).toBe("[redacted]");
+		expect(redactSecrets('API_KEY: "abc123"')).toBe("[redacted]");
 		expect(redactSecrets("client_secret='s3cr3t'")).toBe("[redacted]");
 		// Near-miss: key without a value separator.
 		expect(redactSecrets("the password is hunter2")).toBe(
@@ -917,10 +919,10 @@ describe("redactSecrets", () => {
 		expect(out).toBe("Assistant: here is the key: [redacted] and [redacted]");
 	});
 	test("T20l: secrets echoed in USER text are redacted (F-11)", () => {
-		const branch = [userEntry(`gitlab token glpat-${("a1b" + "2C").repeat(5)}xyz`)];
-		expect(buildTranscript(branch, {})).toBe(
-			"User: gitlab token [redacted]",
-		);
+		const branch = [
+			userEntry(`gitlab token glpat-${("a1b" + "2C").repeat(5)}xyz`),
+		];
+		expect(buildTranscript(branch, {})).toBe("User: gitlab token [redacted]");
 	});
 });
 
@@ -1378,9 +1380,7 @@ describe("real pi-tui editor integration", () => {
 			},
 		}) as never;
 
-	function mkGhostState(
-		over: Partial<SuggestionState> = {},
-	): SuggestionState {
+	function mkGhostState(over: Partial<SuggestionState> = {}): SuggestionState {
 		return {
 			suggestion: "",
 			lastSuggestion: "",
@@ -1446,7 +1446,12 @@ describe("real pi-tui editor integration", () => {
 
 	test("E3: ghost preserves base text and mid-line cursor position", () => {
 		const state = mkGhostState({ suggestion: "ghost" });
-		const ed = new GhostEditor(mkTui(), mkTheme(), getKeybindings() as never, state);
+		const ed = new GhostEditor(
+			mkTui(),
+			mkTheme(),
+			getKeybindings() as never,
+			state,
+		);
 		ed.focused = true;
 		ed.setText("abc");
 		// Move cursor to the start: left, left, left.
@@ -1601,7 +1606,10 @@ function makeFake(opts: {
 	mode?: string;
 	projectTrusted?: boolean;
 	hasPriorEditor?: boolean;
-	confirmResult?: boolean | Promise<boolean> | (() => boolean | Promise<boolean>);
+	confirmResult?:
+		| boolean
+		| Promise<boolean>
+		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
@@ -1661,7 +1669,10 @@ function makeFake(opts: {
 	let editorComponentCalls = 0;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = new Editor(
-		{ requestRender: () => {}, terminal: { rows: 24, cols: 80 } } as unknown as never,
+		{
+			requestRender: () => {},
+			terminal: { rows: 24, cols: 80 },
+		} as unknown as never,
 		{ borderColor: (s: string) => s, selectList: {} } as unknown as never,
 	);
 	editor.focused = true;
@@ -2575,13 +2586,15 @@ describe("non-TUI mode", () => {
 // ---------------------------------------------------------------------------
 
 describe("cross-destination consent", () => {
-	async function setupCross(opts: {
-		confirmResult?:
-			| boolean
-			| Promise<boolean>
-			| (() => boolean | Promise<boolean>);
-		baseUrl?: string;
-	} = {}) {
+	async function setupCross(
+		opts: {
+			confirmResult?:
+				| boolean
+				| Promise<boolean>
+				| (() => boolean | Promise<boolean>);
+			baseUrl?: string;
+		} = {},
+	) {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: {

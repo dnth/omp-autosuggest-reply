@@ -224,7 +224,7 @@ Edit `next-prompt.ts` in place and restart pi to pick up changes.
 
 ## Compatibility
 
-Supported pi range: **0.80.10 – latest (0.84.x at time of writing)**. CI runs the
+Supported pi range: **0.84.0 – latest (0.84.x at time of writing)**. `ModelRegistry.complete()` — which the extension calls directly — was added in pi 0.84.0, so older 0.80–0.83 releases are not supported. CI runs the
 unit suite and typecheck against both the oldest supported and the latest
 published `@earendil-works/pi-*` packages (`.github/workflows/test.yml` — `compat`
 job) on every PR.
