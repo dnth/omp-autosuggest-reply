@@ -72,6 +72,8 @@ export interface NextPromptConfig {
 	maxSuggestionChars?: number;
 	debounceMs?: number;
 	allowCrossProvider?: boolean;
+	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
+	rearmDelayMs?: number;
 }
 
 export type TriggerDecision = "compute" | "skip";
@@ -105,6 +107,7 @@ export interface SuggestionCtx {
 const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
 export const DEFAULT_ACCEPT_KEY = "alt+/";
+export const DEFAULT_REARM_MS = 2000;
 
 // ANSI styling for the below-editor widget. Cyan accent for the ↳/next: prefix and
 // the shortcut hint; the suggestion itself is plain (high-contrast default text).
@@ -541,7 +544,10 @@ function stripAnsi(s: string): string {
 
 export interface SuggestionState {
 	suggestion: string;
+	lastSuggestion: string;
 	acceptKey: string;
+	rearmDelayMs: number;
+	rearmTimer: ReturnType<typeof setTimeout> | undefined;
 	isIdleGetter: () => boolean;
 	getEditorText: () => string;
 	setEditorText: (text: string) => void;
@@ -563,6 +569,8 @@ function renderSuggestionWidget(state: SuggestionState): void {
 function setSuggestion(state: SuggestionState, text: string): void {
 	if (state.getEditorText().length === 0 && state.isIdleGetter()) {
 		state.suggestion = text;
+		state.lastSuggestion = text;
+		clearRearmTimer(state);
 		renderSuggestionWidget(state);
 	}
 }
@@ -570,10 +578,41 @@ function setSuggestion(state: SuggestionState, text: string): void {
 /** Clear the current suggestion (clears the widget too). */
 function clearSuggestion(state: SuggestionState | undefined): void {
 	if (!state) return;
+	clearRearmTimer(state);
 	if (state.suggestion) {
 		state.suggestion = "";
 		state.publishWidget(undefined);
 	}
+}
+
+function clearRearmTimer(state: SuggestionState): void {
+	if (state.rearmTimer !== undefined) {
+		clearTimeout(state.rearmTimer);
+		state.rearmTimer = undefined;
+	}
+}
+
+/**
+ * After any input that might empty the editor, schedule a re-arm check: if the editor
+ * is empty, the agent is idle, no suggestion is showing, and we have a last suggestion,
+ * re-publish it after rearmDelayMs (default 2000, configurable). No new model call.
+ */
+function scheduleRearmCheck(state: SuggestionState): void {
+	// Defer so the editor has processed the key (getEditorText reflects post-input state).
+	setTimeout(() => {
+		if (state.suggestion) return; // already showing
+		if (!state.lastSuggestion) return; // nothing to re-arm with
+		if (!state.isIdleGetter()) return; // agent running
+		if (state.getEditorText().length > 0) return; // not empty
+		clearRearmTimer(state);
+		state.rearmTimer = setTimeout(() => {
+			state.rearmTimer = undefined;
+			if (state.suggestion) return;
+			if (!state.isIdleGetter()) return;
+			if (state.getEditorText().length > 0) return;
+			setSuggestion(state, state.lastSuggestion);
+		}, state.rearmDelayMs);
+	}, 50);
 }
 
 /**
@@ -581,20 +620,27 @@ function clearSuggestion(state: SuggestionState | undefined): void {
  * key before the (default) editor sees it, and fills the editor with the suggestion.
  * Used via ctx.ui.onTerminalInput — editor-independent, survives resetExtensionUI.
  */
-function makeAcceptHandler(state: SuggestionState): (data: string) => { consume?: boolean } | undefined {
+function makeAcceptHandler(
+	state: SuggestionState,
+): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
 			matchesAcceptKeyRaw(data, state.acceptKey);
-		if (!isAcceptKey) return undefined;
-		if (!state.suggestion) return undefined;
-		if (!state.isIdleGetter()) return undefined;
-		if (state.getEditorText().length > 0) return undefined;
-		// Accept: fill the editor and clear the suggestion. Consume the key.
-		state.setEditorText(state.suggestion);
-		state.suggestion = "";
-		state.publishWidget(undefined);
-		return { consume: true };
+		if (isAcceptKey && state.suggestion && state.isIdleGetter() && state.getEditorText().length === 0) {
+			// Accept: fill the editor, remember the last suggestion, clear the widget,
+			// and schedule a re-arm check (if the user deletes back to empty, re-show it).
+			state.lastSuggestion = state.suggestion;
+			state.setEditorText(state.suggestion);
+			state.suggestion = "";
+			state.publishWidget(undefined);
+			scheduleRearmCheck(state);
+			return { consume: true };
+		}
+		// Non-accept key (or accept with nothing to accept): pass through, but check
+		// whether this input emptied the editor so we can re-arm the last suggestion.
+		scheduleRearmCheck(state);
+		return undefined;
 	};
 }
 
@@ -615,7 +661,11 @@ interface NextPromptRef {
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
-	const ref: NextPromptRef = { state: undefined, inflight: undefined, unsubInput: undefined };
+	const ref: NextPromptRef = {
+		state: undefined,
+		inflight: undefined,
+		unsubInput: undefined,
+	};
 	let config: NextPromptConfig = {};
 	const notifiedFallback = { value: false };
 
@@ -638,7 +688,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		const state: SuggestionState = {
 			suggestion: "",
+			lastSuggestion: "",
 			acceptKey: config.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			rearmDelayMs: config.rearmDelayMs ?? DEFAULT_REARM_MS,
+			rearmTimer: undefined,
 			isIdleGetter: () => ctx.isIdle(),
 			getEditorText: () => ctx.ui.getEditorText(),
 			setEditorText: (text) => ctx.ui.setEditorText(text),
@@ -663,9 +716,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 
 	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => { reset(); });
-	pi.on("turn_start", () => { reset(); });
-	pi.on("agent_start", () => { reset(); });
+	pi.on("input", () => {
+		reset();
+	});
+	pi.on("turn_start", () => {
+		reset();
+	});
+	pi.on("agent_start", () => {
+		reset();
+	});
 
 	pi.on("session_shutdown", () => {
 		reset();

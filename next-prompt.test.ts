@@ -793,7 +793,9 @@ function makeFake(opts: {
 	widgetContent: string[] | undefined;
 	editorText: string;
 	setEditorText: (t: string) => void;
-	inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
+	inputHandler:
+		| ((data: string) => { consume?: boolean } | undefined)
+		| undefined;
 	calls: {
 		complete: Array<{
 			model: unknown;
@@ -819,7 +821,9 @@ function makeFake(opts: {
 		notifies: [] as Array<[string, string]>,
 	};
 	let editorText = "";
-	let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
+	let inputHandler:
+		| ((data: string) => { consume?: boolean } | undefined)
+		| undefined;
 	let widgetContent: string[] | undefined;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
@@ -856,10 +860,14 @@ function makeFake(opts: {
 				handler: (data: string) => { consume?: boolean } | undefined,
 			) => {
 				inputHandler = handler;
-				return () => { inputHandler = undefined; };
+				return () => {
+					inputHandler = undefined;
+				};
 			},
 			getEditorText: () => editorText,
-			setEditorText: (text: string) => { editorText = text; },
+			setEditorText: (text: string) => {
+				editorText = text;
+			},
 			setWidget: (
 				_key: string,
 				content: string[] | undefined,
@@ -878,10 +886,18 @@ function makeFake(opts: {
 	return {
 		pi,
 		ctx,
-		get widgetContent() { return widgetContent; },
-		get editorText() { return editorText; },
-		setEditorText: (t: string) => { editorText = t; },
-		get inputHandler() { return inputHandler; },
+		get widgetContent() {
+			return widgetContent;
+		},
+		get editorText() {
+			return editorText;
+		},
+		setEditorText: (t: string) => {
+			editorText = t;
+		},
+		get inputHandler() {
+			return inputHandler;
+		},
 		calls,
 		handlers,
 		setIdle: (v: boolean) => {
@@ -1298,6 +1314,113 @@ describe("accept handler (onTerminalInput)", () => {
 		fake.handlers.get("input")!({}, fake.ctx);
 		const result = fake.inputHandler!("\x1b/");
 		expect(result).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Re-arm: after accept, deleting back to empty re-shows the last suggestion
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Configure a tiny rearmDelayMs so tests don't wait 2s.
+function writeRearmConfig(delayMs: number): void {
+	writeFile(
+		process.env.PI_CODING_AGENT_DIR!,
+		"next-prompt.json",
+		JSON.stringify({ rearmDelayMs: delayMs }),
+	);
+}
+
+describe("re-arm after delete-to-empty", () => {
+	test("T98: accept then delete back to empty → suggestion re-appears after delay (no new model call)", async () => {
+		writeRearmConfig(30);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "redo this" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
+		// Accept → fills editor, clears widget.
+		fake.inputHandler!("\x1b/");
+		expect(fake.editorText).toBe("redo this");
+		expect(fake.widgetContent).toBeUndefined();
+		// Delete back to empty (backspace, then clear editor text).
+		fake.inputHandler!("\x7f");
+		fake.setEditorText("");
+		// After the deferred check + rearmDelayMs, the suggestion re-appears.
+		await sleep(150);
+		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
+		// No new model call — the complete call count is unchanged.
+		expect(fake.calls.complete.length).toBe(1);
+	});
+
+	test("T99: no last suggestion → nothing to re-arm", async () => {
+		writeRearmConfig(30);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		// No agent_settled → no suggestion, no lastSuggestion. Fire backspace-to-empty.
+		fake.setEditorText("");
+		fake.inputHandler!("\x7f");
+		await sleep(150);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("T100: re-arm canceled if editor non-empty when timer fires", async () => {
+		writeRearmConfig(30);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/");
+		fake.setEditorText("");
+		fake.inputHandler!("\x7f");
+		// Type something before the rearm timer fires.
+		fake.setEditorText("new text");
+		await sleep(150);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("T101: re-arm canceled if agent becomes non-idle", async () => {
+		writeRearmConfig(30);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/");
+		fake.setEditorText("");
+		fake.inputHandler!("\x7f");
+		fake.setIdle(false);
+		await sleep(150);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("T102: config rearmDelayMs default is 2000 when unconfigured", async () => {
+		// No config file → default 2000. We don't wait 2s; just assert the re-arm does
+		// NOT fire within a short window (proving it's not the tiny default).
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/");
+		fake.setEditorText("");
+		fake.inputHandler!("\x7f");
+		await sleep(150);
+		expect(fake.widgetContent).toBeUndefined(); // hasn't fired yet (default is 2000ms)
 	});
 });
 
