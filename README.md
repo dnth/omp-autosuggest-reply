@@ -1,72 +1,131 @@
-# next-prompt — inline ghost-text next-prompt suggestions for pi
+# next-prompt — next-prompt suggestions for pi
 
-A pi coding-agent extension that, after an agent turn fully settles and the input
-editor is empty, computes the single most logical next instruction you'd type and
-shows it as **inline greyed ghost text** after the caret.
+A [pi](https://github.com/earendil-works/pi-coding-agent) coding-agent extension that,
+after an agent turn fully settles and the input editor is empty, computes the single
+most logical next instruction you'd type and shows it. Three render modes:
 
-- **Tab** (when the autocomplete dropdown is closed) → accept the suggestion.
-- **Any other key** → dismiss the ghost immediately; it's re-armed from the last
-  computed suggestion when you backspace down to empty (no new model call).
-- **No ghost while streaming** — only when the agent is idle and the editor is empty.
-- **No stale suggestions** — the ghost is cleared and any in-flight model call aborted
-  the instant you submit, start a new turn, or the agent starts.
+- **`widget`** (default) — a colored below-editor line:
+  `↳ next: <suggestion>  (Alt-/ to accept)`
+- **`ghost`** — inline greyed ghost text **in the input box** (renders even when the
+  editor is unfocused, e.g. after switching tabs/apps)
+- **`both`** — inline ghost AND the below-editor widget simultaneously
 
-The built-in `addAutocompleteProvider` API only produces a dropdown; it cannot do inline
-ghost text, so this extension replaces the editor via `setEditorComponent` + a thin
-`CustomEditor` subclass that overlays the suggestion in `render(width)`.
+Accept with **`Alt-/`** (default; configurable) to fill the input box. Any other key
+dismisses; backspace down to empty re-arms the last suggestion after a short delay (no
+new model call). No suggestion while streaming; the suggestion is cleared and any
+in-flight model call aborted the instant you submit, start a turn, or the agent starts.
 
 ## Install
 
-This repo lives at `/home/gabi/Devel/Personal/next-prompt-extension/` and is wired into
-pi via a symlink (no copy, no install):
+Pi auto-discovers extensions from standard locations.
+
+### From npm / the pi package gallery
+
+The published package is `@gamaraan/next-prompt`, published under the npm account `gamaraan`:
 
 ```bash
-ln -sfn /home/gabi/Devel/Personal/next-prompt-extension/next-prompt.ts \
-        ~/.pi/agent/extensions/next-prompt.ts
+pi install npm:@gamaraan/next-prompt
 ```
 
-Pi auto-discovers `~/.pi/agent/extensions/*.ts` globally. Restart `pi` (or start a new
-session) and the extension loads.
-
-To develop, just edit `next-prompt.ts` in place — the symlink picks up changes on the
-next session start. Run the tests:
+A specific release can be pinned with:
 
 ```bash
-cd /home/gabi/Devel/Personal/next-prompt-extension
-bun test
+pi install npm:@gamaraan/next-prompt@0.1.0
 ```
 
-> The local `node_modules/@earendil-works/*` are symlinks to the globally-installed pi
-> packages (so the TypeScript LSP resolves imports). They're git-ignored; nothing is
-> downloaded.
+### From GitHub
 
-## Config
+The source repository is `gamaraan/next-prompt-extension`:
 
-All fields optional. Merged global + project (project overrides global on key
-collisions):
+```bash
+pi install git:github.com/gamaraan/next-prompt-extension
+```
+
+To pin a GitHub release or commit, append the tag or commit reference:
+
+```bash
+pi install git:github.com/gamaraan/next-prompt-extension@v0.1.0
+
+### Manual — copy the file
+
+Copy `next-prompt.ts` into your global pi extensions directory:
+
+```bash
+cp next-prompt.ts ~/.pi/agent/extensions/next-prompt.ts
+```
+
+Or, for a single project only, place it in the project-local extensions directory
+(loads after the project is trusted):
+
+```bash
+cp next-prompt.ts .pi/extensions/next-prompt.ts
+```
+
+### Manual — reference from settings
+
+Add the path to the `extensions` array in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "extensions": [
+    "/absolute/or/relative/path/to/next-prompt.ts"
+  ]
+}
+```
+
+Restart `pi` (or start a new session) after installing.
+
+## Configure
+
+### Interactive: `/next-prompt-config`
+
+Run the `/next-prompt-config` slash command in pi for a guided walkthrough of every
+option — a model picker (lists all available models, like `/model`), render mode,
+thinking level, accept key, re-arm delay, transcript/suggestion caps, and
+cross-provider disclosure. Changes are saved to `~/.pi/agent/next-prompt.json` and pi
+reloads so they take effect immediately.
+
+### Config file
+
+All fields optional. Merged global + project (project overrides global **per top-level
+key**; the nested `model` block is replaced wholesale, not merged):
 
 - Global: `~/.pi/agent/next-prompt.json`
 - Project: `<cwd>/.pi/next-prompt.json`
 
 ```json
 {
-  "model": { "provider": "anthropic", "model": "claude-haiku-4-5" },
-  "systemPrompt": "...override the default extractor prompt...",
+  "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
+  "thinking": "low",
+  "acceptKey": "alt+/",
+  "renderMode": "both",
+  "rearmDelayMs": 2000,
   "maxTranscriptChars": 12000,
   "maxSuggestionChars": 240,
-  "debounceMs": 400,
   "allowCrossProvider": true
 }
 ```
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `model` | current model (`ctx.model`) | The model used to generate the suggestion. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
+| `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
+| `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
+| `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
+| `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). |
+| `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length. |
-| `debounceMs` | `400` | Largely redundant with the `agent_settled` trigger; reserved. |
-| `allowCrossProvider` | `true` | When `false`, fall back to the current model if the configured suggestion model is on a **different** provider than the active one. See Security below. |
+| `allowCrossProvider` | `true` | When `false`, fall back to the current model if the configured suggestion model is on a **different** provider. See Security below. |
+
+### Why `alt+/` is the default accept key
+
+- **`tab`** — conflicts with pi's path-autocomplete and `/template` dropdown.
+- **`ctrl+tab`** — many terminals send it as plain `tab`/`\t` or swallow it (window/tab switcher), so it's unreliable.
+- **`ctrl+space`** — works (sends `\x00`, which pi-tui maps to `ctrl+space`); the extension intercepts it before the base editor so it no longer pollutes, but some terminals remap Ctrl-Space to IME toggle.
+- **`alt+/`** — sends an unambiguous `\x1b/` sequence, not bound by pi or most terminals, and is memorable ("accept the suggested next command"). Recommended.
+
+Override with any `KeyId`, e.g. `"acceptKey": "ctrl+space"`.
 
 ## Security: cross-provider transcript disclosure
 
@@ -80,35 +139,54 @@ sent to that second provider, which may have different data-handling terms.
 Mitigations:
 
 - `buildTranscript` redacts obvious high-entropy secrets (AWS `AKIA…`, OpenAI `sk-…`,
-  GitHub `ghp_…`, Slack `xoxb-…`, PEM private key blocks) before sending. This is
-  defense-in-depth, not a guarantee — the active model may already have seen secrets in
-  the turn, and the model may quote file contents in its text.
+  GitHub `ghp_…` ≥36 chars, Slack `xoxb-…`, PEM private key blocks) before sending.
+  This is defense-in-depth, not a guarantee.
 - Set `"allowCrossProvider": false` to force same-provider suggestions silently.
 - The redaction patterns are in `redactSecrets()`; extend them if you handle other
   secret formats.
 
 ## How it works
 
-1. On `session_start`, `setEditorComponent` installs a `NextPromptEditor` that wraps
-   the default editor.
+1. On `session_start`, a global `ctx.ui.onTerminalInput` listener is registered to
+   detect the accept key **editor-independently** (survives pi's `resetExtensionUI`,
+   which would otherwise orphan a custom editor). In `ghost`/`both` mode, a custom
+   `GhostEditor` is also installed via `setEditorComponent` and re-installed on
+   `agent_settled` to recover after resets.
 2. On `agent_settled` (one event per user-initiated turn, after the agent is truly
    idle), if the editor is empty, the controller calls
-   `ctx.modelRegistry.complete(model, { systemPrompt, messages }, { signal })` with the
-   resolved model and the (redacted, tail-truncated) transcript.
+   `ctx.modelRegistry.complete(model, { systemPrompt, messages }, { signal, reasoning })`
+   with the resolved model, the configured thinking level, and the (redacted,
+   tail-truncated) transcript.
 3. The returned text is sanitized (trimmed, de-quoted, de-fenced, collapsed to one
-   line, capped) and shown as ghost text via `setGhost`.
-4. `decideInput` (a pure function — unit-tested in isolation) decides what each
-   keystroke does: Tab-accept (only when autocomplete is closed), dismiss-on-any-other
-   key, re-arm-on-backspace-to-empty.
-5. `overlayGhost` (pure) inserts the ghost as raw ANSI dim text (`\x1b[2m…\x1b[22m`)
-   immediately after the cursor block, preserving the `CURSOR_MARKER`→cursor offset for
-   IME safety, and bails when the editor is unfocused (no marker emitted).
+   line, capped) and shown — via `setWidget` (widget/both), via the inline ghost
+   overlay (ghost/both), or both.
+4. The accept key is intercepted **before** the base editor: if a suggestion is
+   showing and autocomplete is closed, it fills the editor via
+   `ctx.ui.setEditorText` and swallows the key. Any other key delegates to the base
+   editor; if the user deletes back to empty, the last suggestion re-arms after
+   `rearmDelayMs` (no new model call).
 
-## Design doc
+## Develop
 
-See [`PLAN.md`](./PLAN.md) for the full oracle-reviewed design, including the audit
-trail of 9 blockers found and fixed during adversarial review.
+Clone and run the tests with [Bun](https://bun.sh):
+
+```bash
+bun test
+```
+
+The extension imports `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and
+`@earendil-works/pi-ai`. These are provided by your pi installation — list them in
+`peerDependencies` with `"*"` (do not bundle). If your editor's TypeScript LSP can't
+resolve them, link them from your pi install's `node_modules` (git-ignored here;
+nothing is downloaded).
+
+Edit `next-prompt.ts` in place and restart pi to pick up changes.
+
+## Design & development
+
+Source and design discussion live in the
+[GitHub repository](https://github.com/gamaraan/next-prompt-extension).
 
 ## License
 
-MIT.
+MIT — see [LICENSE](./LICENSE).

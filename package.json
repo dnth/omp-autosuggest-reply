@@ -1,0 +1,32 @@
+{
+  "name": "@gamaraan/next-prompt",
+  "version": "0.1.0",
+  "description": "pi coding-agent extension that suggests the next logical prompt after an agent turn settles (inline ghost, below-editor widget, or both).",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "main": "next-prompt.ts",
+  "files": ["next-prompt.ts", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": ["./next-prompt.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-tui": "^0.84.1",
+    "@types/bun": "latest"
+  }
+}

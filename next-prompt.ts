@@ -1,33 +1,33 @@
 /**
- * next-prompt — inline "ghost" next-prompt suggestion extension for pi.
+ * next-prompt — next-prompt suggestion extension for pi.
  *
  * When the input editor is empty after an agent turn has fully settled, computes the
- * single most logical next instruction the user would type and shows it as inline
- * greyed ghost text after the caret. Tab (with the autocomplete dropdown closed)
- * accepts; any other key dismisses; backspace-to-empty re-arms from the last
- * computed suggestion (no new model call). No ghost is shown while the agent is
- * streaming or the editor is non-empty.
+ * single most logical next instruction the user would type and shows it. Two render
+ * modes (config `renderMode`, default "widget"):
+ *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
+ *   - "ghost":  inline greyed ghost text in the input box after the caret (nicer, but
+ *              re-installs a custom editor and may briefly lose it during session
+ *              lifecycle events such as reload/new/fork; re-installed on session_start
+ *              and agent_settled to recover).
  *
- * Config (all optional), merged global + project:
+ * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
+ * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor via
+ * `ctx.ui.setEditorText` — editor-independent, survives pi's resetExtensionUI. Any
+ * other key dismisses; backspace-to-empty re-arms the last suggestion after
+ * `rearmDelayMs` (default 2000, no new model call). No suggestion while streaming.
+ *
+ * Config (all optional), merged global + project (project overrides global per top-level
+ * key; nested `model` block is replaced wholesale, not merged):
  *   ~/.pi/agent/next-prompt.json
  *   <cwd>/.pi/next-prompt.json
- *
- * {
- *   "model": { "provider": "anthropic", "model": "claude-haiku-4-5" },  // default: current model
- *   "systemPrompt": "...override...",
- *   "maxTranscriptChars": 12000,
- *   "maxSuggestionChars": 240,
- *   "debounceMs": 400,            // largely redundant with agent_settled; reserved
- *   "allowCrossProvider": true   // false => fall back to ctx.model if configured provider differs
- * }
  *
  * See PLAN.md for the full design (oracle-reviewed).
  *
  * @module next-prompt
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
@@ -38,14 +38,23 @@ import {
 	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
-	CURSOR_MARKER,
 	matchesKey,
+	CURSOR_MARKER,
 	truncateToWidth,
 	visibleWidth,
 	type EditorTheme,
+	type KeyId,
 	type TUI,
 } from "@earendil-works/pi-tui";
-import type { Api, AssistantMessage, Context, Message, Model, UserMessage } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Message,
+	Model,
+	ThinkingLevel,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,15 +65,23 @@ export interface NextPromptModelConfig {
 	model: string;
 }
 
+export type RenderMode = "widget" | "ghost" | "both";
+
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
+	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
+	thinking?: ThinkingLevel;
+	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "alt+/". */
+	acceptKey?: string;
+	/** How the suggestion is shown. "widget" (default) = below-editor line; "ghost" = inline overlay in the input box. */
+	renderMode?: RenderMode;
 	systemPrompt?: string;
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
 	debounceMs?: number;
 	allowCrossProvider?: boolean;
-	/** Reserved for v2: render the suggestion below the editor instead of inline. */
-	belowEditorFallback?: boolean;
+	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
+	rearmDelayMs?: number;
 }
 
 export type TriggerDecision = "compute" | "skip";
@@ -97,6 +114,56 @@ export interface SuggestionCtx {
 
 const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
+export const DEFAULT_ACCEPT_KEY = "alt+/";
+export const DEFAULT_REARM_MS = 2000;
+
+// ANSI styling for the below-editor widget. Cyan accent for the ↳/next: prefix and
+// the shortcut hint; the suggestion itself is plain (high-contrast default text).
+const ACCENT = "\x1b[36m";
+const DIM = "\x1b[2m";
+const RESET = "\x1b[0m";
+
+/** Humanize a KeyId for display, e.g. "ctrl+tab" → "Ctrl-Tab". */
+export function humanizeKey(key: string): string {
+	return key
+		.split("+")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join("-");
+}
+
+/**
+ * Raw-byte fallback for accept-key detection, for terminals where pi-tui's
+ * matchesKey() doesn't recognize a legacy alt+symbol sequence. Handles the
+ * common forms an Alt+key or Ctrl+Alt+key can arrive in:
+ *   alt+/   → "\x1b/"  (or sometimes "\x1bO/" / kitty CSI-u)
+ *   ctrl+space → "\x00"
+ * Only the last modifier+key segment is considered. Returns true if `data`
+ * matches any of the candidate byte forms for the configured key.
+ */
+export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
+	const parts = acceptKey.split("+");
+	if (parts.length === 0) return false;
+	const keyPart = parts[parts.length - 1]!;
+	const modifiers = parts.slice(0, -1);
+	const hasAlt = modifiers.includes("alt");
+	const hasCtrl = modifiers.includes("ctrl");
+
+	// ctrl+space special-case: legacy terminals send NUL.
+	if (hasCtrl && !hasAlt && keyPart === "space" && data === "\x00") return true;
+
+	// alt + single printable char: legacy form is ESC + char (both cases).
+	if (hasAlt && !hasCtrl && keyPart.length === 1) {
+		const cp = keyPart.codePointAt(0) ?? 0;
+		const printable = cp >= 0x20 && cp <= 0x7e;
+		if (printable) {
+			if (data === `\x1b${keyPart}`) return true;
+			if (data === `\x1b${keyPart.toUpperCase()}`) return true;
+			// Some terminals prefix with SS3 ('O') for numpad/symbol variants.
+			if (data === `\x1bO${keyPart}`) return true;
+		}
+	}
+	return false;
+}
 
 export function loadConfig(cwd: string): NextPromptConfig {
 	const globalPath = join(getAgentDir(), "next-prompt.json");
@@ -109,14 +176,18 @@ export function loadConfig(cwd: string): NextPromptConfig {
 		try {
 			globalCfg = parseConfig(readFileSync(globalPath, "utf-8"));
 		} catch (err) {
-			console.warn(`next-prompt: failed to read global config ${globalPath}: ${err}`);
+			console.warn(
+				`next-prompt: failed to read global config ${globalPath}: ${err}`,
+			);
 		}
 	}
 	if (existsSync(projectPath)) {
 		try {
 			projectCfg = parseConfig(readFileSync(projectPath, "utf-8"));
 		} catch (err) {
-			console.warn(`next-prompt: failed to read project config ${projectPath}: ${err}`);
+			console.warn(
+				`next-prompt: failed to read project config ${projectPath}: ${err}`,
+			);
 		}
 	}
 	return { ...globalCfg, ...projectCfg };
@@ -125,13 +196,73 @@ export function loadConfig(cwd: string): NextPromptConfig {
 function parseConfig(text: string): NextPromptConfig {
 	// pi-lens-ignore: unchecked-throwing-call
 	const parsed = JSON.parse(text) as NextPromptConfig;
-	if (parsed && typeof parsed !== "object") throw new Error("config is not an object");
-	if (parsed.model != null && (typeof parsed.model !== "object" || typeof parsed.model.provider !== "string" || typeof parsed.model.model !== "string")) {
-		console.warn("next-prompt: config.model must be { provider, model }; ignoring");
+	if (parsed && typeof parsed !== "object")
+		throw new Error("config is not an object");
+	if (
+		parsed.model != null &&
+		(typeof parsed.model !== "object" ||
+			typeof parsed.model.provider !== "string" ||
+			typeof parsed.model.model !== "string")
+	) {
+		console.warn(
+			"next-prompt: config.model must be { provider, model }; ignoring",
+		);
 		return { ...parsed, model: undefined };
 	}
 	return parsed;
 }
+
+/** Merge a partial config update into the existing global config file, preserving unspecified keys. */
+export function saveConfig(
+	update: Partial<NextPromptConfig>,
+): NextPromptConfig {
+	const path = join(getAgentDir(), "next-prompt.json");
+	let existing: NextPromptConfig = {};
+	if (existsSync(path)) {
+		try {
+			existing = parseConfig(readFileSync(path, "utf-8"));
+		} catch {
+			existing = {};
+		}
+	}
+	const merged: NextPromptConfig = { ...existing, ...update };
+	// Drop undefined values so the file stays clean.
+	const clean: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(merged))
+		if (v !== undefined) clean[k] = v;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(clean, null, 2)}\n`);
+	return merged;
+}
+
+/** Format a model for the config-command picker: "provider/model — name". */
+export function formatModelOption(model: {
+	provider: string;
+	id: string;
+	name?: string;
+}): string {
+	return `${model.provider}/${model.id} — ${model.name ?? model.id}`;
+}
+
+/** Parse a picked option (from formatModelOption) back into {provider, model}. */
+export function parseModelOption(
+	picked: string,
+): NextPromptModelConfig | undefined {
+	const m = picked.match(/^(.+?)\/(.+?) — /);
+	if (!m || !m[1] || !m[2]) return undefined;
+	return { provider: m[1], model: m[2] };
+}
+
+/** All selectable thinking levels plus an explicit "off/unset" entry. */
+export const THINKING_OPTIONS = [
+	"(unset — model default)",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
 
 // ---------------------------------------------------------------------------
 // Model resolution
@@ -147,10 +278,17 @@ export function resolveSuggestionModel(
 	if (config.model && config.model.provider && config.model.model) {
 		// allowCrossProvider guard: if false and the configured provider differs from the
 		// active one, fall back to the active model silently (do not notify).
-		if (config.allowCrossProvider === false && active && config.model.provider !== active.provider) {
+		if (
+			config.allowCrossProvider === false &&
+			active &&
+			config.model.provider !== active.provider
+		) {
 			return active;
 		}
-		const found = ctx.modelRegistry.find(config.model.provider, config.model.model);
+		const found = ctx.modelRegistry.find(
+			config.model.provider,
+			config.model.model,
+		);
 		if (found) return found;
 		if (!notifiedRef.value) {
 			notifiedRef.value = true;
@@ -170,8 +308,8 @@ export function resolveSuggestionModel(
 const SECRET_PATTERNS: RegExp[] = [
 	/AKIA[0-9A-Z]{16}/g, // AWS access key id
 	/sk-[a-zA-Z0-9]{20,}/g, // OpenAI-style secret
-	/ghp_[A-Za-z0-9]+/g, // GitHub personal access token (variable length)
-	/xoxb-[0-9a-zA-Z-]+/g, // Slack bot token
+	/ghp_[A-Za-z0-9]{36,}/g, // GitHub personal access token (classic PATs are 40 chars; 36+ avoids short false positives like ghp_test)
+	/xoxb-[0-9a-zA-Z-]{10,}-[0-9a-zA-Z-]{10,}/g, // Slack bot token (xoxb-<10+>-<10+>)
 	/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----/g, // PEM
 ];
 
@@ -216,7 +354,10 @@ function joinAssistantText(content: unknown): string {
 	return parts.join("");
 }
 
-export function buildTranscript(branch: BranchEntry[], config: NextPromptConfig = {}): string {
+export function buildTranscript(
+	branch: BranchEntry[],
+	config: NextPromptConfig = {},
+): string {
 	const max = config.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT;
 	const lines: string[] = [];
 
@@ -252,7 +393,10 @@ export function buildMessages(transcript: string): Message[] {
 // Suggestion sanitization
 // ---------------------------------------------------------------------------
 
-export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): string {
+export function sanitizeSuggestion(
+	raw: string,
+	config: NextPromptConfig = {},
+): string {
 	const max = config.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION;
 	let s = raw.trim();
 
@@ -266,7 +410,11 @@ export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): 
 	if (s.length >= 2) {
 		const first = s[0]!;
 		const last = s[s.length - 1]!;
-		if ((first === '"' && last === '"') || (first === "'" && last === "'") || (first === "`" && last === "`")) {
+		if (
+			(first === '"' && last === '"') ||
+			(first === "'" && last === "'") ||
+			(first === "`" && last === "`")
+		) {
 			s = s.slice(1, -1).trim();
 		}
 	}
@@ -282,7 +430,8 @@ export function sanitizeSuggestion(raw: string, config: NextPromptConfig = {}): 
 
 	// Cap at a grapheme-safe boundary; truncateToWidth appends a trailing \x1b[0m reset,
 	// strip it so the suggestion is clean text.
-	if (visibleWidth(s) > max) s = truncateToWidth(s, max, "").replace(/\x1b\[[0-9;]*m$/g, "");
+	if (visibleWidth(s) > max)
+		s = truncateToWidth(s, max, "").replace(/\x1b\[[0-9;]*m$/g, "");
 	return s;
 }
 
@@ -302,7 +451,8 @@ export function shouldTrigger(
 		const entry = branch[i]!;
 		if (entry.type === "message" && entry.message) {
 			const msg = entry.message;
-			if (msg.role === "assistant" && msg.stopReason === "stop") return "compute";
+			if (msg.role === "assistant" && msg.stopReason === "stop")
+				return "compute";
 			return "skip";
 		}
 	}
@@ -322,9 +472,17 @@ export function decideInput(opts: {
 	isShowingAutocomplete: boolean;
 	isTab: boolean;
 }): InputDecision {
-	const { ghost, lastSuggestion, editorTextBefore, editorTextAfter, isShowingAutocomplete, isTab } = opts;
+	const {
+		ghost,
+		lastSuggestion,
+		editorTextBefore,
+		editorTextAfter,
+		isShowingAutocomplete,
+		isTab,
+	} = opts;
 
-	const backspaceToEmpty = editorTextBefore.length > 0 && editorTextAfter.length === 0;
+	const backspaceToEmpty =
+		editorTextBefore.length > 0 && editorTextAfter.length === 0;
 
 	// 1. Accept on Tab, but only when autocomplete is NOT open (so we never clobber
 	//    /template or path completion).
@@ -337,7 +495,10 @@ export function decideInput(opts: {
 		// The editor text may have changed (e.g. the printable char was inserted, or
 		// escape did nothing). Re-arm check below only applies when text became empty.
 		const newGhost = backspaceToEmpty && lastSuggestion ? lastSuggestion : "";
-		return { action: backspaceToEmpty && lastSuggestion ? "rearm" : "dismiss", ghost: newGhost };
+		return {
+			action: backspaceToEmpty && lastSuggestion ? "rearm" : "dismiss",
+			ghost: newGhost,
+		};
 	}
 	// 3. No ghost: re-arm if the user just backspaced down to empty and we have a
 	//    cached suggestion.
@@ -366,7 +527,11 @@ const DIM_START = "\x1b[2m";
 const DIM_END = "\x1b[22m";
 const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor
 
-export function overlayGhost(lines: string[], ghost: string, width: number): string[] {
+export function overlayGhost(
+	lines: string[],
+	ghost: string,
+	width: number,
+): string[] {
 	if (!ghost || lines.length === 0) return lines;
 
 	// Find the cursor line by locating CURSOR_MARKER. Bail if unfocused (no marker).
@@ -377,35 +542,75 @@ export function overlayGhost(lines: string[], ghost: string, width: number): str
 			break;
 		}
 	}
-	if (cursorLineIdx === -1) return lines; // unfocused: no marker, do nothing.
-
+	const contentWidth = Math.max(1, width);
 	const result = lines.slice();
+
+	if (cursorLineIdx === -1) {
+		// Unfocused (e.g. user switched tabs/apps): CURSOR_MARKER is absent. The empty
+		// editor renders a single padded content line between top/bottom border rules.
+		// Insert the ghost at the start of that content line so the suggestion still shows.
+		let contentIdx = -1;
+		for (let i = 0; i < lines.length; i++) {
+			const stripped = stripAnsi(lines[i]!).trim();
+			if (!stripped.startsWith("─")) {
+				contentIdx = i;
+				break;
+			}
+		}
+		if (contentIdx === -1) return lines;
+		const line = result[contentIdx]!;
+		const ghostSlice =
+			visibleWidth(ghost) > contentWidth
+				? truncateToWidth(ghost, contentWidth, "")
+				: ghost;
+		if (!ghostSlice) return lines;
+		const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
+		result[contentIdx] =
+			ghostStyled +
+			line.slice(visibleWidth(ghostSlice)) +
+			" ".repeat(Math.max(0, contentWidth - visibleWidth(ghostSlice)));
+		return result;
+	}
+
 	const line = result[cursorLineIdx]!;
 
 	// The cursor block is: <before><CURSOR_MARKER>\x1b[7m<grapheme or space>\x1b[0m<rest>
 	// Locate the first \x1b[0m after the CURSOR_MARKER to find the end of the cursor block.
 	const markerIdx = line.indexOf(CURSOR_MARKER);
 	if (markerIdx === -1) return lines; // defensive (already checked)
-	const cursorBlockEnd = line.indexOf(CURSOR_BLOCK_END, markerIdx + CURSOR_MARKER.length);
+	const cursorBlockEnd = line.indexOf(
+		CURSOR_BLOCK_END,
+		markerIdx + CURSOR_MARKER.length,
+	);
 	if (cursorBlockEnd === -1) return lines; // unexpected structure; leave unchanged
 	const insertAt = cursorBlockEnd + CURSOR_BLOCK_END.length;
 
 	// Compute the visible width of the line content (excluding ANSI + the marker) so we
 	// can size the ghost to fit within the editor content width without overflowing the
 	// border.
-	const contentWidth = Math.max(1, width);
 	const leftPart = line.slice(0, insertAt);
 	const trailingPart = line.slice(insertAt);
 	// Strip trailing whitespace (the padding the base editor appends) to measure real width.
 	const trailingTrimmed = trailingPart.replace(/\s+$/, "");
-	const leftVisible = visibleWidth(stripAnsi(leftPart) + stripAnsi(trailingTrimmed));
+	const leftVisible = visibleWidth(
+		stripAnsi(leftPart) + stripAnsi(trailingTrimmed),
+	);
 	const remaining = Math.max(0, contentWidth - leftVisible);
 
-	const ghostSlice = visibleWidth(ghost) > remaining ? truncateToWidth(ghost, remaining, "") : ghost;
+	const ghostSlice =
+		visibleWidth(ghost) > remaining
+			? truncateToWidth(ghost, remaining, "")
+			: ghost;
 	if (!ghostSlice) return lines; // nothing fits
 
 	const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
-	const newLine = leftPart + ghostStyled + trailingTrimmed + " ".repeat(Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)));
+	const newLine =
+		leftPart +
+		ghostStyled +
+		trailingTrimmed +
+		" ".repeat(
+			Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)),
+		);
 	result[cursorLineIdx] = newLine;
 	return result;
 }
@@ -413,72 +618,144 @@ export function overlayGhost(lines: string[], ghost: string, width: number): str
 /** Strip ANSI escape sequences for width measurement. */
 function stripAnsi(s: string): string {
 	// eslint-disable-next-line no-control-regex
-	return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").replace(/\x1b[2-]m/g, "").replace(CURSOR_MARKER, "");
+	return s
+		.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
+		.replace(/\x1b[2-]m/g, "")
+		.replace(CURSOR_MARKER, "");
 }
 
 // ---------------------------------------------------------------------------
-// Editor component (thin shell over decideInput + overlayGhost)
+// Suggestion state (editor-independent acceptance; rendering branches by mode)
 // ---------------------------------------------------------------------------
 
-class NextPromptEditor extends CustomEditor {
-	ghost = "";
-	lastSuggestion = "";
-	private isIdleGetter: () => boolean;
+export interface SuggestionState {
+	suggestion: string;
+	lastSuggestion: string;
+	acceptKey: string;
+	renderMode: RenderMode;
+	rearmDelayMs: number;
+	rearmTimer: ReturnType<typeof setTimeout> | undefined;
+	rearmCheckTimer: ReturnType<typeof setTimeout> | undefined;
+	isIdleGetter: () => boolean;
+	getEditorText: () => string;
+	setEditorText: (text: string) => void;
+	publishWidget: (content: string[] | undefined) => void;
+	renderGhost: (() => void) | undefined;
+}
 
-	constructor(
-		tui: TUI,
-		theme: EditorTheme,
-		keybindings: KeybindingsManager,
-		isIdleGetter: () => boolean,
-	) {
-		super(tui, theme, keybindings);
-		this.isIdleGetter = isIdleGetter;
+/** Publish the below-editor widget (or clear it when there's no suggestion). */
+function renderWidget(state: SuggestionState): void {
+	if (state.suggestion) {
+		const hint = humanizeKey(state.acceptKey);
+		state.publishWidget([
+			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
+		]);
+	} else {
+		state.publishWidget(undefined);
 	}
+}
 
-	setGhost(text: string): void {
-		// Race guard: only show if the editor is STILL empty and the agent is STILL idle.
-		if (this.getText().length === 0 && this.isIdleGetter()) {
-			this.ghost = text;
-			this.lastSuggestion = text;
-			this.tui?.requestRender();
+function renderSuggestion(state: SuggestionState): void {
+	const mode = state.renderMode;
+	const showGhost = mode === "ghost" || mode === "both";
+	const showWidget = mode === "widget" || mode === "both";
+	if (showGhost) state.renderGhost?.();
+	if (showWidget) renderWidget(state);
+}
+
+/** Show a suggestion. Race-guarded: only if the editor is empty and the agent is idle. */
+function setSuggestion(state: SuggestionState, text: string): void {
+	if (state.getEditorText().length === 0 && state.isIdleGetter()) {
+		state.suggestion = text;
+		state.lastSuggestion = text;
+		clearRearmTimer(state);
+		renderSuggestion(state);
+	}
+}
+
+/** Clear the current suggestion (clears the widget / ghost too). */
+function clearSuggestion(state: SuggestionState | undefined): void {
+	if (!state) return;
+	clearRearmTimer(state);
+	clearRearmCheckTimer(state);
+	if (state.suggestion) {
+		state.suggestion = "";
+		renderSuggestion(state);
+	}
+}
+
+function clearRearmTimer(state: SuggestionState): void {
+	if (state.rearmTimer !== undefined) {
+		clearTimeout(state.rearmTimer);
+		state.rearmTimer = undefined;
+	}
+}
+
+function clearRearmCheckTimer(state: SuggestionState): void {
+	if (state.rearmCheckTimer !== undefined) {
+		clearTimeout(state.rearmCheckTimer);
+		state.rearmCheckTimer = undefined;
+	}
+}
+
+/**
+ * After any input that might empty the editor, schedule a re-arm check: if the editor
+ * is empty, the agent is idle, no suggestion is showing, and we have a last suggestion,
+ * re-publish it after rearmDelayMs (default 2000, configurable). No new model call.
+ * The outer 50ms timer is tracked+cleared so rapid typing doesn't pile up timers.
+ */
+function scheduleRearmCheck(state: SuggestionState): void {
+	clearRearmCheckTimer(state);
+	// Defer so the editor has processed the key (getEditorText reflects post-input state).
+	state.rearmCheckTimer = setTimeout(() => {
+		state.rearmCheckTimer = undefined;
+		if (state.suggestion) return; // already showing
+		if (!state.lastSuggestion) return; // nothing to re-arm with
+		if (!state.isIdleGetter()) return; // agent running
+		if (state.getEditorText().length > 0) return; // not empty
+		clearRearmTimer(state);
+		state.rearmTimer = setTimeout(() => {
+			state.rearmTimer = undefined;
+			if (state.suggestion) return;
+			if (!state.isIdleGetter()) return;
+			if (state.getEditorText().length > 0) return;
+			setSuggestion(state, state.lastSuggestion);
+		}, state.rearmDelayMs);
+	}, 50);
+}
+
+/**
+ * Raw terminal-input handler for the accept key. Returns { consume: true } to swallow the
+ * key before the (default) editor sees it, and fills the editor with the suggestion.
+ * Used via ctx.ui.onTerminalInput — editor-independent, survives resetExtensionUI.
+ */
+function makeAcceptHandler(
+	state: SuggestionState,
+): (data: string) => { consume?: boolean } | undefined {
+	return (data: string) => {
+		const isAcceptKey =
+			matchesKey(data, state.acceptKey as KeyId) ||
+			matchesAcceptKeyRaw(data, state.acceptKey);
+		if (
+			isAcceptKey &&
+			state.suggestion &&
+			state.isIdleGetter() &&
+			state.getEditorText().length === 0
+		) {
+			// Accept: fill the editor, remember the last suggestion, clear the widget,
+			// and schedule a re-arm check (if the user deletes back to empty, re-show it).
+			state.lastSuggestion = state.suggestion;
+			state.setEditorText(state.suggestion);
+			state.suggestion = "";
+			state.publishWidget(undefined);
+			scheduleRearmCheck(state);
+			return { consume: true };
 		}
-	}
-
-	clearGhost(): void {
-		if (this.ghost) {
-			this.ghost = "";
-			this.tui?.requestRender();
-		}
-	}
-
-	handleInput(data: string): void {
-		const before = this.getText();
-		const isTab = matchesKey(data, "tab");
-		// Always delegate first so the base editor keeps authority over Tab-autocomplete,
-		// escape, ctrl+d, paste, history, etc.
-		super.handleInput(data);
-		const after = this.getText();
-
-		const d = decideInput({
-			data,
-			ghost: this.ghost,
-			lastSuggestion: this.lastSuggestion,
-			editorTextBefore: before,
-			editorTextAfter: after,
-			isShowingAutocomplete: this.isShowingAutocomplete(),
-			isTab,
-		});
-
-		if (d.action === "accept" && d.acceptText != null) {
-			this.insertTextAtCursor(d.acceptText);
-		}
-		this.ghost = d.ghost;
-		this.tui?.requestRender();
-	}
-
-	render(width: number): string[] {
-		return overlayGhost(super.render(width), this.ghost, width);
-	}
+		// Non-accept key (or accept with nothing to accept): pass through, but check
+		// whether this input emptied the editor so we can re-arm the last suggestion.
+		scheduleRearmCheck(state);
+		return undefined;
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -488,52 +765,175 @@ class NextPromptEditor extends CustomEditor {
 export const SYSTEM_PROMPT = `You predict the single most logical next instruction the user would type into a coding agent, given the conversation so far. Reply with ONLY that instruction, one line, no quotes, no markdown, no explanation. If there is nothing useful to suggest, reply with the single word: NONE`;
 
 // ---------------------------------------------------------------------------
+// Ghost editor (inline overlay mode — renderMode: "ghost")
+// ---------------------------------------------------------------------------
+// A thin CustomEditor that overlays the current suggestion (state.suggestion) as
+// greyed inline text after the caret via overlayGhost(). Acceptance still goes
+// through the global onTerminalInput handler (editor-independent); this class only
+// renders the ghost and dismisses/re-arms on key input. Re-installed on session_start
+// AND agent_settled to recover after pi's resetExtensionUI swaps the editor.
+
+class GhostEditor extends CustomEditor {
+	private suggestionState: SuggestionState;
+	constructor(
+		tui: TUI,
+		theme: EditorTheme,
+		keybindings: KeybindingsManager,
+		state: SuggestionState,
+	) {
+		super(tui, theme, keybindings);
+		this.suggestionState = state;
+	}
+
+	/** Public so the controller can trigger a re-render when the ghost value changes. */
+	requestGhostRender(): void {
+		this.tui?.requestRender();
+	}
+
+	render(width: number): string[] {
+		return overlayGhost(
+			super.render(width),
+			this.suggestionState.suggestion,
+			width,
+		);
+	}
+
+	handleInput(data: string): void {
+		const before = this.getText();
+		const isAcceptKey =
+			matchesKey(data, this.suggestionState.acceptKey as KeyId) ||
+			matchesAcceptKeyRaw(data, this.suggestionState.acceptKey);
+		// Delegate to the base editor first so it keeps authority over autocomplete,
+		// escape, ctrl+d, paste, history, etc.
+		super.handleInput(data);
+		const after = this.getText();
+
+		// The global onTerminalInput handler consumes the accept key (and fills the
+		// editor via setEditorText), so by the time handleInput runs the accept key is
+		// NOT in `data` for the accept case. Here we only manage ghost dismissal / re-arm
+		// for non-accept keys, mirroring decideInput's dismiss/rearm logic.
+		const d = decideInput({
+			data,
+			ghost: this.suggestionState.suggestion,
+			lastSuggestion: this.suggestionState.lastSuggestion,
+			editorTextBefore: before,
+			editorTextAfter: after,
+			isShowingAutocomplete: this.isShowingAutocomplete(),
+			isTab: isAcceptKey,
+		});
+		this.suggestionState.suggestion = d.ghost;
+		if (d.ghost) this.suggestionState.lastSuggestion = d.ghost;
+		else scheduleRearmCheck(this.suggestionState);
+		this.tui?.requestRender();
+	}
+}
+
+export { GhostEditor };
+
+// ---------------------------------------------------------------------------
 // Controller / event wiring
 // ---------------------------------------------------------------------------
 
-interface EditorRef {
-	editor: NextPromptEditor | undefined;
+interface NextPromptRef {
+	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
+	unsubInput: (() => void) | undefined;
+	installGhostEditor: (() => void) | undefined;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
-	const ref: EditorRef = { editor: undefined, inflight: undefined };
+	const ref: NextPromptRef = {
+		state: undefined,
+		inflight: undefined,
+		unsubInput: undefined,
+		installGhostEditor: undefined,
+	};
 	let config: NextPromptConfig = {};
 	const notifiedFallback = { value: false };
 
 	function reset(): void {
 		ref.inflight?.abort();
 		ref.inflight = undefined;
-		ref.editor?.clearGhost();
+		clearSuggestion(ref.state);
 	}
 
 	pi.on("session_start", (_e, ctx) => {
 		reset();
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+		ref.installGhostEditor = undefined;
+
 		config = loadConfig(ctx.cwd);
-		ctx.ui.setEditorComponent((tui, theme, kb) => {
-			const editor = new NextPromptEditor(tui, theme, kb, () => ctx.isIdle());
-			ref.editor = editor;
-			return editor;
-		});
+		const renderMode = config.renderMode ?? "widget";
+		const publishWidget = (content: string[] | undefined) => {
+			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
+		};
+		const state: SuggestionState = {
+			suggestion: "",
+			lastSuggestion: "",
+			acceptKey: config.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			renderMode,
+			rearmDelayMs: config.rearmDelayMs ?? DEFAULT_REARM_MS,
+			rearmTimer: undefined,
+			rearmCheckTimer: undefined,
+			isIdleGetter: () => ctx.isIdle(),
+			getEditorText: () => ctx.ui.getEditorText(),
+			setEditorText: (text) => ctx.ui.setEditorText(text),
+			publishWidget,
+			renderGhost: undefined,
+		};
+		ref.state = state;
+
+		// In ghost or both mode, install the custom editor (and remember how, so
+		// agent_settled can re-install it after pi's resetExtensionUI swaps the editor
+		// back to default).
+		if (renderMode === "ghost" || renderMode === "both") {
+			const install = () => {
+				ctx.ui.setEditorComponent((tui, theme, kb) => {
+					const ed = new GhostEditor(tui, theme, kb, state);
+					state.renderGhost = () => ed.requestGhostRender();
+					return ed;
+				});
+			};
+			install();
+			ref.installGhostEditor = install;
+		}
+
+		// Register a GLOBAL terminal-input listener that swallows the accept key and
+		// fills the editor. Editor-independent — survives resetExtensionUI.
+		ref.unsubInput = ctx.ui.onTerminalInput(makeAcceptHandler(state));
 	});
 
 	pi.on("agent_settled", async (_e, ctx) => {
 		try {
-			if (!ref.editor || !ctx.isIdle() || ref.editor.getText().length > 0) return;
+			// In ghost mode, re-install the custom editor in case resetExtensionUI
+			// swapped it back to the default between turns.
+			ref.installGhostEditor?.();
+			if (!ref.state || !ctx.isIdle() || ctx.ui.getEditorText().length > 0)
+				return;
 			await maybeCompute(ctx);
 		} catch (err) {
 			console.warn("next-prompt: agent_settled handler failed", err);
 		}
 	});
 
-	// Clear ghost + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => { reset(); });
-	pi.on("turn_start", () => { reset(); });
-	pi.on("agent_start", () => { reset(); });
+	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
+	pi.on("input", () => {
+		reset();
+	});
+	pi.on("turn_start", () => {
+		reset();
+	});
+	pi.on("agent_start", () => {
+		reset();
+	});
 
 	pi.on("session_shutdown", () => {
 		reset();
-		ref.editor = undefined;
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+		ref.installGhostEditor = undefined;
+		ref.state = undefined;
 	});
 
 	async function maybeCompute(ctx: ExtensionContext): Promise<void> {
@@ -541,7 +941,13 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const ac = new AbortController();
 		ref.inflight = ac;
 
-		if (shouldTrigger(ctx.sessionManager.getBranch(), ctx.isIdle(), ref.editor!.getText()) !== "compute") {
+		if (
+			shouldTrigger(
+				ctx.sessionManager.getBranch(),
+				ctx.isIdle(),
+				ctx.ui.getEditorText(),
+			) !== "compute"
+		) {
 			return;
 		}
 		const model = resolveSuggestionModel(ctx, config, notifiedFallback);
@@ -556,7 +962,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		let resp: AssistantMessage;
 		try {
-			resp = await ctx.modelRegistry.complete(model, context, { signal: ac.signal });
+			resp = await ctx.modelRegistry.complete(model, context, {
+				signal: ac.signal,
+				reasoning: config.thinking,
+			});
 		} catch (err) {
 			if (!ac.signal.aborted) {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
@@ -577,8 +986,138 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, config);
-		if (clean) ref.editor?.setGhost(clean);
+		if (clean && ref.state) setSuggestion(ref.state, clean);
 	}
+
+	// Interactive config command: `/next-prompt-config`. Walks the user through every
+	// configurable option with model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json,
+	// and reloads so changes take effect immediately.
+	pi.registerCommand("next-prompt-config", {
+		description: "Configure the next-prompt suggestion extension",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify(
+					"next-prompt: /next-prompt-config requires interactive mode",
+					"error",
+				);
+				return;
+			}
+			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
+			if (next) {
+				saveConfig(next);
+				ctx.ui.notify("next-prompt: config saved — reloading", "info");
+				await ctx.reload();
+			}
+		},
+	});
 }
 
-export { NextPromptEditor };
+/**
+ * Interactive config flow. Returns a partial NextPromptConfig to merge+save, or undefined
+ * if the user cancelled at the first prompt. Pure-ish (reads models via ctx.modelRegistry;
+ * only dialogs are interactive). Exported for unit testing with a stub ctx.
+ */
+export async function configureInteractively(
+	ctx: {
+		ui: {
+			select: (title: string, options: string[]) => Promise<string | undefined>;
+			input: (
+				title: string,
+				placeholder?: string,
+			) => Promise<string | undefined>;
+			confirm: (title: string, message: string) => Promise<boolean>;
+		};
+		modelRegistry: {
+			getAvailable(): Array<{ provider: string; id: string; name?: string }>;
+		};
+	},
+	current: NextPromptConfig,
+): Promise<Partial<NextPromptConfig> | undefined> {
+	const update: Partial<NextPromptConfig> = {};
+
+	// 1. Suggestion model (picker over all available models, or "use current").
+	const models = ctx.modelRegistry
+		.getAvailable()
+		.map((m) => formatModelOption(m));
+	const currentLabel = current.model
+		? formatModelOption({ ...current.model, id: current.model.model })
+		: "(use current model)";
+	const modelPick = await ctx.ui.select(
+		`next-prompt: suggestion model [${currentLabel}]`,
+		["(use current model)", ...models],
+	);
+	if (modelPick === undefined) return undefined;
+	if (modelPick === "(use current model)") update.model = undefined;
+	else update.model = parseModelOption(modelPick);
+
+	// 2. renderMode — ghost first (nicer, inline in the box), then widget (reliable
+	// below-editor line), then both.
+	const renderOptions = [
+		"ghost — inline greyed text in the input box",
+		"widget — colored line below the input box",
+		"both — inline ghost AND the below-editor line",
+	];
+	const currentRenderLabel = current.renderMode ?? "widget";
+	const renderPick = await ctx.ui.select(
+		`next-prompt: render mode [${currentRenderLabel}]`,
+		renderOptions,
+	);
+	if (renderPick) update.renderMode = renderPick.split(" — ")[0] as RenderMode;
+
+	// 3. thinking level
+	const thinkPick = await ctx.ui.select(
+		`next-prompt: thinking level [${current.thinking ?? "(unset)"}]`,
+		[...THINKING_OPTIONS],
+	);
+	if (thinkPick)
+		update.thinking =
+			thinkPick === THINKING_OPTIONS[0]
+				? undefined
+				: (thinkPick as ThinkingLevel);
+
+	// 4. acceptKey (free text)
+	const acceptPick = await ctx.ui.input(
+		`next-prompt: accept key [${current.acceptKey ?? "alt+/"}]`,
+		current.acceptKey ?? "alt+/",
+	);
+	if (acceptPick) update.acceptKey = acceptPick.trim();
+
+	// 5. rearmDelayMs (numeric text)
+	const rearmPick = await ctx.ui.input(
+		`next-prompt: re-arm delay ms [${current.rearmDelayMs ?? DEFAULT_REARM_MS}]`,
+		String(current.rearmDelayMs ?? DEFAULT_REARM_MS),
+	);
+	if (rearmPick) {
+		const n = Number(rearmPick.trim());
+		if (Number.isFinite(n) && n > 0) update.rearmDelayMs = n;
+	}
+
+	// 6. maxTranscriptChars (numeric text)
+	const trPick = await ctx.ui.input(
+		`next-prompt: max transcript chars [${current.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT}]`,
+		String(current.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT),
+	);
+	if (trPick) {
+		const n = Number(trPick.trim());
+		if (Number.isFinite(n) && n > 0) update.maxTranscriptChars = n;
+	}
+
+	// 7. maxSuggestionChars (numeric text)
+	const sgPick = await ctx.ui.input(
+		`next-prompt: max suggestion chars [${current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION}]`,
+		String(current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION),
+	);
+	if (sgPick) {
+		const n = Number(sgPick.trim());
+		if (Number.isFinite(n) && n > 0) update.maxSuggestionChars = n;
+	}
+
+	// 8. allowCrossProvider (confirm)
+	const cross = await ctx.ui.confirm(
+		`next-prompt: allow cross-provider suggestion (sends transcript to a different provider)? [${current.allowCrossProvider ?? true}]`,
+		"Yes = use the configured model even if it's on a different provider. No = fall back to the current model.",
+	);
+	update.allowCrossProvider = cross;
+
+	return update;
+}
