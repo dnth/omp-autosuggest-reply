@@ -243,4 +243,4 @@ Source and design discussion live in the
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](https://github.com/gamaraan/next-prompt-extension/blob/main/LICENSE).
