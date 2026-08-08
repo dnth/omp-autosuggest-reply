@@ -26,8 +26,8 @@
  * @module next-prompt
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
@@ -211,6 +211,50 @@ function parseConfig(text: string): NextPromptConfig {
 	}
 	return parsed;
 }
+
+/** Merge a partial config update into the existing global config file, preserving unspecified keys. */
+export function saveConfig(update: Partial<NextPromptConfig>): NextPromptConfig {
+	const path = join(getAgentDir(), "next-prompt.json");
+	let existing: NextPromptConfig = {};
+	if (existsSync(path)) {
+		try {
+			existing = parseConfig(readFileSync(path, "utf-8"));
+		} catch {
+			existing = {};
+		}
+	}
+	const merged: NextPromptConfig = { ...existing, ...update };
+	// Drop undefined values so the file stays clean.
+	const clean: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(merged)) if (v !== undefined) clean[k] = v;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(clean, null, 2)}\n`);
+	return merged;
+}
+
+/** Format a model for the config-command picker: "provider/model — name". */
+export function formatModelOption(model: { provider: string; id: string; name?: string }): string {
+	return `${model.provider}/${model.id} — ${model.name ?? model.id}`;
+}
+
+/** Parse a picked option (from formatModelOption) back into {provider, model}. */
+export function parseModelOption(picked: string): NextPromptModelConfig | undefined {
+	const m = picked.match(/^(.+?)\/(.+?) — /);
+	if (!m || !m[1] || !m[2]) return undefined;
+	return { provider: m[1], model: m[2] };
+}
+
+/** All selectable thinking levels plus an explicit "off/unset" entry. */
+export const THINKING_OPTIONS = [
+	"(unset — model default)",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+
 
 // ---------------------------------------------------------------------------
 // Model resolution
@@ -936,4 +980,113 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const clean = sanitizeSuggestion(raw, config);
 		if (clean && ref.state) setSuggestion(ref.state, clean);
 	}
+
+	// Interactive config command: `/next-prompt-config`. Walks the user through every
+	// configurable option with model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json,
+	// and reloads so changes take effect immediately.
+	pi.registerCommand("next-prompt-config", {
+		description: "Configure the next-prompt suggestion extension",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("next-prompt: /next-prompt-config requires interactive mode", "error");
+				return;
+			}
+			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
+			if (next) {
+				saveConfig(next);
+				ctx.ui.notify("next-prompt: config saved — reloading", "info");
+				await ctx.reload();
+			}
+		},
+	});
+}
+
+/**
+ * Interactive config flow. Returns a partial NextPromptConfig to merge+save, or undefined
+ * if the user cancelled at the first prompt. Pure-ish (reads models via ctx.modelRegistry;
+ * only dialogs are interactive). Exported for unit testing with a stub ctx.
+ */
+export async function configureInteractively(
+	ctx: {
+		ui: {
+			select: (title: string, options: string[]) => Promise<string | undefined>;
+			input: (title: string, placeholder?: string) => Promise<string | undefined>;
+			confirm: (title: string, message: string) => Promise<boolean>;
+		};
+		modelRegistry: { getAvailable(): Array<{ provider: string; id: string; name?: string }> };
+	},
+	current: NextPromptConfig,
+): Promise<Partial<NextPromptConfig> | undefined> {
+	const update: Partial<NextPromptConfig> = {};
+
+	// 1. Suggestion model (picker over all available models, or "use current").
+	const models = ctx.modelRegistry.getAvailable().map((m) => formatModelOption(m));
+	const currentLabel = current.model ? formatModelOption({ ...current.model, id: current.model.model }) : "(use current model)";
+	const modelPick = await ctx.ui.select(
+		`next-prompt: suggestion model [${currentLabel}]`,
+		["(use current model)", ...models],
+	);
+	if (modelPick === undefined) return undefined;
+	if (modelPick === "(use current model)") update.model = undefined;
+	else update.model = parseModelOption(modelPick);
+
+	// 2. renderMode
+	const renderPick = await ctx.ui.select(
+		`next-prompt: render mode [${current.renderMode ?? "widget"}]`,
+		["widget", "ghost", "both"],
+	);
+	if (renderPick) update.renderMode = renderPick as RenderMode;
+
+	// 3. thinking level
+	const thinkPick = await ctx.ui.select(
+		`next-prompt: thinking level [${current.thinking ?? "(unset)"}]`,
+		[...THINKING_OPTIONS],
+	);
+	if (thinkPick) update.thinking = thinkPick === THINKING_OPTIONS[0] ? undefined : (thinkPick as ThinkingLevel);
+
+	// 4. acceptKey (free text)
+	const acceptPick = await ctx.ui.input(
+		`next-prompt: accept key [${current.acceptKey ?? "alt+/"}]`,
+		current.acceptKey ?? "alt+/",
+	);
+	if (acceptPick) update.acceptKey = acceptPick.trim();
+
+	// 5. rearmDelayMs (numeric text)
+	const rearmPick = await ctx.ui.input(
+		`next-prompt: re-arm delay ms [${current.rearmDelayMs ?? DEFAULT_REARM_MS}]`,
+		String(current.rearmDelayMs ?? DEFAULT_REARM_MS),
+	);
+	if (rearmPick) {
+		const n = Number(rearmPick.trim());
+		if (Number.isFinite(n) && n > 0) update.rearmDelayMs = n;
+	}
+
+	// 6. maxTranscriptChars (numeric text)
+	const trPick = await ctx.ui.input(
+		`next-prompt: max transcript chars [${current.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT}]`,
+		String(current.maxTranscriptChars ?? DEFAULT_MAX_TRANSCRIPT),
+	);
+	if (trPick) {
+		const n = Number(trPick.trim());
+		if (Number.isFinite(n) && n > 0) update.maxTranscriptChars = n;
+	}
+
+	// 7. maxSuggestionChars (numeric text)
+	const sgPick = await ctx.ui.input(
+		`next-prompt: max suggestion chars [${current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION}]`,
+		String(current.maxSuggestionChars ?? DEFAULT_MAX_SUGGESTION),
+	);
+	if (sgPick) {
+		const n = Number(sgPick.trim());
+		if (Number.isFinite(n) && n > 0) update.maxSuggestionChars = n;
+	}
+
+	// 8. allowCrossProvider (confirm)
+	const cross = await ctx.ui.confirm(
+		`next-prompt: allow cross-provider suggestion (sends transcript to a different provider)? [${current.allowCrossProvider ?? true}]`,
+		"Yes = use the configured model even if it's on a different provider. No = fall back to the current model.",
+	);
+	update.allowCrossProvider = cross;
+
+	return update;
 }

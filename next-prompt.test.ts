@@ -5,7 +5,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CURSOR_MARKER } from "@earendil-works/pi-tui";
@@ -14,18 +14,23 @@ import type { Api } from "@earendil-works/pi-ai";
 import {
 	buildMessages,
 	buildTranscript,
+	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
 	decideInput,
+	formatModelOption,
 	humanizeKey,
 	isPrintable,
 	loadConfig,
 	matchesAcceptKeyRaw,
 	overlayGhost,
+	parseModelOption,
 	redactSecrets,
 	resolveSuggestionModel,
 	sanitizeSuggestion,
+	saveConfig,
 	shouldTrigger,
 	SYSTEM_PROMPT,
+	THINKING_OPTIONS,
 	type BranchEntry,
 	type NextPromptConfig,
 	type SuggestionCtx,
@@ -54,6 +59,14 @@ function writeFile(dir: string, path: string, content: string): void {
 	const full = join(dir, path);
 	mkdirSync(join(dir, ...path.split("/").slice(0, -1)), { recursive: true });
 	writeFileSync(full, content);
+}
+
+function readFileSyncSafe(path: string): string {
+	try {
+		return readFileSync(path, "utf-8");
+	} catch {
+		return "{}";
+	}
 }
 
 function userEntry(text: string): BranchEntry {
@@ -942,6 +955,9 @@ function makeFake(opts: {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
 			handlers.set(event, handler);
 		},
+		registerCommand: (_name: string, _options: unknown) => {
+			// No-op stub for tests; the config command is exercised via configureInteractively.
+		},
 	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	return {
 		pi,
@@ -1597,5 +1613,172 @@ describe("renderMode both", () => {
 		expect(fake.widgetContent).toBeDefined();
 		fake.handlers.get("input")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Config command helpers (formatModelOption, parseModelOption, saveConfig, configureInteractively)
+// ---------------------------------------------------------------------------
+
+describe("config command helpers", () => {
+	test("T112: formatModelOption → 'provider/model — name'", () => {
+		expect(formatModelOption({ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" })).toBe(
+			"anthropic/claude-haiku — Claude Haiku",
+		);
+	});
+
+	test("T113: formatModelOption falls back to id when name absent", () => {
+		expect(formatModelOption({ provider: "ollama", id: "deepseek-v4-flash" })).toBe(
+			"ollama/deepseek-v4-flash — deepseek-v4-flash",
+		);
+	});
+
+	test("T114: parseModelOption extracts provider + model", () => {
+		expect(parseModelOption("anthropic/claude-haiku — Claude Haiku")).toEqual({
+			provider: "anthropic",
+			model: "claude-haiku",
+		});
+	});
+
+	test("T115: parseModelOption returns undefined for malformed input", () => {
+		expect(parseModelOption("not a model option")).toBeUndefined();
+		expect(parseModelOption("")).toBeUndefined();
+	});
+
+	test("T116: THINKING_OPTIONS has unset sentinel + 6 levels", () => {
+		expect(THINKING_OPTIONS[0]).toBe("(unset — model default)");
+		expect(THINKING_OPTIONS).toContain("low");
+		expect(THINKING_OPTIONS.length).toBe(7);
+	});
+
+	test("T117: saveConfig merges with existing and writes to disk", () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		const path = `${dir}/next-prompt.json`;
+		// Pre-write an existing config.
+		writeFile(dir, "next-prompt.json", JSON.stringify({ thinking: "high", acceptKey: "alt+/" }));
+		const merged = saveConfig({ renderMode: "ghost" });
+		expect(merged.thinking).toBe("high"); // preserved
+		expect(merged.renderMode).toBe("ghost"); // added
+		const onDisk = JSON.parse(readFileSyncSafe(path));
+		expect(onDisk.thinking).toBe("high");
+		expect(onDisk.renderMode).toBe("ghost");
+	});
+
+	test("T118: saveConfig preserves unspecified keys and adds new ones", () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		writeFile(dir, "next-prompt.json", JSON.stringify({ acceptKey: "ctrl+space", rearmDelayMs: 500 }));
+		const merged = saveConfig({ acceptKey: "alt+/" });
+		expect(merged.rearmDelayMs).toBe(500); // preserved
+		expect(merged.acceptKey).toBe("alt+/"); // overridden
+	});
+});
+
+// Minimal stub ctx for configureInteractively tests.
+function makeConfigCtx(opts: {
+	models?: Array<{ provider: string; id: string; name?: string }>;
+	answers: Record<string, string | boolean | undefined>;
+}): Parameters<typeof configureInteractively>[0] {
+	const calls: { select: string[]; input: string[]; confirm: string[] } = { select: [], input: [], confirm: [] };
+	let a = 0;
+	const nextAnswer = () => {
+		const key = Object.keys(opts.answers)[a++]!;
+		return opts.answers[key];
+	};
+	return {
+		modelRegistry: { getAvailable: () => opts.models ?? [] },
+		ui: {
+			select: async (title: string, _options: string[]) => {
+				calls.select.push(title);
+				return nextAnswer() as string | undefined;
+			},
+			input: async (title: string, _placeholder?: string) => {
+				calls.input.push(title);
+				return nextAnswer() as string | undefined;
+			},
+			confirm: async (title: string, _message: string) => {
+				calls.confirm.push(title);
+				return nextAnswer() as boolean;
+			},
+		},
+	} as Parameters<typeof configureInteractively>[0];
+}
+
+describe("configureInteractively", () => {
+	test("T119: full flow — all options set", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" }],
+			answers: {
+				model: "anthropic/claude-haiku — Claude Haiku",
+				renderMode: "ghost",
+				thinking: "low",
+				acceptKey: "ctrl+space",
+				rearmDelayMs: "1500",
+				maxTranscriptChars: "8000",
+				maxSuggestionChars: "200",
+				allowCrossProvider: false,
+			},
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out).toEqual({
+			model: { provider: "anthropic", model: "claude-haiku" },
+			renderMode: "ghost",
+			thinking: "low",
+			acceptKey: "ctrl+space",
+			rearmDelayMs: 1500,
+			maxTranscriptChars: 8000,
+			maxSuggestionChars: 200,
+			allowCrossProvider: false,
+		});
+	});
+
+	test("T120: cancel at model picker → undefined", async () => {
+		const ctx = makeConfigCtx({ answers: { model: undefined } });
+		const out = await configureInteractively(ctx, {});
+		expect(out).toBeUndefined();
+	});
+
+	test("T121: model '(use current model)' → model undefined", async () => {
+		const ctx = makeConfigCtx({
+			models: [{ provider: "openai", id: "gpt" }],
+			answers: { model: "(use current model)" },
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out?.model).toBeUndefined();
+	});
+
+	test("T122: thinking '(unset)' → thinking undefined", async () => {
+		const ctx = makeConfigCtx({
+			answers: {
+				model: "(use current model)",
+				renderMode: "widget",
+				thinking: "(unset — model default)",
+				acceptKey: "alt+/",
+				rearmDelayMs: "2000",
+				maxTranscriptChars: "12000",
+				maxSuggestionChars: "240",
+				allowCrossProvider: true,
+			},
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out?.thinking).toBeUndefined();
+	});
+
+	test("T123: invalid numeric input → field not set", async () => {
+		const ctx = makeConfigCtx({
+			answers: {
+				model: "(use current model)",
+				renderMode: "widget",
+				thinking: "(unset — model default)",
+				acceptKey: "alt+/",
+				rearmDelayMs: "not a number",
+				maxTranscriptChars: "abc",
+				maxSuggestionChars: "200",
+				allowCrossProvider: true,
+			},
+		});
+		const out = await configureInteractively(ctx, {});
+		expect(out?.rearmDelayMs).toBeUndefined();
+		expect(out?.maxTranscriptChars).toBeUndefined();
+		expect(out?.maxSuggestionChars).toBe(200);
 	});
 });
