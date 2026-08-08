@@ -5,7 +5,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CURSOR_MARKER } from "@earendil-works/pi-tui";
@@ -1578,13 +1584,21 @@ describe("renderMode config", () => {
 
 describe("renderMode both", () => {
 	test("T108: renderMode=both installs custom editor on session_start", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		expect(fake.editorComponentInstalled).toBe(true);
 	});
 
 	test("T109: renderMode=both re-installs editor on agent_settled", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		expect(fake.editorComponentInstalled).toBe(true);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -1592,10 +1606,17 @@ describe("renderMode both", () => {
 	});
 
 	test("T110: renderMode=both publishes the widget (below-editor line) after settle", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			completeResult: { content: [{ type: "text", text: "both suggestion" }], stopReason: "stop" },
+			completeResult: {
+				content: [{ type: "text", text: "both suggestion" }],
+				stopReason: "stop",
+			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// In "both" mode the widget is published (ghost renders in the editor separately).
@@ -1604,10 +1625,17 @@ describe("renderMode both", () => {
 	});
 
 	test("T111: renderMode=both clears the widget on input (and the ghost via reset)", async () => {
-		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "both" }));
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			completeResult: { content: [{ type: "text", text: "x" }], stopReason: "stop" },
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent).toBeDefined();
@@ -1622,15 +1650,19 @@ describe("renderMode both", () => {
 
 describe("config command helpers", () => {
 	test("T112: formatModelOption → 'provider/model — name'", () => {
-		expect(formatModelOption({ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" })).toBe(
-			"anthropic/claude-haiku — Claude Haiku",
-		);
+		expect(
+			formatModelOption({
+				provider: "anthropic",
+				id: "claude-haiku",
+				name: "Claude Haiku",
+			}),
+		).toBe("anthropic/claude-haiku — Claude Haiku");
 	});
 
 	test("T113: formatModelOption falls back to id when name absent", () => {
-		expect(formatModelOption({ provider: "ollama", id: "deepseek-v4-flash" })).toBe(
-			"ollama/deepseek-v4-flash — deepseek-v4-flash",
-		);
+		expect(
+			formatModelOption({ provider: "ollama", id: "deepseek-v4-flash" }),
+		).toBe("ollama/deepseek-v4-flash — deepseek-v4-flash");
 	});
 
 	test("T114: parseModelOption extracts provider + model", () => {
@@ -1655,7 +1687,11 @@ describe("config command helpers", () => {
 		const dir = process.env.PI_CODING_AGENT_DIR!;
 		const path = `${dir}/next-prompt.json`;
 		// Pre-write an existing config.
-		writeFile(dir, "next-prompt.json", JSON.stringify({ thinking: "high", acceptKey: "alt+/" }));
+		writeFile(
+			dir,
+			"next-prompt.json",
+			JSON.stringify({ thinking: "high", acceptKey: "alt+/" }),
+		);
 		const merged = saveConfig({ renderMode: "ghost" });
 		expect(merged.thinking).toBe("high"); // preserved
 		expect(merged.renderMode).toBe("ghost"); // added
@@ -1666,7 +1702,11 @@ describe("config command helpers", () => {
 
 	test("T118: saveConfig preserves unspecified keys and adds new ones", () => {
 		const dir = process.env.PI_CODING_AGENT_DIR!;
-		writeFile(dir, "next-prompt.json", JSON.stringify({ acceptKey: "ctrl+space", rearmDelayMs: 500 }));
+		writeFile(
+			dir,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: "ctrl+space", rearmDelayMs: 500 }),
+		);
 		const merged = saveConfig({ acceptKey: "alt+/" });
 		expect(merged.rearmDelayMs).toBe(500); // preserved
 		expect(merged.acceptKey).toBe("alt+/"); // overridden
@@ -1678,7 +1718,11 @@ function makeConfigCtx(opts: {
 	models?: Array<{ provider: string; id: string; name?: string }>;
 	answers: Record<string, string | boolean | undefined>;
 }): Parameters<typeof configureInteractively>[0] {
-	const calls: { select: string[]; input: string[]; confirm: string[] } = { select: [], input: [], confirm: [] };
+	const calls: { select: string[]; input: string[]; confirm: string[] } = {
+		select: [],
+		input: [],
+		confirm: [],
+	};
 	let a = 0;
 	const nextAnswer = () => {
 		const key = Object.keys(opts.answers)[a++]!;
@@ -1706,7 +1750,9 @@ function makeConfigCtx(opts: {
 describe("configureInteractively", () => {
 	test("T119: full flow — all options set", async () => {
 		const ctx = makeConfigCtx({
-			models: [{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" }],
+			models: [
+				{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" },
+			],
 			answers: {
 				model: "anthropic/claude-haiku — Claude Haiku",
 				renderMode: "ghost — inline greyed text in the input box",
@@ -1790,7 +1836,14 @@ test("T124: renderMode picker lists ghost first with descriptions", async () => 
 		ui: {
 			select: async (_title: string, options: string[]) => {
 				// Capture render-mode options (those starting with ghost/widget/both).
-				if (options.some((o) => o.startsWith("ghost") || o.startsWith("widget") || o.startsWith("both"))) {
+				if (
+					options.some(
+						(o) =>
+							o.startsWith("ghost") ||
+							o.startsWith("widget") ||
+							o.startsWith("both"),
+					)
+				) {
 					seenRenderOptions.push(...options);
 					return undefined; // cancel at render picker
 				}
