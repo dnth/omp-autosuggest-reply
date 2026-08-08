@@ -229,9 +229,8 @@ controls the published contents.
 
 ## Design & development
 
-The design went through an adversarial review by an oracle subagent during
-development — see the [GitHub repository](https://github.com/gamaraan/next-prompt-extension)
-for the full commit history and design discussion.
+Source and design discussion live in the
+[GitHub repository](https://github.com/gamaraan/next-prompt-extension).
 
 ## License
 
