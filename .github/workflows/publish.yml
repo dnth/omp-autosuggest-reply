@@ -70,7 +70,7 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org/
-          cache: false
+          cache: none
 
       - name: Publish to npm
         run: npm publish --provenance
