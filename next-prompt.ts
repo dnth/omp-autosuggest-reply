@@ -26,25 +26,21 @@
  * @module next-prompt
  */
 
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
-	CustomEditor,
 	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionContext,
-	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
 	matchesKey,
 	CURSOR_MARKER,
 	truncateToWidth,
 	visibleWidth,
-	type EditorTheme,
 	type KeyId,
-	type TUI,
 } from "@earendil-works/pi-tui";
 import type {
 	Api,
@@ -540,103 +536,66 @@ function stripAnsi(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Editor component (thin shell over decideInput; suggestion shown via setWidget)
+// Suggestion state (editor-independent; published via setWidget, accepted via onTerminalInput)
 // ---------------------------------------------------------------------------
 
-class NextPromptEditor extends CustomEditor {
-	ghost = "";
-	lastSuggestion = "";
-	private isIdleGetter: () => boolean;
-	private publishWidget: (content: string[] | undefined) => void;
-	private acceptKey: string;
+export interface SuggestionState {
+	suggestion: string;
+	acceptKey: string;
+	isIdleGetter: () => boolean;
+	getEditorText: () => string;
+	setEditorText: (text: string) => void;
+	publishWidget: (content: string[] | undefined) => void;
+}
 
-	constructor(
-		tui: TUI,
-		theme: EditorTheme,
-		keybindings: KeybindingsManager,
-		isIdleGetter: () => boolean,
-		publishWidget: (content: string[] | undefined) => void,
-		acceptKey: string,
-	) {
-		super(tui, theme, keybindings);
-		this.isIdleGetter = isIdleGetter;
-		this.publishWidget = publishWidget;
-		this.acceptKey = acceptKey;
+function renderSuggestionWidget(state: SuggestionState): void {
+	if (state.suggestion) {
+		const hint = humanizeKey(state.acceptKey);
+		state.publishWidget([
+			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
+		]);
+	} else {
+		state.publishWidget(undefined);
 	}
+}
 
-	private renderWidget(): void {
-		if (this.ghost) {
-			const hint = humanizeKey(this.acceptKey);
-			this.publishWidget([
-				`${ACCENT}↳ next:${RESET} ${this.ghost}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
-			]);
-		} else {
-			this.publishWidget(undefined);
-		}
+/** Show a suggestion. Race-guarded: only if the editor is empty and the agent is idle. */
+function setSuggestion(state: SuggestionState, text: string): void {
+	if (state.getEditorText().length === 0 && state.isIdleGetter()) {
+		state.suggestion = text;
+		renderSuggestionWidget(state);
 	}
+}
 
-	setGhost(text: string): void {
-		// Race guard: only show if the editor is STILL empty and the agent is STILL idle.
-		if (this.getText().length === 0 && this.isIdleGetter()) {
-			this.ghost = text;
-			this.lastSuggestion = text;
-			this.renderWidget();
-		}
+/** Clear the current suggestion (clears the widget too). */
+function clearSuggestion(state: SuggestionState | undefined): void {
+	if (!state) return;
+	if (state.suggestion) {
+		state.suggestion = "";
+		state.publishWidget(undefined);
 	}
+}
 
-	clearGhost(): void {
-		if (this.ghost) {
-			this.ghost = "";
-			this.renderWidget();
-		}
-	}
-
-	handleInput(data: string): void {
+/**
+ * Raw terminal-input handler for the accept key. Returns { consume: true } to swallow the
+ * key before the (default) editor sees it, and fills the editor with the suggestion.
+ * Used via ctx.ui.onTerminalInput — editor-independent, survives resetExtensionUI.
+ */
+function makeAcceptHandler(state: SuggestionState): (data: string) => { consume?: boolean } | undefined {
+	return (data: string) => {
 		const isAcceptKey =
-			matchesKey(data, this.acceptKey as KeyId) ||
-			matchesAcceptKeyRaw(data, this.acceptKey);
-
-		// TEMP DIAGNOSTIC: log the raw bytes so we can see exactly what the
-		// terminal sends for the configured accept key. Remove once stable.
-		try {
-			appendFileSync(
-				join(getAgentDir(), "next-prompt-keys.log"),
-				`data=${JSON.stringify(data)} acceptKey=${JSON.stringify(this.acceptKey)} isAcceptKey=${isAcceptKey} ghostLen=${this.ghost.length} autocomplete=${this.isShowingAutocomplete()}\n`,
-			);
-		} catch { /* ignore */ }
-
-		// Intercept the accept key BEFORE delegating to super so the base editor
-		// doesn't insert the key's raw byte (e.g. \x00 for ctrl+space) and pollute
-		// the editor text. Only accept when a ghost is showing and autocomplete is
-		// NOT open (so we never clobber /template or path completion).
-		if (isAcceptKey && this.ghost && !this.isShowingAutocomplete()) {
-			this.insertTextAtCursor(this.ghost);
-			this.ghost = "";
-			this.renderWidget();
-			return; // swallow the key — super never sees it
-		}
-
-		const before = this.getText();
-		// Delegate everything else to the base editor first so it keeps authority
-		// over Tab-autocomplete, escape, ctrl+d, paste, history, etc.
-		super.handleInput(data);
-		const after = this.getText();
-
-		const d = decideInput({
-			data,
-			ghost: this.ghost,
-			lastSuggestion: this.lastSuggestion,
-			editorTextBefore: before,
-			editorTextAfter: after,
-			isShowingAutocomplete: this.isShowingAutocomplete(),
-			isTab: isAcceptKey,
-		});
-
-		// After delegating, only dismiss/rearm/passthrough remain (accept handled above).
-		const changed = this.ghost !== d.ghost;
-		this.ghost = d.ghost;
-		if (changed) this.renderWidget();
-	}
+			matchesKey(data, state.acceptKey as KeyId) ||
+			matchesAcceptKeyRaw(data, state.acceptKey);
+		if (!isAcceptKey) return undefined;
+		if (!state.suggestion) return undefined;
+		if (!state.isIdleGetter()) return undefined;
+		if (state.getEditorText().length > 0) return undefined;
+		// Accept: fill the editor and clear the suggestion. Consume the key.
+		state.setEditorText(state.suggestion);
+		state.suggestion = "";
+		state.publishWidget(undefined);
+		return { consume: true };
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -649,45 +608,53 @@ export const SYSTEM_PROMPT = `You predict the single most logical next instructi
 // Controller / event wiring
 // ---------------------------------------------------------------------------
 
-interface EditorRef {
-	editor: NextPromptEditor | undefined;
+interface NextPromptRef {
+	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
+	unsubInput: (() => void) | undefined;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
-	const ref: EditorRef = { editor: undefined, inflight: undefined };
+	const ref: NextPromptRef = { state: undefined, inflight: undefined, unsubInput: undefined };
 	let config: NextPromptConfig = {};
 	const notifiedFallback = { value: false };
 
 	function reset(): void {
 		ref.inflight?.abort();
 		ref.inflight = undefined;
-		ref.editor?.clearGhost();
+		clearSuggestion(ref.state);
 	}
 
 	pi.on("session_start", (_e, ctx) => {
 		reset();
+		// Unsubscribe any previous terminal-input listener (resetExtensionUI clears
+		// listeners, but be safe across reloads).
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+
 		config = loadConfig(ctx.cwd);
-		ctx.ui.setEditorComponent((tui, theme, kb) => {
-			const publishWidget = (content: string[] | undefined) => {
-				ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
-			};
-			const editor = new NextPromptEditor(
-				tui,
-				theme,
-				kb,
-				() => ctx.isIdle(),
-				publishWidget,
-				config.acceptKey ?? DEFAULT_ACCEPT_KEY,
-			);
-			ref.editor = editor;
-			return editor;
-		});
+		const publishWidget = (content: string[] | undefined) => {
+			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
+		};
+		const state: SuggestionState = {
+			suggestion: "",
+			acceptKey: config.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			isIdleGetter: () => ctx.isIdle(),
+			getEditorText: () => ctx.ui.getEditorText(),
+			setEditorText: (text) => ctx.ui.setEditorText(text),
+			publishWidget,
+		};
+		ref.state = state;
+
+		// Register a GLOBAL terminal-input listener that swallows the accept key
+		// and fills the editor. This is editor-independent — it survives
+		// pi's resetExtensionUI() which would otherwise orphan a custom editor.
+		ref.unsubInput = ctx.ui.onTerminalInput(makeAcceptHandler(state));
 	});
 
 	pi.on("agent_settled", async (_e, ctx) => {
 		try {
-			if (!ref.editor || !ctx.isIdle() || ref.editor.getText().length > 0)
+			if (!ref.state || !ctx.isIdle() || ctx.ui.getEditorText().length > 0)
 				return;
 			await maybeCompute(ctx);
 		} catch (err) {
@@ -695,20 +662,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Clear ghost + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => {
-		reset();
-	});
-	pi.on("turn_start", () => {
-		reset();
-	});
-	pi.on("agent_start", () => {
-		reset();
-	});
+	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
+	pi.on("input", () => { reset(); });
+	pi.on("turn_start", () => { reset(); });
+	pi.on("agent_start", () => { reset(); });
 
 	pi.on("session_shutdown", () => {
 		reset();
-		ref.editor = undefined;
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+		ref.state = undefined;
 	});
 
 	async function maybeCompute(ctx: ExtensionContext): Promise<void> {
@@ -720,7 +683,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			shouldTrigger(
 				ctx.sessionManager.getBranch(),
 				ctx.isIdle(),
-				ref.editor!.getText(),
+				ctx.ui.getEditorText(),
 			) !== "compute"
 		) {
 			return;
@@ -761,8 +724,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, config);
-		if (clean) ref.editor?.setGhost(clean);
+		if (clean && ref.state) setSuggestion(ref.state, clean);
 	}
 }
-
-export { NextPromptEditor };

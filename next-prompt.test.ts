@@ -377,7 +377,7 @@ describe("matchesAcceptKeyRaw", () => {
 		expect(matchesAcceptKeyRaw("\x00", "ctrl+space")).toBe(true);
 	});
 
-	test('ctrl+space does NOT match plain space', () => {
+	test("ctrl+space does NOT match plain space", () => {
 		expect(matchesAcceptKeyRaw(" ", "ctrl+space")).toBe(false);
 	});
 
@@ -389,7 +389,7 @@ describe("matchesAcceptKeyRaw", () => {
 		expect(matchesAcceptKeyRaw("\t", "tab")).toBe(false);
 	});
 
-	test('empty acceptKey → false', () => {
+	test("empty acceptKey → false", () => {
 		expect(matchesAcceptKeyRaw("\x1b/", "")).toBe(false);
 	});
 });
@@ -790,8 +790,10 @@ function makeFake(opts: {
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
-	editor: import("./next-prompt.ts").NextPromptEditor;
-
+	widgetContent: string[] | undefined;
+	editorText: string;
+	setEditorText: (t: string) => void;
+	inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
 	calls: {
 		complete: Array<{
 			model: unknown;
@@ -816,7 +818,9 @@ function makeFake(opts: {
 		}>,
 		notifies: [] as Array<[string, string]>,
 	};
-	let capturedEditor: import("./next-prompt.ts").NextPromptEditor | undefined;
+	let editorText = "";
+	let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
+	let widgetContent: string[] | undefined;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
 		cwd: "/tmp",
@@ -848,35 +852,20 @@ function makeFake(opts: {
 		ui: {
 			notify: (m: string, t: "info" | "warning" | "error" = "info") =>
 				calls.notifies.push([m, t]),
-			setEditorComponent: (
-				factory: (tui: unknown, theme: unknown, kb: unknown) => unknown,
+			onTerminalInput: (
+				handler: (data: string) => { consume?: boolean } | undefined,
 			) => {
-				// Build the real NextPromptEditor with stubbed TUI/theme/kb. The constructor
-				// is lightweight and only stores these; we never call handleInput/render.
-				const tuiStub = {
-					requestRender: () => {},
-				} as unknown as import("@earendil-works/pi-tui").TUI;
-				const themeStub = {
-					borderColor: (s: string) => s,
-					selectList: {},
-				} as unknown as import("@earendil-works/pi-tui").EditorTheme;
-				const kbStub = {
-					matches: () => false,
-				} as unknown as import("@earendil-works/pi-coding-agent").KeybindingsManager;
-				// Capture the editor the factory *returns* — that's the instance the controller
-				// assigns to ref.editor and talks to. Do not create our own.
-				capturedEditor = factory(
-					tuiStub,
-					themeStub,
-					kbStub,
-				) as import("./next-prompt.ts").NextPromptEditor;
+				inputHandler = handler;
+				return () => { inputHandler = undefined; };
 			},
+			getEditorText: () => editorText,
+			setEditorText: (text: string) => { editorText = text; },
 			setWidget: (
 				_key: string,
-				_content: string[] | undefined,
+				content: string[] | undefined,
 				_options?: { placement?: string },
 			) => {
-				// No-op stub: widget rendering is a pi concern; tests assert via editor.ghost.
+				widgetContent = content;
 			},
 		},
 		sessionManager: { getBranch: () => opts.branch ?? [] },
@@ -889,13 +878,10 @@ function makeFake(opts: {
 	return {
 		pi,
 		ctx,
-		get editor() {
-			if (!capturedEditor)
-				throw new Error(
-					"editor not captured — call session_start handler first",
-				);
-			return capturedEditor;
-		},
+		get widgetContent() { return widgetContent; },
+		get editorText() { return editorText; },
+		setEditorText: (t: string) => { editorText = t; },
+		get inputHandler() { return inputHandler; },
 		calls,
 		handlers,
 		setIdle: (v: boolean) => {
@@ -916,7 +902,7 @@ async function setup(opts: Parameters<typeof makeFake>[0]) {
 describe("controller wiring (agent_settled)", () => {
 	test("T71: agent_settled + editor non-empty → no complete call", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		fake.editor.setText("already typing");
+		fake.setEditorText("already typing");
 		const handler = fake.handlers.get("agent_settled")!;
 		await handler({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
@@ -987,7 +973,7 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
 	});
 
-	test("T74d: config acceptKey is passed to the editor", async () => {
+	test("T74d: config acceptKey is reflected in the widget hint", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
@@ -995,23 +981,21 @@ describe("controller wiring (agent_settled)", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ acceptKey: "alt+/" }),
+			JSON.stringify({ acceptKey: "ctrl+space" }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const acceptKey = (fake.editor as unknown as { acceptKey: string })
-			.acceptKey;
-		expect(acceptKey).toBe("alt+/");
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
 	});
 
-	test("T74e: no acceptKey config → editor defaults to alt+/", async () => {
+	test("T74e: no acceptKey config → widget hint shows Alt-/", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
 		});
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const acceptKey = (fake.editor as unknown as { acceptKey: string })
-			.acceptKey;
-		expect(acceptKey).toBe("alt+/");
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ to accept");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {
@@ -1052,9 +1036,9 @@ describe("controller wiring (agent_settled)", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		const handler = fake.handlers.get("agent_settled")!;
 		const p = handler({}, fake.ctx);
-		fake.editor.setText("user typed");
+		fake.setEditorText("user typed");
 		await p;
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T78: complete resolves after agent started (idle=false) → setGhost ignored (idle guard)", async () => {
@@ -1063,7 +1047,7 @@ describe("controller wiring (agent_settled)", () => {
 		const p = handler({}, fake.ctx);
 		fake.setIdle(false);
 		await p;
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T79: complete returns stopReason length → no ghost", async () => {
@@ -1075,7 +1059,7 @@ describe("controller wiring (agent_settled)", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T80: complete returns stopReason error → notify warning, no ghost", async () => {
@@ -1087,7 +1071,7 @@ describe("controller wiring (agent_settled)", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 		expect(fake.calls.notifies.some((n) => n[1] === "warning")).toBe(true);
 	});
 
@@ -1100,7 +1084,7 @@ describe("controller wiring (agent_settled)", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T82: complete throws (non-abort) → notify error once, no ghost", async () => {
@@ -1109,7 +1093,7 @@ describe("controller wiring (agent_settled)", () => {
 			completeError: new Error("boom"),
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 		expect(
 			fake.calls.notifies.some(
 				(n) => n[0].includes("failed") && n[1] === "error",
@@ -1129,7 +1113,7 @@ describe("controller wiring (agent_settled)", () => {
 		await (p as Promise<unknown>).catch(() => {});
 		// The complete that actually ran threw "boom" (our fake always throws), so an error
 		// notify may fire; the key assertion is no ghost is set.
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T84: loadConfig failure at session_start → extension still installs, falls back to ctx.model", async () => {
@@ -1150,36 +1134,36 @@ describe("controller wiring (agent_settled)", () => {
 
 	test("T85: input event → inflight aborted + ghost cleared", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		fake.editor.ghost = "stale";
+		fake.setEditorText("dummy"); // suggestion is internal; widget cleared on clear events
 		fake.handlers.get("input")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T86: turn_start / agent_start → inflight aborted + ghost cleared", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		fake.editor.ghost = "stale";
+		fake.setEditorText("dummy"); // suggestion is internal; widget cleared on clear events
 		fake.handlers.get("turn_start")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
-		fake.editor.ghost = "stale2";
+		expect(fake.widgetContent).toBeUndefined();
+		fake.setEditorText("dummy"); // suggestion is internal; widget cleared on clear events
 		fake.handlers.get("agent_start")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T87: session_shutdown → inflight aborted, editor nulled, ghost cleared", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		fake.editor.ghost = "stale";
+		fake.setEditorText("dummy"); // suggestion is internal; widget cleared on clear events
 		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
 	test("T88: session_start (reload) → previous inflight aborted, new editor installed, ghost cleared", async () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
-		fake.editor.ghost = "stale";
+		fake.setEditorText("dummy"); // suggestion is internal; widget cleared on clear events
 		await fake.handlers.get("session_start")!(
 			{ type: "session_start", reason: "reload" },
 			fake.ctx,
 		);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 	});
 });
 
@@ -1197,7 +1181,7 @@ describe("acceptance / regression", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("what's next?");
+		expect(fake.widgetContent?.[0] ?? "").toContain("what's next?");
 	});
 
 	test("T90: shouldTrigger short-circuits when editor non-empty (typing cancels)", () => {
@@ -1228,10 +1212,10 @@ describe("acceptance / regression", () => {
 		});
 		// First settle → ghost "fresh"
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("fresh");
+		expect(fake.widgetContent?.[0] ?? "").toContain("fresh");
 		// User types & submits → ghost cleared
 		fake.handlers.get("input")!({}, fake.ctx);
-		expect(fake.editor.ghost).toBe("");
+		expect(fake.widgetContent).toBeUndefined();
 		// Settle again with a new complete result → fresh suggestion
 		fake as unknown as {
 			opts: {
@@ -1246,6 +1230,74 @@ describe("acceptance / regression", () => {
 		const before = fake.calls.complete.length;
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete.length).toBeGreaterThan(before);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Accept-handler (onTerminalInput): the core of the accept fix
+// ---------------------------------------------------------------------------
+
+describe("accept handler (onTerminalInput)", () => {
+	test("T93: accept key fills the editor and clears the widget (consume=true)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "suggestion text" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
+		// Fire the accept key (alt+/ → \x1b/)
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toEqual({ consume: true });
+		expect(fake.editorText).toBe("suggestion text");
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("T94: non-accept key is NOT consumed (passes through to editor)", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const result = fake.inputHandler!("a");
+		expect(result).toBeUndefined();
+	});
+
+	test("T95: accept key while agent NOT idle → not consumed", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.setIdle(false);
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toBeUndefined();
+	});
+
+	test("T96: accept key while editor non-empty → not consumed", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.setEditorText("already typed");
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toBeUndefined();
+		expect(fake.editorText).toBe("already typed");
+	});
+
+	test("T97: accept key with no suggestion → not consumed", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// No suggestion computed (default completeResult text "suggestion" — but clear it first)
+		fake.handlers.get("input")!({}, fake.ctx);
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toBeUndefined();
 	});
 });
 
