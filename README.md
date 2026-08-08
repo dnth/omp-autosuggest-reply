@@ -1,8 +1,9 @@
 # next-prompt — next-prompt suggestions for pi
 
-A pi coding-agent extension that, after an agent turn fully settles and the input
-editor is empty, computes the single most logical next instruction you'd type and
-shows it as a **colored below-editor suggestion widget**:
+A [pi](https://github.com/earendil-works/pi-coding-agent) coding-agent extension that,
+after an agent turn fully settles and the input editor is empty, computes the single
+most logical next instruction you'd type and shows it as a **colored below-editor
+suggestion widget**:
 
 ```
 ↳ next: Show me the diff of the skill file you just patched  (Alt-/ to accept)
@@ -21,28 +22,53 @@ cyan.
 
 ## Install
 
-This repo lives at `/home/gabi/Devel/Personal/next-prompt-extension/` and is wired into
-pi via a symlink (no copy, no install):
+Pi auto-discovers extensions from standard locations. Pick one:
+
+### Option A — copy the file (simplest)
+
+Copy `next-prompt.ts` into your global pi extensions directory:
 
 ```bash
-ln -sfn /home/gabi/Devel/Personal/next-prompt-extension/next-prompt.ts \
-        ~/.pi/agent/extensions/next-prompt.ts
+cp next-prompt.ts ~/.pi/agent/extensions/next-prompt.ts
 ```
 
-Pi auto-discovers `~/.pi/agent/extensions/*.ts` globally. Restart `pi` (or start a new
-session) and the extension loads.
-
-To develop, just edit `next-prompt.ts` in place — the symlink picks up changes on the
-next session start. Run the tests:
+Or, for a single project only, place it in the project-local extensions directory:
 
 ```bash
-cd /home/gabi/Devel/Personal/next-prompt-extension
+cp next-prompt.ts .pi/extensions/next-prompt.ts
+```
+
+Project-local extensions load only after the project is trusted.
+
+### Option B — reference it from `settings.json`
+
+Add the path to the `extensions` array in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "extensions": [
+    "/absolute/or/relative/path/to/next-prompt.ts"
+  ]
+}
+```
+
+Restart `pi` (or start a new session) and the extension loads.
+
+## Develop
+
+Clone the repo and run the tests with [Bun](https://bun.sh):
+
+```bash
 bun test
 ```
 
-> The local `node_modules/@earendil-works/*` are symlinks to the globally-installed pi
-> packages (so the TypeScript LSP resolves imports). They're git-ignored; nothing is
-> downloaded.
+The extension imports `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and
+`@earendil-works/pi-ai`. These are provided by your pi installation, so no extra
+dependencies are installed for the extension itself. If your editor's TypeScript LSP
+can't resolve those packages, link them from your pi install's `node_modules` (they're
+git-ignored in this repo; nothing is downloaded).
+
+Edit `next-prompt.ts` in place and restart pi to pick up changes.
 
 ## Config
 
