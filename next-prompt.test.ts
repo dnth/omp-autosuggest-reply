@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CURSOR_MARKER } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import type { Api } from "@earendil-works/pi-ai";
 
 import {
@@ -886,9 +886,12 @@ describe("sanitizeTerminalText", () => {
 	test("T50f: C1 controls are removed", () => {
 		expect(sanitizeTerminalText("a\x9bb")).toBe("ab"); // CSI single-byte
 	});
-	test("T50g: bidi override/isolate characters are removed", () => {
+	test("T50g: bidi override/isolate characters are removed — including consecutive controls (P1-2)", () => {
 		expect(sanitizeTerminalText("a\u202Eb\u202Cc")).toBe("abc");
 		expect(sanitizeTerminalText("a\u2066b\u2069c")).toBe("abc");
+		// Stateful-regex parity bug: two consecutive controls must BOTH be removed.
+		expect(sanitizeTerminalText("a\u202C\u202Eafter")).toBe("aafter");
+		expect(sanitizeTerminalText("\u202e\u202e\u202eX")).toBe("X");
 	});
 	test("T50h: dangling ESC is dropped", () => {
 		expect(sanitizeTerminalText("a\x1b")).toBe("a");
@@ -904,6 +907,20 @@ describe("sanitizeTerminalText", () => {
 		expect(
 			sanitizeSuggestion(`ok \x1b]52;c;${btoa("payload")}\x07`, {}),
 		).toBe("ok");
+	});
+	test("T50l: OSC terminated by C1 ST (0x9C) is removed without eating following text (P2-2)", () => {
+		expect(sanitizeTerminalText("a\x1b]0;title\x9cb")).toBe("ab");
+	});
+	test("T50m: OSC payload longer than the scan cap is consumed entirely, no tail re-emission (P2-1)", () => {
+		const payload = "A".repeat(4200);
+		const out = sanitizeTerminalText(`\x1b]52;c;${payload}\x07B`);
+		// Cap-hit without a visible terminator: the whole string is consumed so no
+		// part of the runaway sequence (or its tail) survives as literal text.
+		expect(out).toBe("");
+	});
+	test("T50n: DCS/APC also terminated by C1 ST", () => {
+		expect(sanitizeTerminalText("a\x1bP1;2data\x9cb")).toBe("ab");
+		expect(sanitizeTerminalText("a\x1b_stuff\x9cb")).toBe("ab");
 	});
 });
 
@@ -953,8 +970,8 @@ describe("overlayGhost", () => {
 		const cursorLine = out[1]!;
 		expect(cursorLine).toContain("\x1b[2m");
 		expect(cursorLine).toContain("\x1b[22m");
-		// line should not exceed content width visibly (no border overflow)
-		expect(cursorLine.endsWith("\n")).toBe(false);
+		// P2-4: assert the rendered line never exceeds the requested width.
+		expect(visibleWidth(cursorLine)).toBeLessThanOrEqual(WIDTH);
 	});
 	test("T61: cursor on a non-last visual line — only that line gains the ghost", () => {
 		const lines = makeLines({ text: "hi" });
@@ -991,6 +1008,8 @@ describe("overlayGhost", () => {
 		// The content line must contain the dim ghost but not exceed visible width.
 		expect(out[1]).toContain("\x1b[2m");
 		expect(out[1]).toContain("\x1b[22m");
+		// P2-4: every returned line is width-exact.
+		for (const line of out) expect(visibleWidth(line)).toBeLessThanOrEqual(WIDTH);
 	});
 	test("T64: output contains raw ANSI dim escapes (not theme.fg)", () => {
 		const lines = makeLines({ text: "hi" });
@@ -1791,7 +1810,7 @@ describe("renderMode config", () => {
 		expect(fake.editorComponentCalls).toBe(1); // no re-install
 	});
 
-	test("T106b: renderMode=ghost falls back to widget when another extension owns the editor (F-05)", async () => {
+	test("T106b: renderMode=ghost falls back to widget when another extension owns the editor (F-05 / P1-1)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -1800,11 +1819,19 @@ describe("renderMode config", () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			hasPriorEditor: true,
+			completeResult: {
+				content: [{ type: "text", text: "fallback suggestion" }],
+				stopReason: "stop",
+			},
 		});
 		expect(fake.editorComponentInstalled).toBe(false); // never clobbers
 		expect(
 			fake.calls.notifies.some(([m, t]) => t === "warning" && m.includes("another extension")),
 		).toBe(true);
+		// P1-1: the fallback must actually render the widget, not silently compute.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {

@@ -4,9 +4,9 @@
 
 ## Executive summary
 
-**Target:** `@gamaraan/next-prompt` v0.1.0 at commit `653fea7`  
-**Scope:** all 11 tracked files, the complete repository history, and the installed pi APIs at `0.84.1`  
-**Review strategy:** deep current-implementation review; the worktree had no implementation diff to compare  
+**Target:** `@gamaraan/next-prompt` v0.1.0 at commit `653fea7`
+**Scope:** all 11 tracked files, the complete repository history, and the installed pi APIs at `0.84.1`
+**Review strategy:** deep current-implementation review; the worktree had no implementation diff to compare
 **Recommendation:** **REQUEST CHANGES before the next release**
 
 | Severity | Count |

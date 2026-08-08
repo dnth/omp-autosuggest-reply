@@ -419,10 +419,14 @@ export function loadEffectiveConfig(
 	};
 }
 
-/** Merge a partial config update into the existing global config file, preserving unspecified keys. */
+/**
+ * Merge a partial config update into the existing global config file, preserving
+ * unspecified keys. Returns the merged config plus a `saved` flag: false when
+ * the destination was refused (symlink/non-regular) or the write failed.
+ */
 export function saveConfig(
 	update: Partial<NextPromptConfig>,
-): NextPromptConfig {
+): NextPromptConfig & { saved: boolean } {
 	const path = join(getAgentDir(), "next-prompt.json");
 	let existing: NextPromptConfig = {};
 	if (existsSync(path)) {
@@ -447,7 +451,7 @@ export function saveConfig(
 		const st = lstatSync(path);
 		if (!st.isFile() || st.isSymbolicLink()) {
 			console.warn(`next-prompt: refusing to overwrite non-regular config ${path}`);
-			return merged;
+			return { ...merged, saved: false };
 		}
 	}
 
@@ -471,8 +475,9 @@ export function saveConfig(
 		} catch {
 			/* best effort */
 		}
+		return { ...merged, saved: false };
 	}
-	return merged;
+	return { ...merged, saved: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +803,7 @@ export function buildMessages(transcript: string): Message[] {
 // Terminal-control sanitizer (F-01)
 // ---------------------------------------------------------------------------
 
-const BIDI_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const BIDI_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/; // no /g: stateful lastIndex would skip every other control
 
 /**
  * Remove terminal control sequences (OSC/CSI/DCS/APC/PM/SOS), C0/C1 controls,
@@ -832,37 +837,56 @@ export function sanitizeTerminalText(text: string): string {
 				}
 				i = Math.min(j + 1, n);
 			} else if (next === "]") {
-				// OSC: consume until BEL or ST (ESC \). Cap runaway sequences.
+				// OSC: consume until BEL, ST (ESC \), or C1 ST (0x9C). Cap runaway
+				// sequences; on cap-hit without a terminator, consume to end of string.
 				let j = i + 2;
+				let terminated = false;
 				const end = Math.min(n, i + 2 + 4096);
 				while (j < end) {
-					if (text[j] === "\x07") {
+					const c = text[j];
+					if (c === "\x07") {
 						j += 1;
+						terminated = true;
 						break;
 					}
-					if (text[j] === "\x1b" && text[j + 1] === "\\") {
+					if (c === "\x1b" && text[j + 1] === "\\") {
 						j += 2;
+						terminated = true;
+						break;
+					}
+					if (c !== undefined && c.charCodeAt(0) === 0x9c) {
+						j += 1;
+						terminated = true;
 						break;
 					}
 					j += 1;
 				}
-				i = j;
+				i = terminated ? j : n;
 			} else if (next === "P" || next === "_") {
-				// DCS / APC: consume until ST or BEL.
+				// DCS / APC: consume until ST (ESC \), BEL, or C1 ST. Cap runaway.
 				let j = i + 2;
+				let terminated = false;
 				const end = Math.min(n, i + 2 + 4096);
 				while (j < end) {
-					if (text[j] === "\x1b" && text[j + 1] === "\\") {
+					const c = text[j];
+					if (c === "\x1b" && text[j + 1] === "\\") {
 						j += 2;
+						terminated = true;
 						break;
 					}
-					if (text[j] === "\x07") {
+					if (c === "\x07") {
 						j += 1;
+						terminated = true;
+						break;
+					}
+					if (c !== undefined && c.charCodeAt(0) === 0x9c) {
+						j += 1;
+						terminated = true;
 						break;
 					}
 					j += 1;
 				}
-				i = j;
+				i = terminated ? j : n;
 			} else if (next !== undefined && isFinal(next.charCodeAt(0))) {
 				// ESC + single final byte (e.g. ESC 7, ESC c): consume both.
 				i += 2;
@@ -1087,6 +1111,8 @@ export interface SuggestionState {
 	setEditorText: (text: string) => void;
 	publishWidget: (content: string[] | undefined) => void;
 	renderGhost: (() => void) | undefined;
+	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
+	abortInflight: () => void;
 }
 
 /** Publish the below-editor widget (or clear it when there's no suggestion). */
@@ -1228,16 +1254,18 @@ function makeInputHandler(
 			state.inputGeneration += 1;
 			clearRearmTimer(state);
 			clearRearmCheckTimer(state);
+			state.abortInflight();
 			state.setEditorText(state.lastSuggestion);
 			state.publishWidget(undefined);
 			scheduleRearmCheck(state, editorTextBefore);
 			return { consume: true };
 		}
 
-		// Non-accept key: dismiss any active suggestion, invalidate in-flight work,
+		// Non-accept key: dismiss any active suggestion, abort in-flight work,
 		// and pass the key through to the editor.
 		dismissSuggestion(state);
 		state.inputGeneration += 1;
+		state.abortInflight();
 		scheduleRearmCheck(state, editorTextBefore);
 		return undefined;
 	};
@@ -1352,11 +1380,17 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const publishWidget = (content: string[] | undefined) => {
 			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
 		};
+		// F-05: install the ghost editor exactly once per session, and only when
+		// no other extension already owns the editor. Otherwise fall back to the
+		// widget mode rather than clobbering the other editor (P1-1: the fallback
+		// must actually switch renderMode, or no surface renders at all).
+		let renderMode: RenderMode = effective.renderMode ?? "widget";
+
 		const state: SuggestionState = {
 			suggestion: "",
 			lastSuggestion: "",
 			acceptKey: effective.acceptKey ?? DEFAULT_ACCEPT_KEY,
-			renderMode: effective.renderMode ?? "widget",
+			renderMode,
 			rearmDelayMs: effective.rearmDelayMs ?? DEFAULT_REARM_MS,
 			rearmTimer: undefined,
 			rearmCheckTimer: undefined,
@@ -1366,22 +1400,25 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			setEditorText: (text) => ctx.ui.setEditorText(text),
 			publishWidget,
 			renderGhost: undefined,
+			abortInflight: () => {
+				ref.inflight?.abort();
+				ref.inflight = undefined;
+			},
 		};
 		ref.state = state;
 
-		// F-05: install the ghost editor exactly once per session, and only when
-		// no other extension already owns the editor. Otherwise fall back to the
-		// widget mode rather than clobbering the other editor.
 		const wantGhost =
-			(effective.renderMode === "ghost" || effective.renderMode === "both") &&
+			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
 			const prior = ctx.ui.getEditorComponent();
 			if (prior) {
+				renderMode = "widget";
+				state.renderMode = "widget";
 				ctx.ui.notify(
 					"next-prompt: another extension owns the editor; using widget mode",
-				"warning",
-			);
+					"warning",
+				);
 			} else {
 				ctx.ui.setEditorComponent((tui, theme, kb) => {
 					const ed = new GhostEditor(tui, theme, kb, state);
@@ -1517,6 +1554,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
 		if (clean && ref.state === state) showSuggestion(state, clean, generation);
+		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 
 	// Interactive config command: `/next-prompt-config`. Walks the user through every
@@ -1534,7 +1572,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			}
 			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
 			if (next) {
-				saveConfig(next);
+				const saved = saveConfig(next);
+				if (!saved.saved) {
+					ctx.ui.notify(
+						"next-prompt: failed to save config; changes not applied",
+						"error",
+					);
+					return;
+				}
 				ctx.ui.notify("next-prompt: config saved — reloading", "info");
 				await ctx.reload();
 			}
@@ -1619,7 +1664,8 @@ export async function configureInteractively(
 	);
 	if (rearmPick) {
 		const n = Number(rearmPick.trim());
-		if (Number.isFinite(n) && n > 0) update.rearmDelayMs = n;
+		if (Number.isInteger(n) && n >= MIN_REARM_DELAY && n <= 60_000)
+			update.rearmDelayMs = n;
 	}
 
 	// 6. maxTranscriptChars (numeric text)
@@ -1629,7 +1675,12 @@ export async function configureInteractively(
 	);
 	if (trPick) {
 		const n = Number(trPick.trim());
-		if (Number.isFinite(n) && n > 0) update.maxTranscriptChars = n;
+		if (
+			Number.isInteger(n) &&
+			n >= MIN_TRANSCRIPT_CHARS &&
+			n <= MAX_TRANSCRIPT_CHARS
+		)
+			update.maxTranscriptChars = n;
 	}
 
 	// 7. maxSuggestionChars (numeric text)
@@ -1639,7 +1690,12 @@ export async function configureInteractively(
 	);
 	if (sgPick) {
 		const n = Number(sgPick.trim());
-		if (Number.isFinite(n) && n > 0) update.maxSuggestionChars = n;
+		if (
+			Number.isInteger(n) &&
+			n >= MIN_SUGGESTION_CHARS &&
+			n <= MAX_SUGGESTION_CHARS
+		)
+			update.maxSuggestionChars = n;
 	}
 
 	// 8. allowCrossProvider (confirm)
