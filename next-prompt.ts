@@ -1,25 +1,25 @@
 /**
- * next-prompt — inline "ghost" next-prompt suggestion extension for pi.
+ * next-prompt — next-prompt suggestion extension for pi.
  *
  * When the input editor is empty after an agent turn has fully settled, computes the
- * single most logical next instruction the user would type and shows it as inline
- * greyed ghost text after the caret. Tab (with the autocomplete dropdown closed)
- * accepts; any other key dismisses; backspace-to-empty re-arms from the last
- * computed suggestion (no new model call). No ghost is shown while the agent is
- * streaming or the editor is non-empty.
+ * single most logical next instruction the user would type and shows it. Two render
+ * modes (config `renderMode`, default "widget"):
+ *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
+ *   - "ghost":  inline greyed ghost text in the input box after the caret (nicer, but
+ *              re-installs a custom editor and may briefly lose it during session
+ *              lifecycle events such as reload/new/fork; re-installed on session_start
+ *              and agent_settled to recover).
  *
- * Config (all optional), merged global + project:
+ * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
+ * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor via
+ * `ctx.ui.setEditorText` — editor-independent, survives pi's resetExtensionUI. Any
+ * other key dismisses; backspace-to-empty re-arms the last suggestion after
+ * `rearmDelayMs` (default 2000, no new model call). No suggestion while streaming.
+ *
+ * Config (all optional), merged global + project (project overrides global per top-level
+ * key; nested `model` block is replaced wholesale, not merged):
  *   ~/.pi/agent/next-prompt.json
  *   <cwd>/.pi/next-prompt.json
- *
- * {
- *   "model": { "provider": "anthropic", "model": "claude-haiku-4-5" },  // default: current model
- *   "systemPrompt": "...override...",
- *   "maxTranscriptChars": 12000,
- *   "maxSuggestionChars": 240,
- *   "debounceMs": 400,            // largely redundant with agent_settled; reserved
- *   "allowCrossProvider": true   // false => fall back to ctx.model if configured provider differs
- * }
  *
  * See PLAN.md for the full design (oracle-reviewed).
  *
@@ -31,16 +31,20 @@ import { join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
+	CustomEditor,
 	getAgentDir,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
 	matchesKey,
 	CURSOR_MARKER,
 	truncateToWidth,
 	visibleWidth,
+	type EditorTheme,
 	type KeyId,
+	type TUI,
 } from "@earendil-works/pi-tui";
 import type {
 	Api,
@@ -61,12 +65,16 @@ export interface NextPromptModelConfig {
 	model: string;
 }
 
+export type RenderMode = "widget" | "ghost";
+
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
-	/** Key id that accepts the suggestion (e.g. "ctrl+tab", "tab", "alt+enter"). Defaults to "ctrl+tab". */
+	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "alt+/". */
 	acceptKey?: string;
+	/** How the suggestion is shown. "widget" (default) = below-editor line; "ghost" = inline overlay in the input box. */
+	renderMode?: RenderMode;
 	systemPrompt?: string;
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
@@ -248,8 +256,8 @@ export function resolveSuggestionModel(
 const SECRET_PATTERNS: RegExp[] = [
 	/AKIA[0-9A-Z]{16}/g, // AWS access key id
 	/sk-[a-zA-Z0-9]{20,}/g, // OpenAI-style secret
-	/ghp_[A-Za-z0-9]+/g, // GitHub personal access token (variable length)
-	/xoxb-[0-9a-zA-Z-]+/g, // Slack bot token
+	/ghp_[A-Za-z0-9]{36,}/g, // GitHub personal access token (classic PATs are 40 chars; 36+ avoids short false positives like ghp_test)
+	/xoxb-[0-9a-zA-Z-]{10,}-[0-9a-zA-Z-]{10,}/g, // Slack bot token (xoxb-<10+>-<10+>)
 	/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----/g, // PEM
 ];
 
@@ -539,23 +547,30 @@ function stripAnsi(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Suggestion state (editor-independent; published via setWidget, accepted via onTerminalInput)
+// Suggestion state (editor-independent acceptance; rendering branches by mode)
 // ---------------------------------------------------------------------------
 
 export interface SuggestionState {
 	suggestion: string;
 	lastSuggestion: string;
 	acceptKey: string;
+	renderMode: RenderMode;
 	rearmDelayMs: number;
 	rearmTimer: ReturnType<typeof setTimeout> | undefined;
+	rearmCheckTimer: ReturnType<typeof setTimeout> | undefined;
 	isIdleGetter: () => boolean;
 	getEditorText: () => string;
 	setEditorText: (text: string) => void;
 	publishWidget: (content: string[] | undefined) => void;
+	renderGhost: (() => void) | undefined;
 }
 
-function renderSuggestionWidget(state: SuggestionState): void {
-	if (state.suggestion) {
+function renderSuggestion(state: SuggestionState): void {
+	if (state.renderMode === "ghost") {
+		// Ghost mode: the custom editor overlays this.ghost in its render(). We only need
+		// to trigger a render of the editor so the overlay picks up the new ghost value.
+		state.renderGhost?.();
+	} else if (state.suggestion) {
 		const hint = humanizeKey(state.acceptKey);
 		state.publishWidget([
 			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
@@ -571,17 +586,18 @@ function setSuggestion(state: SuggestionState, text: string): void {
 		state.suggestion = text;
 		state.lastSuggestion = text;
 		clearRearmTimer(state);
-		renderSuggestionWidget(state);
+		renderSuggestion(state);
 	}
 }
 
-/** Clear the current suggestion (clears the widget too). */
+/** Clear the current suggestion (clears the widget / ghost too). */
 function clearSuggestion(state: SuggestionState | undefined): void {
 	if (!state) return;
 	clearRearmTimer(state);
+	clearRearmCheckTimer(state);
 	if (state.suggestion) {
 		state.suggestion = "";
-		state.publishWidget(undefined);
+		renderSuggestion(state);
 	}
 }
 
@@ -592,14 +608,24 @@ function clearRearmTimer(state: SuggestionState): void {
 	}
 }
 
+function clearRearmCheckTimer(state: SuggestionState): void {
+	if (state.rearmCheckTimer !== undefined) {
+		clearTimeout(state.rearmCheckTimer);
+		state.rearmCheckTimer = undefined;
+	}
+}
+
 /**
  * After any input that might empty the editor, schedule a re-arm check: if the editor
  * is empty, the agent is idle, no suggestion is showing, and we have a last suggestion,
  * re-publish it after rearmDelayMs (default 2000, configurable). No new model call.
+ * The outer 50ms timer is tracked+cleared so rapid typing doesn't pile up timers.
  */
 function scheduleRearmCheck(state: SuggestionState): void {
+	clearRearmCheckTimer(state);
 	// Defer so the editor has processed the key (getEditorText reflects post-input state).
-	setTimeout(() => {
+	state.rearmCheckTimer = setTimeout(() => {
+		state.rearmCheckTimer = undefined;
 		if (state.suggestion) return; // already showing
 		if (!state.lastSuggestion) return; // nothing to re-arm with
 		if (!state.isIdleGetter()) return; // agent running
@@ -627,7 +653,12 @@ function makeAcceptHandler(
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
 			matchesAcceptKeyRaw(data, state.acceptKey);
-		if (isAcceptKey && state.suggestion && state.isIdleGetter() && state.getEditorText().length === 0) {
+		if (
+			isAcceptKey &&
+			state.suggestion &&
+			state.isIdleGetter() &&
+			state.getEditorText().length === 0
+		) {
 			// Accept: fill the editor, remember the last suggestion, clear the widget,
 			// and schedule a re-arm check (if the user deletes back to empty, re-show it).
 			state.lastSuggestion = state.suggestion;
@@ -651,6 +682,68 @@ function makeAcceptHandler(
 export const SYSTEM_PROMPT = `You predict the single most logical next instruction the user would type into a coding agent, given the conversation so far. Reply with ONLY that instruction, one line, no quotes, no markdown, no explanation. If there is nothing useful to suggest, reply with the single word: NONE`;
 
 // ---------------------------------------------------------------------------
+// Ghost editor (inline overlay mode — renderMode: "ghost")
+// ---------------------------------------------------------------------------
+// A thin CustomEditor that overlays the current suggestion (state.suggestion) as
+// greyed inline text after the caret via overlayGhost(). Acceptance still goes
+// through the global onTerminalInput handler (editor-independent); this class only
+// renders the ghost and dismisses/re-arms on key input. Re-installed on session_start
+// AND agent_settled to recover after pi's resetExtensionUI swaps the editor.
+
+class GhostEditor extends CustomEditor {
+	private suggestionState: SuggestionState;
+	constructor(
+		tui: TUI,
+		theme: EditorTheme,
+		keybindings: KeybindingsManager,
+		state: SuggestionState,
+	) {
+		super(tui, theme, keybindings);
+		this.suggestionState = state;
+	}
+
+	/** Public so the controller can trigger a re-render when the ghost value changes. */
+	requestGhostRender(): void {
+		this.tui?.requestRender();
+	}
+
+	render(width: number): string[] {
+		return overlayGhost(super.render(width), this.suggestionState.suggestion, width);
+	}
+
+	handleInput(data: string): void {
+		const before = this.getText();
+		const isAcceptKey =
+			matchesKey(data, this.suggestionState.acceptKey as KeyId) ||
+			matchesAcceptKeyRaw(data, this.suggestionState.acceptKey);
+		// Delegate to the base editor first so it keeps authority over autocomplete,
+		// escape, ctrl+d, paste, history, etc.
+		super.handleInput(data);
+		const after = this.getText();
+
+		// The global onTerminalInput handler consumes the accept key (and fills the
+		// editor via setEditorText), so by the time handleInput runs the accept key is
+		// NOT in `data` for the accept case. Here we only manage ghost dismissal / re-arm
+		// for non-accept keys, mirroring decideInput's dismiss/rearm logic.
+		const d = decideInput({
+			data,
+			ghost: this.suggestionState.suggestion,
+			lastSuggestion: this.suggestionState.lastSuggestion,
+			editorTextBefore: before,
+			editorTextAfter: after,
+			isShowingAutocomplete: this.isShowingAutocomplete(),
+			isTab: isAcceptKey,
+		});
+		this.suggestionState.suggestion = d.ghost;
+		if (d.ghost) this.suggestionState.lastSuggestion = d.ghost;
+		else scheduleRearmCheck(this.suggestionState);
+		this.tui?.requestRender();
+	}
+}
+
+export { GhostEditor };
+
+// ---------------------------------------------------------------------------
 // Controller / event wiring
 // ---------------------------------------------------------------------------
 
@@ -658,6 +751,7 @@ interface NextPromptRef {
 	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
 	unsubInput: (() => void) | undefined;
+	installGhostEditor: (() => void) | undefined;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -665,6 +759,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		state: undefined,
 		inflight: undefined,
 		unsubInput: undefined,
+		installGhostEditor: undefined,
 	};
 	let config: NextPromptConfig = {};
 	const notifiedFallback = { value: false };
@@ -677,12 +772,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_e, ctx) => {
 		reset();
-		// Unsubscribe any previous terminal-input listener (resetExtensionUI clears
-		// listeners, but be safe across reloads).
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
+		ref.installGhostEditor = undefined;
 
 		config = loadConfig(ctx.cwd);
+		const renderMode = config.renderMode ?? "widget";
 		const publishWidget = (content: string[] | undefined) => {
 			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
 		};
@@ -690,23 +785,42 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			suggestion: "",
 			lastSuggestion: "",
 			acceptKey: config.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			renderMode,
 			rearmDelayMs: config.rearmDelayMs ?? DEFAULT_REARM_MS,
 			rearmTimer: undefined,
+			rearmCheckTimer: undefined,
 			isIdleGetter: () => ctx.isIdle(),
 			getEditorText: () => ctx.ui.getEditorText(),
 			setEditorText: (text) => ctx.ui.setEditorText(text),
 			publishWidget,
+			renderGhost: undefined,
 		};
 		ref.state = state;
 
-		// Register a GLOBAL terminal-input listener that swallows the accept key
-		// and fills the editor. This is editor-independent — it survives
-		// pi's resetExtensionUI() which would otherwise orphan a custom editor.
+		// In ghost mode, install the custom editor (and remember how, so agent_settled
+		// can re-install it after pi's resetExtensionUI swaps the editor back to default).
+		if (renderMode === "ghost") {
+			const install = () => {
+				ctx.ui.setEditorComponent((tui, theme, kb) => {
+					const ed = new GhostEditor(tui, theme, kb, state);
+					state.renderGhost = () => ed.requestGhostRender();
+					return ed;
+				});
+			};
+			install();
+			ref.installGhostEditor = install;
+		}
+
+		// Register a GLOBAL terminal-input listener that swallows the accept key and
+		// fills the editor. Editor-independent — survives resetExtensionUI.
 		ref.unsubInput = ctx.ui.onTerminalInput(makeAcceptHandler(state));
 	});
 
 	pi.on("agent_settled", async (_e, ctx) => {
 		try {
+			// In ghost mode, re-install the custom editor in case resetExtensionUI
+			// swapped it back to the default between turns.
+			ref.installGhostEditor?.();
 			if (!ref.state || !ctx.isIdle() || ctx.ui.getEditorText().length > 0)
 				return;
 			await maybeCompute(ctx);
@@ -716,20 +830,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 
 	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => {
-		reset();
-	});
-	pi.on("turn_start", () => {
-		reset();
-	});
-	pi.on("agent_start", () => {
-		reset();
-	});
+	pi.on("input", () => { reset(); });
+	pi.on("turn_start", () => { reset(); });
+	pi.on("agent_start", () => { reset(); });
 
 	pi.on("session_shutdown", () => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
+		ref.installGhostEditor = undefined;
 		ref.state = undefined;
 	});
 

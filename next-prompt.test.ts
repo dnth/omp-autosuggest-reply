@@ -415,7 +415,7 @@ describe("redactSecrets", () => {
 		).toBe("tok [redacted] end");
 	});
 	test("T20: Slack xoxb- token redacted", () => {
-		expect(redactSecrets("bot xoxb-1234567890-abcdef here")).toBe(
+		expect(redactSecrets("bot xoxb-1234567890123456-abcdefghij123456 here")).toBe(
 			"bot [redacted] here",
 		);
 	});
@@ -434,6 +434,25 @@ describe("redactSecrets", () => {
 			"AKIAIOSFODNN7EXAMPLE and sk-abcdefghijklmnopqrstuvwxyz",
 		);
 		expect(out).toBe("[redacted] and [redacted]");
+	});
+
+	test("T20a: short ghp_ (under 36 chars) NOT redacted (avoids false positives like ghp_test)", () => {
+		expect(redactSecrets("tok ghp_test end")).toBe("tok ghp_test end");
+		expect(redactSecrets("tok ghp_01234567890123456789012345678901234 end")).toBe(
+			"tok ghp_01234567890123456789012345678901234 end",
+		); // 35 chars after ghp_ → below 36 threshold → not matched
+	});
+
+	test("T20b: 40-char ghp_ IS redacted (classic GitHub PAT)", () => {
+		const token = "ghp_" + "a".repeat(40);
+		expect(redactSecrets(`tok ${token} end`)).toBe("tok [redacted] end");
+	});
+
+	test("T20c: short xoxb- (no second dash group of 10+) NOT redacted", () => {
+		expect(redactSecrets("bot xoxb-short here")).toBe("bot xoxb-short here");
+		expect(redactSecrets("bot xoxb-1234567890-abc here")).toBe(
+			"bot xoxb-1234567890-abc here",
+		); // second group only 3 chars → not matched
 	});
 });
 
@@ -808,6 +827,7 @@ function makeFake(opts: {
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
 	setIdle: (v: boolean) => void;
+	editorComponentInstalled: boolean;
 } {
 	let idle = opts.idle ?? true;
 	const calls = {
@@ -825,6 +845,7 @@ function makeFake(opts: {
 		| ((data: string) => { consume?: boolean } | undefined)
 		| undefined;
 	let widgetContent: string[] | undefined;
+	let editorComponentInstalled = false;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
 		cwd: "/tmp",
@@ -875,6 +896,17 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
+			setEditorComponent: (
+				factory: (tui: unknown, theme: unknown, kb: unknown) => unknown,
+			) => {
+				editorComponentInstalled = true;
+				// Call the factory so a real GhostEditor is constructed (lightweight ctor).
+				factory(
+					{ requestRender: () => {} } as unknown,
+					{ borderColor: (s: string) => s, selectList: {} } as unknown,
+					{ matches: () => false } as unknown,
+				);
+			},
 		},
 		sessionManager: { getBranch: () => opts.branch ?? [] },
 	};
@@ -897,6 +929,9 @@ function makeFake(opts: {
 		},
 		get inputHandler() {
 			return inputHandler;
+		},
+		get editorComponentInstalled() {
+			return editorComponentInstalled;
 		},
 		calls,
 		handlers,
@@ -1427,4 +1462,50 @@ describe("re-arm after delete-to-empty", () => {
 // sanity: SYSTEM_PROMPT is non-empty
 test("SYSTEM_PROMPT is non-empty", () => {
 	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// renderMode config + ghost editor install
+// ---------------------------------------------------------------------------
+
+describe("renderMode config", () => {
+	test("T103: default renderMode is widget → setEditorComponent NOT called", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(false);
+	});
+
+	test("T104: renderMode=widget uses setWidget (below-editor line)", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: { content: [{ type: "text", text: "widget suggestion" }], stopReason: "stop" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("↳ next:");
+		expect(fake.widgetContent?.[0] ?? "").toContain("widget suggestion");
+		expect(fake.editorComponentInstalled).toBe(false);
+	});
+
+	test("T105: renderMode=ghost installs custom editor on session_start", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(true);
+	});
+
+	test("T106: renderMode=ghost re-installs editor on agent_settled (after resetExtensionUI)", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(true);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(true);
+	});
+
+	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
+		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: { content: [{ type: "text", text: "ghost suggestion" }], stopReason: "stop" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+	});
 });
