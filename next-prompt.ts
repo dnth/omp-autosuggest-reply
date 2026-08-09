@@ -1281,6 +1281,13 @@ export interface SuggestionState {
 	setEditorText: (text: string) => void;
 	publishWidget: (content: string[] | undefined) => void;
 	renderGhost: (() => void) | undefined;
+	/**
+	 * Permanently switch this session from ghost/both to widget mode after a
+	 * ghost rendering failure (the other editor owner gets restored). Guarded:
+	 * the first call wins, later calls are no-ops. Undefined when ghost was
+	 * never attempted (widget-only sessions).
+	 */
+	fallbackToWidget: (() => void) | undefined;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
 }
@@ -1474,15 +1481,29 @@ class GhostEditor extends CustomEditor {
 
 	/** Public so the controller can trigger a re-render when the ghost value changes. */
 	requestGhostRender(): void {
-		this.tui?.requestRender();
+		try {
+			this.tui?.requestRender();
+		} catch {
+			// Render pipeline broken -> treat as a ghost failure (P1-1).
+			this.suggestionState.fallbackToWidget?.();
+		}
 	}
 
 	render(width: number): string[] {
-		return overlayGhost(
-			super.render(width),
-			this.suggestionState.suggestion,
-			width,
-		);
+		const base = super.render(width);
+		try {
+			return overlayGhost(
+				base,
+				this.suggestionState.suggestion,
+				width,
+			);
+		} catch {
+			// A ghost overlay failure must never break the editor's own render
+			// pass: surface the base lines and permanently fall back to widget
+			// mode (restoring the previous editor owner).
+			this.suggestionState.fallbackToWidget?.();
+			return base;
+		}
 	}
 
 	handleInput(data: string): void {
@@ -1553,11 +1574,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const publishWidget = (content: string[] | undefined) => {
 			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
 		};
-		// F-05: install the ghost editor exactly once per session, and only when
-		// no other extension already owns the editor. Otherwise fall back to the
-		// widget mode rather than clobbering the other editor (P1-1: the fallback
-		// must actually switch renderMode, or no surface renders at all).
-		let renderMode: RenderMode = effective.renderMode ?? "widget";
+		// F-05: install the ghost editor exactly once per session. If another
+		// extension already owns the editor, still try ghost mode on top of it
+		// (P1-1): only when the ghost actually fails to render do we restore the
+		// prior owner and switch to widget mode. The prior factory is captured
+		// before installation so the fallback can restore it.
+		const renderMode: RenderMode = effective.renderMode ?? "widget";
 
 		const state: SuggestionState = {
 			suggestion: "",
@@ -1573,6 +1595,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			setEditorText: (text) => ctx.ui.setEditorText(text),
 			publishWidget,
 			renderGhost: undefined,
+			fallbackToWidget: undefined,
 			abortInflight: () => {
 				ref.inflight?.abort();
 				ref.inflight = undefined;
@@ -1585,20 +1608,52 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
 			const prior = ctx.ui.getEditorComponent();
-			if (prior) {
-				renderMode = "widget";
+			// P1-1: permanent, guarded fallback. First call wins; once we are in
+			// widget mode there is nothing left to fall back to, so later calls
+			// (e.g. from a stale GhostEditor instance) are no-ops.
+			const fallbackToWidget = () => {
+				if (state.renderMode === "widget") return;
 				state.renderMode = "widget";
+				state.renderGhost = undefined;
+				editorInstalled = false;
+				// Restore the previous owner (or the default editor) so the other
+				// extension's surface is not left half-replaced.
+				try {
+					ctx.ui.setEditorComponent(prior ?? undefined);
+				} catch {
+					// Restoration is best-effort; widget mode still works.
+				}
 				ctx.ui.notify(
-					"next-prompt: another extension owns the editor; using widget mode",
+					"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
 					"warning",
 				);
-			} else {
+				renderSuggestion(state);
+			};
+			state.fallbackToWidget = fallbackToWidget;
+			try {
 				ctx.ui.setEditorComponent((tui, theme, kb) => {
 					const ed = new GhostEditor(tui, theme, kb, state);
-					state.renderGhost = () => ed.requestGhostRender();
+					state.renderGhost = () => {
+						try {
+							ed.requestGhostRender();
+						} catch {
+							fallbackToWidget();
+						}
+					};
 					return ed;
 				});
 				editorInstalled = true;
+				if (prior) {
+					ctx.ui.notify(
+						"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
+						"warning",
+					);
+				}
+			} catch {
+				// Installation threw (e.g. the owner rejected replacement): keep
+				// widget mode, restore the prior owner, and let the suggestion
+				// surface via the widget.
+				fallbackToWidget();
 			}
 		}
 

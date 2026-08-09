@@ -184,8 +184,10 @@ Mitigations:
 1. On `session_start` (TUI mode only — headless/RPC/JSON sessions never compute),
 a global `ctx.ui.onTerminalInput` listener is registered to detect the accept key
 **editor-independently**. In `ghost`/`both` mode, a render-only `GhostEditor` is
-installed via `setEditorComponent` — never re-installed on settle, and skipped
-(with a widget fallback) if another extension already owns the editor. pi clears
+installed via `setEditorComponent` — never re-installed on settle. If another
+extension already owns the editor, the ghost is **still attempted** (with a
+warning); only if the ghost install or its render pass actually fails does the
+extension restore the prior owner and fall back to widget mode. pi clears
 extension listeners and custom editors when the UI is reset; each fresh
 `session_start` (reload/new/resume/fork) re-registers exactly one listener and
 re-installs the editor once.
