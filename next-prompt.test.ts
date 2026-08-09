@@ -335,6 +335,23 @@ describe("destination identity", () => {
 			destinationKey({ provider: "openai", origin: "", model: "" }),
 		).not.toBe(destinationKey(d!));
 	});
+
+	test("P1: pairAllowed matches directionally, case-insensitively, and never the reverse", () => {
+		const { pairAllowed } =
+			require("./next-prompt.ts") as typeof import("./next-prompt.ts");
+		const pairs: Array<[string, string]> = [["openai", "anthropic"]];
+		expect(pairAllowed(pairs, "openai", "anthropic")).toBe(true);
+		// Case-insensitive on both sides.
+		expect(pairAllowed(pairs, "OpenAI", "ANTHROPIC")).toBe(true);
+		// Directional: the reverse pair is NOT implied.
+		expect(pairAllowed(pairs, "anthropic", "openai")).toBe(false);
+		// Missing inputs never match.
+		expect(pairAllowed(pairs, undefined, "anthropic")).toBe(false);
+		expect(pairAllowed(pairs, "openai", undefined)).toBe(false);
+		// Empty/missing pair list never matches.
+		expect(pairAllowed(undefined, "openai", "anthropic")).toBe(false);
+		expect(pairAllowed([], "openai", "anthropic")).toBe(false);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -1650,6 +1667,10 @@ function makeFake(opts: {
 		| Promise<boolean>
 		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
+	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
+	selectResult?: string | Promise<string> | (() => string | Promise<string>);
+	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
+	selectUnavailable?: boolean;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -1677,6 +1698,7 @@ function makeFake(opts: {
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
+		selects: Array<[string, string[]]>;
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
 	setIdle: (v: boolean) => void;
@@ -1698,6 +1720,7 @@ function makeFake(opts: {
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
+		selects: [] as Array<[string, string[]]>,
 	};
 	let editorText = "";
 	let inputHandler:
@@ -1711,7 +1734,7 @@ function makeFake(opts: {
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
-	let lastEditorComponent: unknown ;
+	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = new Editor(
 		{
@@ -1754,6 +1777,18 @@ function makeFake(opts: {
 		ui: {
 			notify: (m: string, t: "info" | "warning" | "error" = "info") =>
 				calls.notifies.push([m, t]),
+			...(opts.selectUnavailable
+				? {}
+				: {
+						select: async (title: string, options: string[]) => {
+							calls.selects.push([title, options]);
+							const result =
+								typeof opts.selectResult === "function"
+									? opts.selectResult()
+									: (opts.selectResult ?? "once");
+							return typeof result === "string" ? result : await result;
+						},
+					}),
 			confirm: async (title: string) => {
 				calls.confirms.push(title);
 				opts.confirmCall?.();
@@ -1790,11 +1825,7 @@ function makeFake(opts: {
 				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
 			setEditorComponent: (
 				factory:
-					| ((
-							tui: unknown,
-							theme: unknown,
-							kb: unknown,
-						) => unknown)
+					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
 					| undefined,
 			) => {
 				editorComponentCalls += 1;
@@ -2576,9 +2607,7 @@ describe("renderMode config", () => {
 		expect(fake.editorComponentRestores).toBe(1); // prior owner restored
 		expect(
 			fake.calls.notifies.some(
-				([m, t]) =>
-					t === "warning" &&
-					m.includes("fell back to widget mode"),
+				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
 			),
 		).toBe(true);
 		// P1-1: the fallback must actually render the widget, not silently compute.
@@ -2607,9 +2636,7 @@ describe("renderMode config", () => {
 		expect(fake.editorComponentRestores).toBe(1); // default editor restored
 		expect(
 			fake.calls.notifies.some(
-				([m, t]) =>
-					t === "warning" &&
-					m.includes("fell back to widget mode"),
+				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
 			),
 		).toBe(true);
 		// P1-1: the fallback must actually render the widget, not silently compute.
@@ -2617,8 +2644,8 @@ describe("renderMode config", () => {
 		// Guarded: a second settle after the fallback does not re-notify.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(
-			fake.calls.notifies.filter(
-				([m]) => m.includes("fell back to widget mode"),
+			fake.calls.notifies.filter(([m]) =>
+				m.includes("fell back to widget mode"),
 			),
 		).toHaveLength(1);
 	});
@@ -2743,6 +2770,11 @@ describe("cross-destination consent", () => {
 				| boolean
 				| Promise<boolean>
 				| (() => boolean | Promise<boolean>);
+			selectResult?:
+				| string
+				| Promise<string>
+				| (() => string | Promise<string>);
+			selectUnavailable?: boolean;
 			baseUrl?: string;
 		} = {},
 	) {
@@ -2780,10 +2812,23 @@ describe("cross-destination consent", () => {
 		}
 	}
 
-	test("C1: first cross-destination use prompts for consent; grant → complete on configured model", async () => {
+	function globalConfigOnDisk(): Record<string, unknown> {
+		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`;
+		try {
+			return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+		} catch {
+			return {};
+		}
+	}
+
+	test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
 		const { fake } = await setupCross();
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.confirms).toHaveLength(1);
+		expect(fake.calls.selects).toHaveLength(1);
+		// The dialog offers the three choices, always-allow second.
+		expect(fake.calls.selects[0]![1].join("|")).toContain(
+			"Always allow for this provider pair",
+		);
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "anthropic",
 			id: "haiku",
@@ -2792,7 +2837,7 @@ describe("cross-destination consent", () => {
 	});
 
 	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
-		const { fake } = await setupCross({ confirmResult: false });
+		const { fake } = await setupCross({ selectResult: "decline" });
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
@@ -2800,7 +2845,7 @@ describe("cross-destination consent", () => {
 		);
 		// Session denial: settling again must not re-prompt nor send.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.confirms).toHaveLength(1);
+		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
@@ -2812,7 +2857,7 @@ describe("cross-destination consent", () => {
 		// New session: consent persisted per project+destination.
 		const { fake: fake2 } = await setupCross();
 		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-		expect(fake2.calls.confirms).toHaveLength(0);
+		expect(fake2.calls.selects).toHaveLength(0);
 		expect(fake2.calls.complete).toHaveLength(1);
 	});
 
@@ -2837,7 +2882,7 @@ describe("cross-destination consent", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.confirms).toHaveLength(1); // consent for gateway/claude
+		expect(fake.calls.selects).toHaveLength(1); // consent for gateway/claude
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "openai",
 			id: "claude",
@@ -2863,7 +2908,7 @@ describe("cross-destination consent", () => {
 		);
 		await fake2.handlers.get("session_start")!({}, fake2.ctx);
 		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-		expect(fake2.calls.confirms).toHaveLength(1);
+		expect(fake2.calls.selects).toHaveLength(1);
 	});
 
 	test("C5: legacy consent record WITHOUT model route never matches → re-prompt (F-02/F-10)", async () => {
@@ -2883,62 +2928,181 @@ describe("cross-destination consent", () => {
 		const { fake } = await setupCross();
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Fail closed: the legacy record does not authorize the current route.
+		expect(fake.calls.selects).toHaveLength(1);
+	});
+
+	test("C6: provider pair in global config skips the dialog entirely (directional)", async () => {
+		// Pair allows openai→anthropic; prompt once, then never again.
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		const { fake } = await setupCross();
+		// setupCross overwrites next-prompt.json without pairs → restore them.
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["openai", "anthropic"]],
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete[0]!.model).toEqual({
+			provider: "anthropic",
+			id: "haiku",
+		});
+	});
+
+	test("C7: always-allow persists the directional pair to global config; no re-prompt afterwards", async () => {
+		const { fake } = await setupCross({ selectResult: "always" });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(1);
+		// Pair persisted in the global config file, merged with the rest.
+		const cfg = globalConfigOnDisk();
+		const pairs = cfg.allowCrossProviderPairs as Array<[string, string]>;
+		expect(pairs).toContainEqual(["openai", "anthropic"]);
+		// Info notification confirms the save.
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "info" && m.includes("saved to global config"),
+			),
+		).toBe(true);
+		// Per-destination consent also persisted (belt and suspenders).
+		expect(consentsOnDisk()).toHaveLength(1);
+		// New session: pair grant → no dialog, still completes.
+		const { fake: fake2 } = await setupCross();
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.selects).toHaveLength(0);
+		expect(fake2.calls.complete).toHaveLength(1);
+	});
+
+	test("C8: pair grant is directional — reverse pair does not skip the dialog", async () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["anthropic", "openai"]],
+			}),
+		);
+		const { fake } = await setupCross();
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: [["anthropic", "openai"]],
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// openai→anthropic is NOT allowed; the dialog still appears.
+		expect(fake.calls.selects).toHaveLength(1);
+	});
+
+	test("C9: no select API → falls back to confirm dialog; grant → complete", async () => {
+		const { fake } = await setupCross({
+			selectUnavailable: true,
+			confirmResult: true,
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(0);
 		expect(fake.calls.confirms).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(consentsOnDisk()).toHaveLength(1);
+	});
+
+	test("C10: malformed allowCrossProviderPairs fails closed (no compute)", async () => {
+		const dir = process.env.PI_CODING_AGENT_DIR!;
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: ["openai", "anthropic"], // not a pair
+			}),
+		);
+		const { fake } = await setupCross();
+		// setupCross rewrote config; restore the invalid one.
+		writeFileSync(
+			`${dir}/next-prompt.json`,
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				allowCrossProviderPairs: ["openai", "anthropic"],
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		// Fail closed: no dialog, no compute.
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.complete).toHaveLength(0);
 	});
 
 	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: boolean) => void;
-		const pending = new Promise<boolean>((r) => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
 			resolveConfirm = r;
 		});
-		const { fake } = await setupCross({ confirmResult: pending });
+		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Ordinary typing while the dialog is pending bumps the input generation.
 		fake.deliverInput("x");
-		resolveConfirm(true); // late approval
+		resolveConfirm("once"); // late approval
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
 	});
 
 	test("F08b: consent resolved AFTER session restart → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: boolean) => void;
-		const pending = new Promise<boolean>((r) => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
 			resolveConfirm = r;
 		});
-		const { fake } = await setupCross({ confirmResult: pending });
+		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// Session restart invalidates state and aborts in-flight work.
 		await fake.handlers.get("session_start")!(
 			{ type: "session_start", reason: "reload" },
 			fake.ctx,
 		);
-		resolveConfirm(true);
+		resolveConfirm("once");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("F08c: consent resolved AFTER shutdown → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: boolean) => void;
-		const pending = new Promise<boolean>((r) => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
 			resolveConfirm = r;
 		});
-		const { fake } = await setupCross({ confirmResult: pending });
+		const { fake } = await setupCross({ selectResult: pending });
 		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		resolveConfirm(true);
+		resolveConfirm("once");
 		await settle;
 		expect(fake.calls.complete).toHaveLength(0);
 		expect(consentsOnDisk()).toHaveLength(0);
 	});
 
 	test("F08d: consent resolved AFTER a second settle aborts the first → no late disclose (F-08)", async () => {
-		const resolvers: Array<(v: boolean) => void> = [];
+		const resolvers: Array<(v: string) => void> = [];
 		const { fake } = await setupCross({
-			// Each confirm call gets its own deferred promise.
-			confirmResult: () =>
-				new Promise<boolean>((r) => {
+			// Each select call gets its own deferred promise.
+			selectResult: () =>
+				new Promise<string>((r) => {
 					resolvers.push(r);
 				}),
 		});
@@ -2946,9 +3110,9 @@ describe("cross-destination consent", () => {
 		// Second settle while the first dialog is pending aborts the first.
 		const second = fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// User approves the SECOND dialog only; the first never resolves.
-		resolvers[resolvers.length - 1]!(true);
+		resolvers[resolvers.length - 1]!("once");
 		await second;
-		resolvers[0]!(true); // late approval on the aborted first dialog
+		resolvers[0]!("once"); // late approval on the aborted first dialog
 		await first;
 		// The stale first settle must never disclose; only the second may
 		// complete (its own fresh request).

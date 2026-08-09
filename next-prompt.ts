@@ -111,6 +111,15 @@ export interface NextPromptConfig {
 	 * controller).
 	 */
 	allowCrossProvider?: boolean;
+	/**
+	 * Directional provider pairs that skip the cross-provider consent dialog:
+	 * `[from, to]` = [active model provider, suggestion model provider]. Set
+	 * via the dialog's "Always allow" option (saved to the global config) or
+	 * edited by hand. The reverse pair is NOT implied. Only provider labels
+	 * are compared (case-insensitive); endpoint/model changes do not
+	 * invalidate a pair grant.
+	 */
+	allowCrossProviderPairs?: Array<[string, string]>;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
 	rearmDelayMs?: number;
 }
@@ -371,6 +380,19 @@ function parseConfig(text: string): {
 				if (typeof value !== "boolean") failPrivacy("must be a boolean");
 				else cfg.allowCrossProvider = value;
 				break;
+			case "allowCrossProviderPairs": {
+				const isValidPair = (p: unknown): p is [string, string] =>
+					Array.isArray(p) &&
+					p.length === 2 &&
+					typeof p[0] === "string" &&
+					p[0].length > 0 &&
+					typeof p[1] === "string" &&
+					p[1].length > 0;
+				if (!Array.isArray(value) || !value.every(isValidPair))
+					failPrivacy("must be an array of [from, to] provider pairs");
+				else cfg.allowCrossProviderPairs = value as Array<[string, string]>;
+				break;
+			}
 			case "maxTranscriptChars":
 				if (
 					typeof value !== "number" ||
@@ -610,6 +632,23 @@ export function hasConsent(
 			r.project === project &&
 			destinationKey(r.destination) === destinationKey(destination),
 	);
+}
+
+/**
+ * Whether a directional provider pair is allow-listed in the global config:
+ * [from, to] = [active model provider, suggestion model provider]. Matching is
+ * case-insensitive; the reverse direction is NOT implied. A pair grant skips
+ * the per-destination consent dialog entirely.
+ */
+export function pairAllowed(
+	pairs: Array<[string, string]> | undefined,
+	from: string | undefined,
+	to: string | undefined,
+): boolean {
+	if (!pairs || pairs.length === 0 || !from || !to) return false;
+	const f = from.toLowerCase();
+	const t = to.toLowerCase();
+	return pairs.some(([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t);
 }
 
 /** Persist a consent grant atomically (best effort; never throws). */
@@ -1492,11 +1531,7 @@ class GhostEditor extends CustomEditor {
 	render(width: number): string[] {
 		const base = super.render(width);
 		try {
-			return overlayGhost(
-				base,
-				this.suggestionState.suggestion,
-				width,
-			);
+			return overlayGhost(base, this.suggestionState.suggestion, width);
 		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget
@@ -1719,20 +1754,48 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		// F-02 / F-10: cross-destination disclosure requires explicit, persisted
 		// per-project consent. Fail closed on decline; never re-prompt in-session.
+		// A directional provider pair in the global config (set via the dialog's
+		// "Always allow" option) skips the dialog for that active→suggestion
+		// provider direction.
 		if (resolved.crossDestination) {
 			const dest = destinationOf(resolved.model);
 			const key = dest ? destinationKey(dest) : "";
 			if (!dest || deniedConsents.has(key)) return;
-			if (!hasConsent(ctx.cwd, dest)) {
-				if (!ctx.ui.confirm) return; // no dialogs available -> fail closed
+			const fromProvider = ctx.model?.provider ?? "";
+			const toProvider = resolved.model.provider ?? "";
+			if (
+				!pairAllowed(
+					effective.allowCrossProviderPairs,
+					fromProvider,
+					toProvider,
+				) &&
+				!hasConsent(ctx.cwd, dest)
+			) {
+				// No dialogs at all -> fail closed.
+				if (!ctx.ui.select && !ctx.ui.confirm) return;
 				const transcriptSize = buildTranscript(
 					ctx.sessionManager.getBranch(),
 					effective,
 				).length;
-				const granted = await ctx.ui.confirm(
-					"next-prompt: send transcript to another provider?",
-					`Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there. Allow for this project?`,
-				);
+				const title = "next-prompt: send transcript to another provider?";
+				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
+				// Prefer the 3-option selector (allow once / always allow this
+				// provider pair / decline); fall back to a plain confirm dialog
+				// when the UI does not offer select.
+				let choice: string | undefined;
+				if (ctx.ui.select) {
+					choice = await ctx.ui.select(title, [
+						"Allow once (this project)",
+						"Always allow for this provider pair",
+						"Decline",
+					]);
+				} else {
+					const granted = await ctx.ui.confirm(
+						title,
+						`${detail} Allow for this project?`,
+					);
+					choice = granted ? "once" : "decline";
+				}
 				// F-08: the dialog may resolve AFTER an interaction, reset, or
 				// shutdown invalidated this request. Require the original
 				// controller/state identity, request signal, and input generation
@@ -1746,7 +1809,41 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					if (ref.inflight === ac) ref.inflight = undefined;
 					return;
 				}
-				if (!granted) {
+				if (choice === "always") {
+					// Persist the directional provider pair in the global config.
+					const updated = saveConfig({
+						allowCrossProviderPairs: [
+							...(effective.allowCrossProviderPairs ?? []),
+							[fromProvider, toProvider],
+						],
+					});
+					// The pair grant also covers this exact destination, but keep
+					// the per-project record so the dialog never re-appears even
+					// if the config write was refused.
+					grantConsent(
+						ctx.cwd,
+						dest,
+						`${resolved.model.provider}/${resolved.model.id}`,
+					);
+					if (updated.saved) {
+						ctx.ui.notify(
+							`next-prompt: always allow ${fromProvider} → ${toProvider} saved to global config`,
+							"info",
+						);
+					} else {
+						ctx.ui.notify(
+							"next-prompt: failed to save provider pair in global config (consent kept for this project)",
+							"warning",
+						);
+					}
+				} else if (choice === "once") {
+					grantConsent(
+						ctx.cwd,
+						dest,
+						`${resolved.model.provider}/${resolved.model.id}`,
+					);
+				} else {
+					// Decline (or dialog dismissed without a choice).
 					deniedConsents.add(key);
 					ctx.ui.notify(
 						"next-prompt: cross-provider suggestion declined",
@@ -1754,11 +1851,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					);
 					return;
 				}
-				grantConsent(
-					ctx.cwd,
-					dest,
-					`${resolved.model.provider}/${resolved.model.id}`,
-				);
 			}
 		}
 
