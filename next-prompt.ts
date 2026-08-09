@@ -648,9 +648,7 @@ export function pairAllowed(
 	if (!pairs || pairs.length === 0 || !from || !to) return false;
 	const f = from.toLowerCase();
 	const t = to.toLowerCase();
-	return pairs.some(
-		([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t,
-	);
+	return pairs.some(([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t);
 }
 
 /** Persist a consent grant atomically (best effort; never throws). */
@@ -1792,7 +1790,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 						"Decline",
 					]);
 				} else {
-					const granted = await ctx.ui.confirm(title, `${detail} Allow for this project?`);
+					const granted = await ctx.ui.confirm(
+						title,
+						`${detail} Allow for this project?`,
+					);
 					choice = granted ? "once" : "decline";
 				}
 				// F-08: the dialog may resolve AFTER an interaction, reset, or
@@ -1827,12 +1828,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					if (updated.saved) {
 						ctx.ui.notify(
 							`next-prompt: always allow ${fromProvider} → ${toProvider} saved to global config`,
-						"info",
+							"info",
 						);
 					} else {
 						ctx.ui.notify(
 							"next-prompt: failed to save provider pair in global config (consent kept for this project)",
-						"warning",
+							"warning",
 						);
 					}
 				} else if (choice === "once") {

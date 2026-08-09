@@ -337,7 +337,8 @@ describe("destination identity", () => {
 	});
 
 	test("P1: pairAllowed matches directionally, case-insensitively, and never the reverse", () => {
-		const { pairAllowed } = require("./next-prompt.ts") as typeof import("./next-prompt.ts");
+		const { pairAllowed } =
+			require("./next-prompt.ts") as typeof import("./next-prompt.ts");
 		const pairs: Array<[string, string]> = [["openai", "anthropic"]];
 		expect(pairAllowed(pairs, "openai", "anthropic")).toBe(true);
 		// Case-insensitive on both sides.
@@ -1667,10 +1668,7 @@ function makeFake(opts: {
 		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
 	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
-	selectResult?:
-		| string
-		| Promise<string>
-		| (() => string | Promise<string>);
+	selectResult?: string | Promise<string> | (() => string | Promise<string>);
 	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
 	selectUnavailable?: boolean;
 }): {
@@ -1790,7 +1788,7 @@ function makeFake(opts: {
 									: (opts.selectResult ?? "once");
 							return typeof result === "string" ? result : await result;
 						},
-				  }),
+					}),
 			confirm: async (title: string) => {
 				calls.confirms.push(title);
 				opts.confirmCall?.();
@@ -2766,102 +2764,102 @@ describe("non-TUI mode", () => {
 // ---------------------------------------------------------------------------
 
 describe("cross-destination consent", () => {
-async function setupCross(
-opts: {
-confirmResult?:
-| boolean
-| Promise<boolean>
-| (() => boolean | Promise<boolean>);
-selectResult?:
-| string
-| Promise<string>
-| (() => string | Promise<string>);
-selectUnavailable?: boolean;
-baseUrl?: string;
-} = {},
-) {
-const { fake } = await setup({
-branch: [assistantEntry("a")],
-model: {
-provider: "openai",
-id: "gpt",
-baseUrl: opts.baseUrl,
-},
-findModel: (p, m) =>
-p === "anthropic" && m === "haiku"
-? { provider: "anthropic", id: "haiku", baseUrl: opts.baseUrl }
-: undefined,
-...opts,
-});
-writeFile(
-process.env.PI_CODING_AGENT_DIR!,
-"next-prompt.json",
-JSON.stringify({
-model: { provider: "anthropic", model: "haiku" },
-allowCrossProvider: true,
-}),
-);
-await fake.handlers.get("session_start")!({}, fake.ctx);
-return { fake };
-}
+	async function setupCross(
+		opts: {
+			confirmResult?:
+				| boolean
+				| Promise<boolean>
+				| (() => boolean | Promise<boolean>);
+			selectResult?:
+				| string
+				| Promise<string>
+				| (() => string | Promise<string>);
+			selectUnavailable?: boolean;
+			baseUrl?: string;
+		} = {},
+	) {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: {
+				provider: "openai",
+				id: "gpt",
+				baseUrl: opts.baseUrl,
+			},
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku"
+					? { provider: "anthropic", id: "haiku", baseUrl: opts.baseUrl }
+					: undefined,
+			...opts,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		return { fake };
+	}
 
-function consentsOnDisk(): unknown[] {
-const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`;
-try {
-return JSON.parse(readFileSync(path, "utf-8")) as unknown[];
-} catch {
-return [];
-}
-}
+	function consentsOnDisk(): unknown[] {
+		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`;
+		try {
+			return JSON.parse(readFileSync(path, "utf-8")) as unknown[];
+		} catch {
+			return [];
+		}
+	}
 
-function globalConfigOnDisk(): Record<string, unknown> {
-const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`;
-try {
-return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
-} catch {
-return {};
-}
-}
+	function globalConfigOnDisk(): Record<string, unknown> {
+		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`;
+		try {
+			return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+		} catch {
+			return {};
+		}
+	}
 
-test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
-const { fake } = await setupCross();
-await fake.handlers.get("agent_settled")!({}, fake.ctx);
-expect(fake.calls.selects).toHaveLength(1);
-// The dialog offers the three choices, always-allow second.
-expect(fake.calls.selects[0]![1].join("|")).toContain(
-"Always allow for this provider pair",
-);
-expect(fake.calls.complete[0]!.model).toEqual({
-provider: "anthropic",
-id: "haiku",
-});
-expect(consentsOnDisk()).toHaveLength(1);
-});
+	test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
+		const { fake } = await setupCross();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		// The dialog offers the three choices, always-allow second.
+		expect(fake.calls.selects[0]![1].join("|")).toContain(
+			"Always allow for this provider pair",
+		);
+		expect(fake.calls.complete[0]!.model).toEqual({
+			provider: "anthropic",
+			id: "haiku",
+		});
+		expect(consentsOnDisk()).toHaveLength(1);
+	});
 
-test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
-const { fake } = await setupCross({ selectResult: "decline" });
-await fake.handlers.get("agent_settled")!({}, fake.ctx);
-expect(fake.calls.complete).toHaveLength(0);
-expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
-true,
-);
-// Session denial: settling again must not re-prompt nor send.
-await fake.handlers.get("agent_settled")!({}, fake.ctx);
-expect(fake.calls.selects).toHaveLength(1);
-expect(fake.calls.complete).toHaveLength(0);
-});
+	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
+		const { fake } = await setupCross({ selectResult: "decline" });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
+			true,
+		);
+		// Session denial: settling again must not re-prompt nor send.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
 
-test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
-const { fake } = await setupCross();
-await fake.handlers.get("agent_settled")!({}, fake.ctx);
-expect(fake.calls.complete).toHaveLength(1);
-expect(consentsOnDisk()).toHaveLength(1);
-// New session: consent persisted per project+destination.
-const { fake: fake2 } = await setupCross();
-await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-expect(fake2.calls.selects).toHaveLength(0);
-expect(fake2.calls.complete).toHaveLength(1);
-});
+	test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
+		const { fake } = await setupCross();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(consentsOnDisk()).toHaveLength(1);
+		// New session: consent persisted per project+destination.
+		const { fake: fake2 } = await setupCross();
+		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
+		expect(fake2.calls.selects).toHaveLength(0);
+		expect(fake2.calls.complete).toHaveLength(1);
+	});
 
 	test("C4: same origin + DIFFERENT model route re-prompts (F-02/F-10)", async () => {
 		// Active gateway/openai, configured gateway/claude — same endpoint.
