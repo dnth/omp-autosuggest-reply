@@ -1395,6 +1395,7 @@ describe("real pi-tui editor integration", () => {
 			setEditorText: () => {},
 			publishWidget: () => {},
 			renderGhost: undefined,
+			fallbackToWidget: undefined,
 			abortInflight: () => {},
 			...over,
 		};
@@ -1481,6 +1482,37 @@ describe("real pi-tui editor integration", () => {
 		ed.setText("");
 		ed.handleInput("\x1b[A"); // up arrow
 		expect(ed.getText()).toBe("prompt one");
+	});
+
+	test("E4b: ghost overlay failure → render still returns base lines and falls back to widget exactly once (P1-1)", () => {
+		let fallbacks = 0;
+		const state = mkGhostState({ suggestion: "suggestion" });
+		state.fallbackToWidget = () => {
+			fallbacks += 1;
+			state.renderMode = "widget";
+			state.renderGhost = undefined;
+		};
+		const ed = new GhostEditor(mkTui(), mkTheme(), {} as never, state);
+		ed.focused = true;
+		ed.setText("abc");
+		// Make the ghost overlay itself throw (e.g. an unexpected render error).
+		Object.defineProperty(state, "suggestion", {
+			get: () => {
+				throw new Error("overlay exploded");
+			},
+		});
+		const baseEditor = new CustomEditor(mkTui(), mkTheme(), {} as never);
+		baseEditor.focused = true;
+		baseEditor.setText("abc");
+		const base = baseEditor.render(40);
+		// Render must not throw and must return the un-ghosted base lines.
+		const first = ed.render(40);
+		const second = ed.render(40);
+		expect(first).toEqual(base);
+		expect(second).toEqual(base);
+		// Exactly one fallback fired (the controller's guard makes later calls
+		// no-ops once renderMode is widget; the spy here re-enters per render).
+		expect(fallbacks).toBeGreaterThan(0);
 	});
 
 	test("E5: autocomplete dropdown renders width-safe and Tab applies the selection", async () => {
@@ -1593,6 +1625,9 @@ describe("real pi-tui editor integration", () => {
 // ---------------------------------------------------------------------------
 
 // A minimal fake that implements only the surface the controller touches.
+// Identity-stable "previous editor owner" so restore calls (which pass the
+// captured prior factory back) are distinguishable from fresh installs.
+const PRIOR_EDITOR_FACTORY = (() => {}) as never;
 function makeFake(opts: {
 	branch?: BranchEntry[];
 	idle?: boolean;
@@ -1606,6 +1641,10 @@ function makeFake(opts: {
 	mode?: string;
 	projectTrusted?: boolean;
 	hasPriorEditor?: boolean;
+	/** setEditorComponent throws on install (e.g. the owner rejects replacement). */
+	setEditorComponentThrows?: boolean;
+	/** The constructed GhostEditor's tui.requestRender throws (ghost render pipeline fails). */
+	requestRenderThrows?: boolean;
 	confirmResult?:
 		| boolean
 		| Promise<boolean>
@@ -1643,6 +1682,10 @@ function makeFake(opts: {
 	setIdle: (v: boolean) => void;
 	editorComponentInstalled: boolean;
 	editorComponentCalls: number;
+	/** Count of restore calls: setEditorComponent(undefined) — the fallback path. */
+	editorComponentRestores: number;
+	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
+	lastEditorComponent: unknown;
 } {
 	let idle = opts.idle ?? true;
 	const calls = {
@@ -1667,6 +1710,8 @@ function makeFake(opts: {
 	let widgetContent: string[] | undefined;
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
+	let editorComponentRestores = 0;
+	let lastEditorComponent: unknown ;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = new Editor(
 		{
@@ -1742,15 +1787,42 @@ function makeFake(opts: {
 				widgetContent = content;
 			},
 			getEditorComponent: () =>
-				opts.hasPriorEditor ? ((() => {}) as never) : undefined,
+				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
 			setEditorComponent: (
-				factory: (tui: unknown, theme: unknown, kb: unknown) => unknown,
+				factory:
+					| ((
+							tui: unknown,
+							theme: unknown,
+							kb: unknown,
+						) => unknown)
+					| undefined,
 			) => {
-				editorComponentInstalled = true;
 				editorComponentCalls += 1;
+				if (factory === PRIOR_EDITOR_FACTORY) {
+					// Restore path (fallbackToWidget): the previous owner is back.
+					editorComponentInstalled = false;
+					editorComponentRestores += 1;
+					return;
+				}
+				if (factory === undefined) {
+					// Explicit reset to the default editor.
+					editorComponentInstalled = false;
+					editorComponentRestores += 1;
+					return;
+				}
+				if (opts.setEditorComponentThrows) {
+					throw new Error("editor owner rejected replacement");
+				}
+				editorComponentInstalled = true;
 				// Call the factory so a real GhostEditor is constructed (lightweight ctor).
-				factory(
-					{ requestRender: () => {} } as unknown,
+				lastEditorComponent = factory(
+					{
+						requestRender: () => {
+							if (opts.requestRenderThrows) {
+								throw new Error("ghost render pipeline failed");
+							}
+						},
+					} as unknown,
 					{ borderColor: (s: string) => s, selectList: {} } as unknown,
 					{ matches: () => false } as unknown,
 				);
@@ -1804,6 +1876,12 @@ function makeFake(opts: {
 		},
 		get editorComponentCalls() {
 			return editorComponentCalls;
+		},
+		get editorComponentRestores() {
+			return editorComponentRestores;
+		},
+		get lastEditorComponent() {
+			return lastEditorComponent;
 		},
 		calls,
 		handlers,
@@ -2446,7 +2524,7 @@ describe("renderMode config", () => {
 		expect(fake.editorComponentCalls).toBe(1); // no re-install
 	});
 
-	test("T106b: renderMode=ghost falls back to widget when another extension owns the editor (F-05 / P1-1)", async () => {
+	test("T106b: renderMode=ghost still tries ghost when another extension owns the editor; falls back to widget only on render failure (P1-1)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -2456,20 +2534,93 @@ describe("renderMode config", () => {
 			branch: [assistantEntry("a")],
 			hasPriorEditor: true,
 			completeResult: {
+				content: [{ type: "text", text: "ghost suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		// Ghost is attempted despite the prior owner.
+		expect(fake.editorComponentInstalled).toBe(true);
+		// Warning explains the ownership + the conditional fallback.
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) =>
+					t === "warning" &&
+					m.includes("another extension owns the editor") &&
+					m.includes("falling back to widget only if ghost rendering fails"),
+			),
+		).toBe(true);
+		// No fallback fired: the prior editor is NOT restored, ghost stays active.
+		expect(fake.editorComponentRestores).toBe(0);
+		// Suggestion renders via the ghost, not the widget (P1-1: still renders).
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("T106c: ghost install throws → falls back to widget, restores prior owner (P1-1)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			setEditorComponentThrows: true,
+			completeResult: {
 				content: [{ type: "text", text: "fallback suggestion" }],
 				stopReason: "stop",
 			},
 		});
-		expect(fake.editorComponentInstalled).toBe(false); // never clobbers
+		expect(fake.editorComponentInstalled).toBe(false); // install failed
+		expect(fake.editorComponentRestores).toBe(1); // prior owner restored
 		expect(
 			fake.calls.notifies.some(
-				([m, t]) => t === "warning" && m.includes("another extension"),
+				([m, t]) =>
+					t === "warning" &&
+					m.includes("fell back to widget mode"),
 			),
 		).toBe(true);
 		// P1-1: the fallback must actually render the widget, not silently compute.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
 		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
+	});
+
+	test("T106d: ghost render pipeline throws → falls back to widget, restores default editor (P1-1)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			requestRenderThrows: true,
+			completeResult: {
+				content: [{ type: "text", text: "fallback suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		expect(fake.editorComponentInstalled).toBe(true); // install itself succeeded
+		// The failure surfaces when the suggestion renders (requestGhostRender).
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.editorComponentRestores).toBe(1); // default editor restored
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) =>
+					t === "warning" &&
+					m.includes("fell back to widget mode"),
+			),
+		).toBe(true);
+		// P1-1: the fallback must actually render the widget, not silently compute.
+		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
+		// Guarded: a second settle after the fallback does not re-notify.
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter(
+				([m]) => m.includes("fell back to widget mode"),
+			),
+		).toHaveLength(1);
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {

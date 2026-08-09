@@ -55,8 +55,9 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Run `/reload`, `/new`, `/resume`, `/fork`, and `/clone`; acceptance and
   rendering continue without duplicate listeners or double-installed editors
   (no double ghost/widgets, no doubled accept key).
-- [ ] Run alongside another custom-editor extension; both behaviors remain
-  available or next-prompt falls back to widget mode with a clear warning.
+- [ ] Run alongside another custom-editor extension: next-prompt warns, still
+  tries ghost mode, and only falls back to widget mode if ghost rendering
+  actually fails (prior owner restored, suggestion still appears below the box).
 
 ## Model / lifecycle error paths
 
