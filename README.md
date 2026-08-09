@@ -121,6 +121,7 @@ key**; the nested `model` block is replaced wholesale, not merged):
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
+| `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
 
 ### Why `alt+/` is the default accept key
 
@@ -150,10 +151,16 @@ Cross-destination disclosure is **opt-in and fail-closed**:
 different destination is never used; the extension silently falls back to the
 active model (and, when there is no active model, computes nothing).
 - With `true`, the first time a different destination would receive the transcript,
-pi shows a confirmation naming the destination and the transcript size. Consent is
-persisted per project + destination (provider + endpoint + model route) in
-`~/.pi/agent/next-prompt-consent.json` (a 0600 file outside the repository);
-declining blocks that destination for the rest of the session without re-prompting.
+pi shows a dialog naming the destination and the transcript size, with three
+choices: **Allow once (this project)**, **Always allow for this provider pair**, and
+**Decline**. "Allow once" persists consent per project + destination (provider +
+endpoint + model route) in `~/.pi/agent/next-prompt-consent.json` (a 0600 file
+outside the repository); declining blocks that destination for the rest of the
+session without re-prompting. "Always allow" additionally saves the directional
+provider pair (`[active provider, suggestion provider]`) to the global config
+(`~/.pi/agent/next-prompt.json`, via the same atomic 0600 write), so that exact
+direction never prompts again in any project — the per-destination consent record
+is kept too, so the dialog also stays silent when the config write is refused.
 - Consent is keyed by the full destination identity: changing the endpoint **or**
 the model route invalidates a stored grant and prompts again. Records written by
 older versions (without a model route) never match and also re-prompt — fail closed.
