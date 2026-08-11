@@ -1781,14 +1781,32 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
 				// Prefer the 3-option selector (allow once / always allow this
 				// provider pair / decline); fall back to a plain confirm dialog
-				// when the UI does not offer select.
+				// when the UI does not offer select. The selector returns the
+				// selected label, not an internal choice id.
+				const allowOnceLabel = "Allow once (this project)";
+				const alwaysAllowLabel = "Always allow for this provider pair";
+				const declineLabel = "Decline";
 				let choice: string | undefined;
 				if (ctx.ui.select) {
-					choice = await ctx.ui.select(title, [
-						"Allow once (this project)",
-						"Always allow for this provider pair",
-						"Decline",
+					const selected = await ctx.ui.select(title, [
+						allowOnceLabel,
+						alwaysAllowLabel,
+						declineLabel,
 					]);
+					switch (selected) {
+						case allowOnceLabel:
+							choice = "once";
+							break;
+						case alwaysAllowLabel:
+							choice = "always";
+							break;
+						case declineLabel:
+							choice = "decline";
+							break;
+						default:
+							// Keep symbolic values accepted by older callers/tests.
+							choice = selected;
+					}
 				} else {
 					const granted = await ctx.ui.confirm(
 						title,
