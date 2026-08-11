@@ -8,8 +8,10 @@
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
- * OMP runs `widget` fully; until OMP exposes a public editor-owner getter,
- * `ghost`/`both` safely downgrade to widget (one warning per session).
+ * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
+ * failure there restores the default editor (Pi restores the captured prior
+ * owner), and another custom-editor extension installed first in the same OMP
+ * session is not detected (last installer wins).
  *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
@@ -1246,6 +1248,37 @@ const DIM_START = "\x1b[2m";
 const DIM_END = "\x1b[22m";
 const CURSOR_BLOCK_END = "\x1b[0m"; // ends the \x1b[7m... reverse-video cursor
 
+/**
+ * Skip the editor's cursor representation starting at `i` (the position just
+ * past the CURSOR_MARKER): any ANSI sequences, then one visible code point.
+ * Pi renders the cursor as a `\x1b[7m…\x1b[0m` reverse-video block (located
+ * via CURSOR_BLOCK_END); OMP renders a plain theme glyph (`marker + glyph`,
+ * no trailing reset), so this fallback finds the insertion point after that
+ * glyph so the ghost lands between the cursor and any trailing text.
+ */
+function skipCursorRepresentation(line: string, i: number): number {
+	const n = line.length;
+	let j = i;
+	// Consume leading ANSI sequences (no visible width).
+	while (j < n) {
+		const c = line[j]!;
+		if (c === "\x1b") {
+			if (line[j + 1] === "[") {
+				// CSI: consume through the final byte (0x40..0x7E).
+				let k = j + 2;
+				while (k < n && (line.charCodeAt(k) < 0x40 || line.charCodeAt(k) > 0x7e)) k += 1;
+				j = Math.min(n, k + 1);
+				continue;
+			}
+			j = Math.min(n, j + 2); // ESC + one byte
+			continue;
+		}
+		break;
+	}
+	const next = Array.from(line.slice(j))[0];
+	return next ? j + next.length : j;
+}
+
 export function overlayGhost(
 	lines: string[],
 	ghost: string,
@@ -1296,27 +1329,26 @@ export function overlayGhost(
 
 	const line = result[cursorLineIdx]!;
 
-	// The cursor block is: <before><CURSOR_MARKER>\x1b[7m<grapheme or space>\x1b[0m<rest>
-	// Locate the first \x1b[0m after the CURSOR_MARKER to find the end of the cursor block.
+	// The cursor is: <before><CURSOR_MARKER><cursor block or glyph><rest>
+	// Locate the insertion point: Pi's reverse-video cursor block ends at the
+	// first \x1b[0m after the marker; OMP's plain theme glyph has no block, so
+	// skip one glyph after the marker instead.
 	const markerIdx = line.indexOf(CURSOR_MARKER);
 	if (markerIdx === -1) return lines; // defensive (already checked)
 	const cursorBlockEnd = line.indexOf(
 		CURSOR_BLOCK_END,
 		markerIdx + CURSOR_MARKER.length,
 	);
-	if (cursorBlockEnd === -1) return lines; // unexpected structure; leave unchanged
-	const insertAt = cursorBlockEnd + CURSOR_BLOCK_END.length;
+	const insertAt =
+		cursorBlockEnd !== -1
+			? cursorBlockEnd + CURSOR_BLOCK_END.length
+			: skipCursorRepresentation(line, markerIdx + CURSOR_MARKER.length);
 
-	// Compute the visible width of the line content (excluding ANSI + the marker) so we
-	// can size the ghost to fit within the editor content width without overflowing the
-	// border.
+	// Compute the visible width of the real content before the cursor (text +
+	// cursor glyph; ANSI and the marker stripped) so the ghost is sized to fit
+	// without overflowing the editor width.
 	const leftPart = line.slice(0, insertAt);
-	const trailingPart = line.slice(insertAt);
-	// Strip trailing whitespace (the padding the base editor appends) to measure real width.
-	const trailingTrimmed = trailingPart.replace(/\s+$/, "");
-	const leftVisible = visibleWidth(
-		stripAnsi(leftPart) + stripAnsi(trailingTrimmed),
-	);
+	const leftVisible = visibleWidth(stripAnsi(leftPart));
 	const remaining = Math.max(0, contentWidth - leftVisible);
 
 	const ghostSlice =
@@ -1326,14 +1358,21 @@ export function overlayGhost(
 	if (!ghostSlice) return lines; // nothing fits
 
 	const ghostStyled = `${DIM_START}${ghostSlice}${DIM_END}`;
-	const newLine =
-		leftPart +
-		ghostStyled +
-		trailingTrimmed +
-		" ".repeat(
-			Math.max(0, contentWidth - leftVisible - visibleWidth(ghostSlice)),
-		);
-	result[cursorLineIdx] = newLine;
+	const ghostVisible = visibleWidth(ghostSlice);
+	// Preserve the line's exact width: remove ghostVisible cells from the
+	// padding adjacent to the cursor. Pi pads at the line end (`rest<pad>`);
+	// OMP pads right after the cursor, before the right border (`<pad>─╯`).
+	let tail = line.slice(insertAt);
+	const leadingPad = tail.match(/^\s+/)?.[0].length ?? 0;
+	if (leadingPad > 0) {
+		tail = tail.slice(Math.min(leadingPad, ghostVisible));
+	} else {
+		const trailingPad = tail.match(/\s+$/)?.[0].length ?? 0;
+		if (trailingPad > 0) {
+			tail = tail.slice(0, Math.max(0, tail.length - Math.min(trailingPad, ghostVisible)));
+		}
+	}
+	result[cursorLineIdx] = leftPart + ghostStyled + tail;
 	return result;
 }
 
@@ -1474,20 +1513,38 @@ function clearRearmCheckTimer(state: SuggestionState): void {
  * After a delete-to-empty transition, re-arm the last suggestion after
  * rearmDelayMs (no new model call). Only a genuine non-empty -> empty
  * transition arms the timers (F-09); dismissal via Escape/arrows/focus never
- * does. The 50ms outer timer defers until the editor has processed the key.
+ * does. The 50ms outer check defers until the editor has processed the key,
+ * and re-polls for a bounded window (REARM_CHECK_POLLS) so a slow or
+ * chunked delete that has not finished emptying the editor at the first
+ * check still arms once it does — a one-shot check silently dropped the
+ * re-arm whenever the editor lagged past 50ms (observed on OMP with chunked
+ * terminal input).
  */
+const REARM_CHECK_INTERVAL_MS = 50;
+const REARM_CHECK_POLLS = 12; // ~600ms window for the editor to settle empty
+
 function scheduleRearmCheck(
 	state: SuggestionState,
 	editorTextBefore: string,
+	pollsLeft: number = REARM_CHECK_POLLS,
 ): void {
-	clearRearmCheckTimer(state);
 	if (editorTextBefore.length === 0) return; // nothing to delete from
+	clearRearmCheckTimer(state);
+	if (pollsLeft <= 0) return; // delete never settled empty; next key re-arms
 	state.rearmCheckTimer = setTimeout(() => {
 		state.rearmCheckTimer = undefined;
 		if (state.suggestion) return; // already showing
 		if (!state.lastSuggestion) return; // nothing to re-arm with
 		if (!state.isIdleGetter()) return; // agent running
-		if (state.getEditorText().length > 0) return; // not empty
+		const editorLen = state.getEditorText().length;
+		if (editorLen > 0) {
+			// Still deleting (or the editor is processing chunked input):
+			// re-check shortly; only a sustained non-empty state (the user is
+			// typing something new) stops the re-arm, and the next keystroke
+			// re-schedules anyway.
+			scheduleRearmCheck(state, state.getEditorText(), pollsLeft - 1);
+			return;
+		}
 		clearRearmTimer(state);
 		state.rearmTimer = setTimeout(() => {
 			state.rearmTimer = undefined;
@@ -1501,7 +1558,7 @@ function scheduleRearmCheck(
 				true,
 			);
 		}, state.rearmDelayMs);
-	}, 50);
+	}, REARM_CHECK_INTERVAL_MS);
 }
 
 function isConsentDialogKey(data: string): boolean {
@@ -1594,6 +1651,12 @@ class GhostEditor extends CustomEditor {
 		state: SuggestionState,
 	) {
 		super(tui, theme, keybindings);
+		// Capture the host TUI directly. Pi's CustomEditor sets `this.tui` in
+		// its own constructor; OMP's CustomEditor captures it only via an
+		// `instanceof` probe that can miss depending on module identity —
+		// without it, requestGhostRender silently no-ops and the ghost never
+		// repaints after a re-arm.
+		this.tui = tui;
 		this.suggestionState = state;
 	}
 
@@ -1825,8 +1888,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const deniedConsents = new Set<string>();
 	let consentDialogOpen = false;
 	let editorInstalled = false;
-	// OMP ghost/both downgrade notice: exactly one warning per session.
-	let ompDowngradeNotified = false;
+	// Tracks a custom-editor install that OMP must reset itself (it has no
+	// host-side extension-UI teardown like Pi's resetExtensionUI).
+	let editorInstalledForHost = false;
 
 	// Boundary: register lifecycle events and the config command through a
 	// structural API view so the host-specific event names typecheck under
@@ -1858,7 +1922,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput = undefined;
 		notifiedFallback.value = false;
 		editorInstalled = false;
-		ompDowngradeNotified = false;
 		deniedConsents.clear();
 
 		// F-03: no interactive UI => no invisible suggestion work in headless
@@ -1867,6 +1930,19 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			ref.state = undefined;
 			effective = undefined;
 			return;
+		}
+
+		// OMP has no host-side extension-editor reset on session teardown (Pi
+		// clears extension UI on reset), so a GhostEditor we installed in a
+		// previous session would outlive it with a dead suggestion state.
+		// Restore the default editor before the new session's setup.
+		if (host === "omp" && editorInstalledForHost) {
+			try {
+				ctx.ui.setEditorComponent?.(undefined);
+			} catch {
+				// Best effort; a stale editor only affects rendering.
+			}
+			editorInstalledForHost = false;
 		}
 
 		// F-02: trust-gated, validated config with policy floors applied. OMP
@@ -1890,26 +1966,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// (P1-1): only when the ghost actually fails to render do we restore the
 		// prior owner and switch to widget mode. The prior factory is captured
 		// before installation so the fallback can restore it.
-		const configuredRenderMode: RenderMode =
-			effective.renderMode ?? "widget";
-		// OMP has no getEditorComponent(): it cannot capture and restore a
-		// prior editor owner, so `ghost`/`both` safely downgrade to the
-		// below-editor widget for this session (saved config is untouched, and
-		// no editor getter/setter is ever called on OMP).
-		const renderMode: RenderMode =
-			host === "omp" &&
-			(configuredRenderMode === "ghost" || configuredRenderMode === "both")
-				? "widget"
-				: configuredRenderMode;
-		if (host === "omp" && renderMode !== configuredRenderMode) {
-			if (!ompDowngradeNotified) {
-				ompDowngradeNotified = true;
-				ctx.ui.notify(
-					"next-prompt: OMP cannot safely preserve the active editor owner; ghost/both mode is shown as the below-editor widget",
-					"warning",
-				);
-			}
-		}
+		const renderMode: RenderMode = effective.renderMode ?? "widget";
 
 		const state: SuggestionState = {
 			suggestion: "",
@@ -1937,6 +1994,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
+			// OMP has no getEditorComponent(): `prior` stays undefined there,
+			// so a fallback restores the DEFAULT editor (setEditorComponent
+			// with no factory) rather than a captured prior owner.
 			const prior = ctx.ui.getEditorComponent?.();
 			// P1-1: permanent, guarded fallback. First call wins; once we are in
 			// widget mode there is nothing left to fall back to, so later calls
@@ -1946,10 +2006,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				state.renderMode = "widget";
 				state.renderGhost = undefined;
 				editorInstalled = false;
+				editorInstalledForHost = false;
 				// Restore the previous owner (or the default editor) so the other
 				// extension's surface is not left half-replaced. `prior` is an
 				// opaque factory captured at the boundary and handed back
-				// verbatim.
+				// verbatim; on OMP it is undefined and the default editor is
+				// restored.
 				try {
 					ctx.ui.setEditorComponent?.(prior as never);
 				} catch {
@@ -1975,6 +2037,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					return ed;
 				});
 				editorInstalled = true;
+				editorInstalledForHost = true;
 				if (prior) {
 					ctx.ui.notify(
 						"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",

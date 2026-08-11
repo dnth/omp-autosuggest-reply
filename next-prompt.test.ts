@@ -1373,6 +1373,22 @@ describe("overlayGhost", () => {
 		expect(out[1]!).toContain("\x1b[2m");
 		expect(out[1]!).toContain("\x1b[22m");
 	});
+	test("T64b: OMP-style cursor (marker + plain glyph, no reverse-video block) still overlays after the cursor (dual-host)", () => {
+		// OMP's focused editor renders `<marker><theme glyph>` without the
+		// \x1b[7m…\x1b[0m block Pi uses; the ghost must be inserted after the
+		// glyph, not dropped.
+		const border = "─".repeat(WIDTH);
+		const cursorGlyph = "\u258c"; // theme.symbols.inputCursor style glyph
+		const line = "hi" + CURSOR_MARKER + cursorGlyph + " ".repeat(WIDTH - 3);
+		const lines = [border, line, border];
+		const out = overlayGhost(lines, "sug", WIDTH);
+		const cursorLine = out[1]!;
+		expect(cursorLine).toContain("\x1b[2msug\x1b[22m");
+		expect(cursorLine.indexOf(cursorGlyph)).toBeLessThan(
+			cursorLine.indexOf("\x1b[2msug"),
+		);
+		expect(cursorLine).toContain(CURSOR_MARKER);
+	});
 	test("T65: does not mutate the input lines array", () => {
 		const lines = makeLines({ text: "hi" });
 		const snapshot = lines.slice();
@@ -2015,6 +2031,8 @@ function makeOmpFake(opts: {
 	/** Hook invoked while the consent selector is open. */
 	selectCall?: () => void;
 	selectUnavailable?: boolean;
+	/** The constructed GhostEditor's tui.requestRender throws (ghost render pipeline fails). */
+	requestRenderThrows?: boolean;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	ctx: unknown;
@@ -2045,9 +2063,17 @@ function makeOmpFake(opts: {
 	setIdle: (v: boolean) => void;
 	/** Number of times the OMP completion-module loader was invoked. */
 	loaderCalls: number;
+	/** Whether the ghost editor was installed via setEditorComponent. */
+	editorComponentInstalled: boolean;
+	editorComponentCalls: number;
+	/** Count of setEditorComponent(undefined) calls (default-editor restore). */
+	editorComponentRestores: number;
 } {
 	let idle = opts.idle ?? true;
 	let loaderCalls = 0;
+	let editorComponentInstalled = false;
+	let editorComponentCalls = 0;
+	let editorComponentRestores = 0;
 	const calls = {
 		ompComplete: [] as Array<{
 			model: unknown;
@@ -2167,7 +2193,32 @@ function makeOmpFake(opts: {
 			) => {
 				widgetContent = content;
 			},
-			// deliberately no getEditorComponent / setEditorComponent
+			// OMP shape: setEditorComponent exists, getEditorComponent does not.
+			setEditorComponent: (
+				factory:
+					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
+					| undefined,
+			) => {
+				editorComponentCalls += 1;
+				if (factory === undefined) {
+					// Restore the default editor (fallback / session reset).
+					editorComponentInstalled = false;
+					editorComponentRestores += 1;
+					return;
+				}
+				editorComponentInstalled = true;
+				factory(
+					{
+						requestRender: () => {
+							if (opts.requestRenderThrows) {
+								throw new Error("ghost render pipeline failed");
+							}
+						},
+					} as unknown,
+					{ borderColor: (s: string) => s, selectList: {} } as unknown,
+					{ matches: () => false } as unknown,
+				);
+			},
 		},
 		sessionManager: { getBranch: () => opts.branch ?? [] },
 	};
@@ -2221,6 +2272,15 @@ function makeOmpFake(opts: {
 		},
 		get loaderCalls() {
 			return loaderCalls;
+		},
+		get editorComponentInstalled() {
+			return editorComponentInstalled;
+		},
+		get editorComponentCalls() {
+			return editorComponentCalls;
+		},
+		get editorComponentRestores() {
+			return editorComponentRestores;
 		},
 	};
 }
@@ -2735,6 +2795,29 @@ describe("re-arm after delete-to-empty", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
 		// No new model call — the complete call count is unchanged.
 		expect(fake.calls.complete.length).toBe(1);
+	});
+
+	test("T98b: delete that empties the editor LATE (after the first 50ms check) still re-arms via re-poll (chunked/laggy delivery)", async () => {
+		vi.useFakeTimers();
+		writeRearmConfig(60);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "late clear" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/"); // accept → editor = "late clear"
+		// Delete key arrives; the editor text does NOT empty within the first
+		// 50ms check (chunked/laggy terminal delivery), then settles empty.
+		fake.inputHandler!("\x7f");
+		vi.advanceTimersByTime(100); // first check sees non-empty text → re-polls
+		fake.setEditorText(""); // editor finally settles empty
+		vi.advanceTimersByTime(100); // next poll arms the rearm timer
+		vi.advanceTimersByTime(200); // rearmDelayMs (60) fires
+		expect(fake.widgetContent?.[0] ?? "").toContain("late clear");
+		expect(fake.calls.complete).toHaveLength(1); // cached — no new model call
 	});
 
 	test("T99: no last suggestion → nothing to re-arm", async () => {
@@ -3827,9 +3910,10 @@ describe("host compatibility boundary", () => {
 		expect(
 			"getEditorComponent" in (fake.ctx as { ui: object }).ui,
 		).toBe(false);
+		// OMP exposes setEditorComponent (ghost install) but no getter.
 		expect(
 			"setEditorComponent" in (fake.ctx as { ui: object }).ui,
-		).toBe(false);
+		).toBe(true);
 	});
 
 	test("B7: Pi session starts and computes without any OMP-only field", async () => {
@@ -4196,7 +4280,7 @@ describe("OMP render downgrade (widget-only)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("widget suggestion");
 	});
 
-	test("R2: OMP renderMode ghost → widget renders with one downgrade warning, no editor getter/setter", async () => {
+	test("R2: OMP renderMode ghost → GhostEditor installed via setEditorComponent, ghost renders (no widget), no getEditorComponent", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -4205,21 +4289,20 @@ describe("OMP render downgrade (widget-only)", () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleResult: {
-				content: [{ type: "text", text: "ghost downgraded" }],
+				content: [{ type: "text", text: "ghost suggestion" }],
 				stopReason: "stop",
 			},
 		});
 		expect(
-			fake.calls.notifies.filter(
-				([m, t]) =>
-					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
-			),
-		).toHaveLength(1);
+			"getEditorComponent" in (fake.ctx as { ui: object }).ui,
+		).toBe(false);
+		expect(fake.editorComponentInstalled).toBe(true);
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("ghost downgraded");
+		// ghost-only: no below-editor widget published.
+		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("R3: OMP renderMode both → widget renders with one downgrade warning", async () => {
+	test("R3: OMP renderMode both → GhostEditor installed AND the widget renders", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -4228,55 +4311,61 @@ describe("OMP render downgrade (widget-only)", () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			completeSimpleResult: {
-				content: [{ type: "text", text: "both downgraded" }],
+				content: [{ type: "text", text: "both suggestion" }],
 				stopReason: "stop",
 			},
 		});
-		expect(
-			fake.calls.notifies.filter(
-				([m, t]) =>
-					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
-			),
-		).toHaveLength(1);
+		expect(fake.editorComponentInstalled).toBe(true);
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("both downgraded");
+		expect(fake.widgetContent?.[0] ?? "").toContain("both suggestion");
 	});
 
-	test("R4: additional settles after downgrade → no duplicate warning or listener", async () => {
+	test("R4: OMP ghost render failure → one warning, default editor restored, no duplicate warning on later settles", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({ renderMode: "ghost" }),
 		);
-		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			requestRenderThrows: true,
+		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(false);
+		expect(fake.editorComponentRestores).toBe(1); // default editor restored
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
+			),
+		).toHaveLength(1);
+		// Later settles do not re-notify (guarded fallback).
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(
 			fake.calls.notifies.filter(
-				([m, t]) =>
-					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
+				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
 			),
 		).toHaveLength(1);
 		expect(fake.inputListeners).toHaveLength(1);
 	});
 
-	test("R4b: reload after downgrade emits a fresh per-session warning (still once per session)", async () => {
+	test("R4b: OMP reload resets a previous session's ghost editor to default, then re-installs for the new session", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ renderMode: "both" }),
+			JSON.stringify({ renderMode: "ghost" }),
 		);
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		expect(fake.editorComponentInstalled).toBe(true);
+		expect(fake.editorComponentCalls).toBe(1);
 		await fake.handlers.get("session_start")!(
 			{ type: "session_start", reason: "reload" },
 			fake.ctx,
 		);
-		expect(
-			fake.calls.notifies.filter(
-				([m, t]) =>
-					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
-			),
-		).toHaveLength(2); // one per session_start
+		// OMP teardown has no host-side editor reset, so the extension resets
+		// the previous ghost to the default editor, then installs a fresh one.
+		expect(fake.editorComponentRestores).toBe(1);
+		expect(fake.editorComponentCalls).toBe(3); // setup install + reset + reinstall
+		expect(fake.editorComponentInstalled).toBe(true);
 	});
 
 	test("R5: OMP accept key fills the editor exactly once and consumes the raw key", async () => {

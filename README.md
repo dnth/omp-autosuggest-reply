@@ -10,10 +10,11 @@ most logical next instruction you'd type and shows it. Three render modes:
   editor is unfocused, e.g. after switching tabs/apps)
 - **`both`** — inline ghost AND the below-editor widget simultaneously
 
-> **OMP rendering limitation:** OMP supports the `widget` mode fully. Until OMP
-> exposes a public editor-owner getter/restoration API, configured `ghost` and
-> `both` sessions **safely downgrade to widget** on OMP (one warning per
-> session; saved config is untouched).
+> **OMP editor-coexistence note:** `ghost`/`both` work on OMP too. OMP has no
+> public editor-owner getter, so next-prompt cannot detect another custom-editor
+> extension that installed first in the same session — the last installer wins
+> there (Pi captures and can restore the prior owner). If ghost rendering ever
+> fails, the default editor is restored and the mode falls back to widget.
 
 Accept with **`Alt-/`** (default; configurable) to fill the input box. Any other key
 dismisses; backspace down to empty re-arms the last suggestion after a short delay (no
@@ -143,7 +144,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
-| `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` safely run as widget (see the rendering limitation above). |
+| `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/next-prompt-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
@@ -226,15 +227,16 @@ Mitigations:
 1. On `session_start` (interactive mode only — Pi TUI `ctx.mode === "tui"`, OMP
 `ctx.hasUI === true`; headless/RPC/JSON sessions never compute), a global
 `ctx.ui.onTerminalInput` listener is registered to detect the accept key
-**editor-independently**. On Pi, `ghost`/`both` install a render-only
-`GhostEditor` via `setEditorComponent` — never re-installed on settle. If another
-extension already owns the editor, the ghost is **still attempted** (with a
-warning); only if the ghost install or its render pass actually fails does the
-extension restore the prior owner and fall back to widget mode. The host clears
-extension listeners and custom editors when the UI is reset; each fresh
-`session_start` (reload/new/resume/fork) re-registers exactly one listener and
-re-installs the editor once. OMP has no editor-owner getter, so `ghost`/`both`
-run as widget (one warning per session) and no editor getter/setter is ever called.
+**editor-independently**. `ghost`/`both` install a render-only `GhostEditor` via
+`setEditorComponent` — never re-installed on settle. If another extension owns
+the editor on Pi, the ghost is **still attempted** (with a warning); only if the
+ghost install or its render pass actually fails does the extension restore the
+prior owner and fall back to widget mode. On OMP there is no editor-owner getter,
+so a failed ghost restores the **default** editor instead; OMP also has no
+host-side extension-editor teardown, so next-prompt resets its editor to default
+at the next `session_start`. The host clears extension listeners when the UI is
+reset; each fresh `session_start` (reload/new/resume/fork) re-registers exactly
+one listener and re-installs the editor once.
 2. On completion:
    - **Pi:** `agent_settled` (its fully-settled contract) — if the editor is
      empty, the controller calls
@@ -305,8 +307,10 @@ hosts. OMP-specific behavior:
   compute. Pi keeps its `agent_settled` contract.
 - Transport: OMP completes via `completeSimple` + the model registry's auth
   resolver; Pi keeps `modelRegistry.complete`.
-- Rendering: OMP supports `widget`; `ghost`/`both` safely run as widget until OMP
-  exposes a public editor-owner getter/restoration contract.
+- Rendering: OMP supports `widget`, `ghost`, and `both`; because OMP has no
+  editor-owner getter, a ghost failure restores the default editor (Pi restores
+  the captured prior owner) and another custom-editor extension installed first
+  in the same session is not detected.
 - Trust: OMP has no project-trust API; project config follows the loader default
   (global privacy floors and consent are unchanged).
 

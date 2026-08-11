@@ -87,9 +87,11 @@ checks.
   **final** `agent_end` (editor empty, agent idle).
 - [ ] Tool-loop / automatic-retry continuation shows **no** intermediate
   suggestion (only the terminal completion does).
-- [ ] `renderMode: "ghost"` and `renderMode: "both"` each produce exactly one
-  downgrade notice per session and a usable widget suggestion; saved config is
-  unchanged (still `ghost`/`both` after reload).
+- [ ] `renderMode: "ghost"` and `renderMode: "both"` render inline ghost text in
+  the input box after the caret (empty editor), with a usable widget in `both`;
+  accept fills the editor exactly once; delete-to-empty re-arms the last
+  suggestion after `rearmDelayMs` without a second model call; ghost render
+  failure falls back to the default editor + widget.
 - [ ] Widget accept (`Alt-/`) fills the editor exactly once and the raw key is
   consumed; any other key dismisses and passes through; delete-to-empty re-arms
   the cached suggestion without a second model call.
