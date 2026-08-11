@@ -246,7 +246,13 @@ run as widget (one warning per session) and no editor getter/setter is ever call
      produce no suggestion) — the controller lazily imports `completeSimple`
      from the remapped legacy pi-ai module and calls
      `completeSimple(model, { systemPrompt: [prompt], messages }, { apiKey: modelRegistry.resolver(model), signal, reasoning })`.
-     Pi never loads the OMP module; OMP never calls `modelRegistry.complete`.
+     OMP emits the extension `agent_end` **before** the session fully unwinds
+     (`ctx.isIdle()` is still false at handler time), so the terminal event
+     itself is treated as the settle signal on OMP; Pi keeps its
+     `agent_settled` + real-time idle gates. Stale-output protection is
+     identical on both hosts (input-generation bumps, aborts, and render-time
+     guards). Pi never loads the OMP module; OMP never calls
+     `modelRegistry.complete`.
 3. The returned text is sanitized (terminal controls stripped, trimmed, de-quoted,
    de-fenced, collapsed to one line, capped) and shown — via `setWidget`
    (widget/both), via the inline ghost overlay (ghost/both), or both.

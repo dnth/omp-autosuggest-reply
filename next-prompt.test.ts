@@ -3921,11 +3921,11 @@ describe("OMP lifecycle (agent_end)", () => {
 		expect(fake.calls.ompComplete).toHaveLength(0);
 	});
 
-	test("L6: OMP final agent_end while not idle → zero computations", async () => {
+	test("L6: OMP terminal agent_end fires before the session unwinds — ctx.isIdle() is false, but the terminal event IS the settle signal and compute still runs (verified live on OMP 17.2.13)", async () => {
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
-		fake.setIdle(false);
+		fake.setIdle(false); // OMP reports not-idle at extension agent_end time
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.calls.ompComplete).toHaveLength(1);
 	});
 
 	test("L7: second OMP agent_end while first is pending → first aborted, stale cannot render", async () => {
@@ -3935,6 +3935,39 @@ describe("OMP lifecycle (agent_end)", () => {
 		const p2 = handler({}, fake.ctx);
 		await Promise.all([p1, p2]);
 		expect(fake.calls.ompComplete.some((c) => c.signal?.aborted)).toBe(true);
+	});
+
+	test("L6b: OMP compute-path render does NOT require real-time idle (session unwinds after agent_end)", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "still shows" }],
+				stopReason: "stop",
+			},
+		});
+		fake.setIdle(false); // still busy when the (fast) completion resolves
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.widgetContent?.[0] ?? "").toContain("still shows");
+	});
+
+	test("L6c: OMP re-arm path KEEPS the real-time idle gate (user-driven render)", async () => {
+		vi.useFakeTimers();
+		writeRearmConfig(60);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "cached" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/"); // accept into the editor
+		fake.setEditorText("");
+		fake.inputHandler!("\x7f"); // delete-to-empty schedules re-arm
+		fake.setIdle(false); // agent busy when the re-arm timer fires
+		vi.advanceTimersByTime(150);
+		expect(fake.widgetContent).toBeUndefined(); // idle gate held
 	});
 
 	test("L8: input while OMP request pending → abort, nothing renders, no error notify", async () => {

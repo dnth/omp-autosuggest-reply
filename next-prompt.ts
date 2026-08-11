@@ -1402,15 +1402,22 @@ function renderSuggestion(state: SuggestionState): void {
 /**
  * Show a suggestion. Guarded twice: the captured input generation must still
  * match (no intervening user interaction) and the editor must still be empty
- * and the agent idle (no submit/turn since the request started).
+ * (no submit/turn since the request started). The `checkIdle` render gate
+ * applies on Pi (agent_settled + real-time idle); OMP's compute path skips it
+ * because the terminal agent_end fires before the session unwinds — the
+ * generation/abort guards are its stale-result protection. The re-arm path
+ * always keeps the real-time idle gate (user-driven rendering while the agent
+ * is busy must not show).
  */
 function showSuggestion(
 	state: SuggestionState,
 	text: string,
 	generation: number,
+	checkIdle: boolean,
 ): void {
 	if (generation !== state.inputGeneration) return;
-	if (state.getEditorText().length > 0 || !state.isIdleGetter()) return;
+	if (state.getEditorText().length > 0) return;
+	if (checkIdle && !state.isIdleGetter()) return;
 	state.suggestion = text;
 	state.lastSuggestion = text;
 	clearRearmTimer(state);
@@ -1487,7 +1494,12 @@ function scheduleRearmCheck(
 			if (state.suggestion) return;
 			if (!state.isIdleGetter()) return;
 			if (state.getEditorText().length > 0) return;
-			showSuggestion(state, state.lastSuggestion, state.inputGeneration);
+			showSuggestion(
+				state,
+				state.lastSuggestion,
+				state.inputGeneration,
+				true,
+			);
 		}, state.rearmDelayMs);
 	}, 50);
 }
@@ -2009,6 +2021,22 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	 * exist; config remains valid after reload; agent is idle; editor is
 	 * empty; then `maybeCompute` re-checks `shouldTrigger` before any request.
 	 */
+	/**
+	 * Shared settled-turn handling. Guard order:
+	 * interactive context; session state and effective config exist; config
+	 * remains valid after reload; agent is idle (Pi only — see below); editor
+	 * is empty; then `maybeCompute` re-checks `shouldTrigger` before any
+	 * request.
+	 *
+	 * Host difference: Pi's `agent_settled` fires when the agent is fully
+	 * idle, so the idle gate applies. OMP emits the terminal `agent_end`
+	 * BEFORE the session unwinds — `ctx.isIdle()` is still false at handler
+	 * time (verified live on OMP 17.2.13) — so on OMP the terminal event
+	 * itself (after the `willContinue` filter) is the settle signal and the
+	 * idle gate is skipped. Stale-output protection is unchanged: any user
+	 * interaction bumps the input generation and aborts the in-flight
+	 * request, and the render-time guards still apply on Pi.
+	 */
 	async function handleSettled(ctx: HostCtx): Promise<void> {
 		try {
 			if (!isInteractiveContext(ctx)) return;
@@ -2019,7 +2047,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				projectTrusted: projectTrustedForHost(ctx),
 			});
 			if (effective.computeDisabled) return;
-			if (!ctx.isIdle() || ctx.ui.getEditorText().length > 0) return;
+			if (host === "pi" && !ctx.isIdle()) return;
+			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx);
 		} catch (err) {
 			console.warn("next-prompt: settled-turn handler failed", err);
@@ -2056,7 +2085,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (
 			shouldTrigger(
 				ctx.sessionManager.getBranch(),
-				ctx.isIdle(),
+				// Pi: agent_settled is the fully-idle contract. OMP: the
+				// terminal agent_end fires before the session unwinds, so the
+				// host event (already filtered for willContinue) is the settle
+				// signal — the idle check would always fail there.
+				host === "omp" ? true : ctx.isIdle(),
 				ctx.ui.getEditorText(),
 			) !== "compute"
 		) {
@@ -2220,7 +2253,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const clean = sanitizeSuggestion(raw, effective);
-		if (clean && ref.state === state) showSuggestion(state, clean, generation);
+		if (clean && ref.state === state)
+			showSuggestion(state, clean, generation, host === "pi");
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 
