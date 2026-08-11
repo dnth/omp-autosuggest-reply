@@ -30,6 +30,7 @@ import {
 	buildMessages,
 	buildTranscript,
 	configureInteractively,
+	consentChoiceFromLabel,
 	DEFAULT_ACCEPT_KEY,
 	destinationKey,
 	destinationOf,
@@ -351,6 +352,16 @@ describe("destination identity", () => {
 		// Empty/missing pair list never matches.
 		expect(pairAllowed(undefined, "openai", "anthropic")).toBe(false);
 		expect(pairAllowed([], "openai", "anthropic")).toBe(false);
+	});
+
+	test("P2: consent labels tolerate whitespace/ANSI and symbolic values", () => {
+		expect(consentChoiceFromLabel("once")).toBe("once");
+		expect(consentChoiceFromLabel("  Allow once (this project)  ")).toBe("once");
+		expect(
+			consentChoiceFromLabel("\x1b[36mAlways allow for this provider pair\x1b[0m"),
+		).toBe("always");
+		expect(consentChoiceFromLabel(" Decline ")).toBe("decline");
+		expect(consentChoiceFromLabel(undefined)).toBeUndefined();
 	});
 });
 
@@ -2998,6 +3009,17 @@ describe("cross-destination consent", () => {
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.selects).toHaveLength(1);
 		expect(fake.calls.complete).toHaveLength(2);
+	});
+
+	test("C7c: styled/trimmed always-allow label persists the provider pair", async () => {
+		const { fake } = await setupCross({
+			selectResult: "  \x1b[36mAlways allow for this provider pair\x1b[0m  ",
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
+			["openai", "anthropic"],
+		]);
 	});
 
 	test("C8: pair grant is directional — reverse pair does not skip the dialog", async () => {

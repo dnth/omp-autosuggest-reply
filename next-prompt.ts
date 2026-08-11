@@ -651,6 +651,26 @@ export function pairAllowed(
 	return pairs.some(([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t);
 }
 
+/**
+ * Normalize the value returned by the real select dialog. Core pi returns the
+ * option label, but adapters/themes may add whitespace or ANSI styling; older
+ * test callers also used the symbolic values directly.
+ */
+export function consentChoiceFromLabel(
+	selected: unknown,
+): "once" | "always" | "decline" | undefined {
+	if (typeof selected !== "string") return undefined;
+	const normalized = stripAnsi(selected).trim().toLowerCase();
+	if (normalized === "once" || normalized.includes("allow once")) return "once";
+	if (
+		normalized === "always" ||
+		normalized.includes("always allow for this provider pair")
+	)
+		return "always";
+	if (normalized === "decline" || normalized.includes("decline")) return "decline";
+	return undefined;
+}
+
 /** Persist a consent grant atomically (best effort; never throws). */
 export function grantConsent(
 	project: string,
@@ -1793,20 +1813,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 						alwaysAllowLabel,
 						declineLabel,
 					]);
-					switch (selected) {
-						case allowOnceLabel:
-							choice = "once";
-							break;
-						case alwaysAllowLabel:
-							choice = "always";
-							break;
-						case declineLabel:
-							choice = "decline";
-							break;
-						default:
-							// Keep symbolic values accepted by older callers/tests.
-							choice = selected;
-					}
+					choice = consentChoiceFromLabel(selected);
 				} else {
 					const granted = await ctx.ui.confirm(
 						title,
