@@ -7,6 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import {
+	existsSync,
 	mkdtempSync,
 	mkdirSync,
 	readFileSync,
@@ -24,7 +25,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import type { Api } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage } from "@earendil-works/pi-ai";
 
 import {
 	buildMessages,
@@ -34,25 +35,31 @@ import {
 	DEFAULT_ACCEPT_KEY,
 	destinationKey,
 	destinationOf,
+	detectHost,
 	formatModelOption,
 	GhostEditor,
 	humanizeKey,
+	isInteractiveContext,
 	loadConfig,
 	loadEffectiveConfig,
 	matchesAcceptKeyRaw,
 	overlayGhost,
 	parseModelOption,
+	projectTrustedForHost,
 	redactSecrets,
 	resolveSuggestionModel,
 	sanitizeSuggestion,
 	sanitizeTerminalText,
 	saveConfig,
+	setOmpCompletionModuleForTests,
 	shouldTrigger,
 	suggestionCodePointCap,
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
+	type HostKind,
 	type NextPromptConfig,
+	type OmpCompletionModule,
 	type SuggestionCtx,
 	type SuggestionState,
 } from "./next-prompt.ts";
@@ -74,6 +81,8 @@ afterEach(() => {
 	if (origEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = origEnv;
 	rmSync(tmpHome, { recursive: true, force: true });
+	// Never leak an OMP completion-module override across tests.
+	setOmpCompletionModuleForTests(undefined);
 	// F-13: never leak fake timers across tests.
 	vi.useRealTimers();
 });
@@ -1390,6 +1399,28 @@ describe("overlayGhost", () => {
 // TUI so rendering, focus, cursor, undo/history, and autocomplete contracts
 // are exercised against the real implementation, not a callback fake.
 
+/**
+ * Construct a stub-backed pi-tui Editor. Pi's `Editor` constructor is
+ * `(tui, theme)`; OMP's is `(theme)` — the runtime suite runs against Pi while
+ * the OMP typecheck compiles against OMP types, so widen the constructor at
+ * the boundary. Tests only exercise the shared rendering/input surface.
+ */
+function makeStubEditor(): Editor {
+	return new (Editor as unknown as new (...args: unknown[]) => Editor)(
+		{ requestRender: () => {}, terminal: { rows: 24, cols: 80 } },
+		{
+			borderColor: (s: string) => s,
+			selectList: {
+				selectedPrefix: (s: string) => s,
+				selectedText: (s: string) => s,
+				description: (s: string) => s,
+				scrollInfo: (s: string) => s,
+				noMatch: (s: string) => s,
+			},
+		},
+	);
+}
+
 describe("real pi-tui editor integration", () => {
 	const mkTui = () =>
 		({
@@ -1544,20 +1575,22 @@ describe("real pi-tui editor integration", () => {
 	});
 
 	test("E5: autocomplete dropdown renders width-safe and Tab applies the selection", async () => {
-		const ed = new Editor(mkTui(), mkTheme());
+		const ed = makeStubEditor();
 		ed.focused = true;
 		let requested = 0;
+		// Boundary cast: Pi's AutocompleteProvider carries `triggerCharacters`,
+		// OMP's does not; this provider only relies on the shared surface.
 		ed.setAutocompleteProvider({
 			triggerCharacters: ["/"],
 			getSuggestions: async () => {
 				requested += 1;
 				return { items: [{ value: "bar", label: "bar" }], prefix: "/" };
 			},
-			applyCompletion: (lines, cursorLine, _cursorCol) => {
+			applyCompletion: (lines: string[], cursorLine: number, _cursorCol: number) => {
 				lines[cursorLine] = "/bar";
 				return { lines, cursorLine, cursorCol: 4 };
 			},
-		});
+		} as never);
 		ed.handleInput("/");
 		await sleep(200); // debounce + async resolve
 		expect(requested).toBeGreaterThan(0);
@@ -1749,13 +1782,7 @@ function makeFake(opts: {
 	let editorComponentRestores = 0;
 	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
-	const editor = new Editor(
-		{
-			requestRender: () => {},
-			terminal: { rows: 24, cols: 80 },
-		} as unknown as never,
-		{ borderColor: (s: string) => s, selectList: {} } as unknown as never,
-	);
+	const editor = makeStubEditor();
 	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
 	const ctx = {
@@ -1941,6 +1968,268 @@ async function setup(opts: Parameters<typeof makeFake>[0]) {
 	const factory = (await import("./next-prompt.ts")).default;
 	factory(fake.pi);
 	// Trigger session_start so the controller installs the editor and captures it.
+	await fake.handlers.get("session_start")!({}, fake.ctx);
+	return { fake };
+}
+
+// ---------------------------------------------------------------------------
+// OMP-shaped controller fixture
+// ---------------------------------------------------------------------------
+// A distinct fake matching the researched OMP 17.2.12 ExtensionAPI/Context:
+//   - `hasUI` and NO `mode`;
+//   - `agent_end` registered and NO `agent_settled`;
+//   - `modelRegistry.resolver` and NO `modelRegistry.complete`;
+//   - NO `ui.getEditorComponent` / `ui.setEditorComponent`;
+//   - no `isProjectTrusted`.
+// Completion goes through the OMP transport: `completeSimple` read from the
+// lazily loaded completion module (replaced via setOmpCompletionModuleForTests),
+// invoked with `apiKey: modelRegistry.resolver(model)`. Unavailable methods are
+// absent from the fixture, so a regression that reaches for a Pi-only API on
+// OMP throws instead of silently passing.
+
+/** The auth resolver the OMP fake's modelRegistry returns. */
+const OMP_RESOLVER = (async () => "sk-omp-test") as never;
+
+function makeOmpFake(opts: {
+	branch?: BranchEntry[];
+	idle?: boolean;
+	completeSimpleResult?: {
+		content: Array<{ type: "text"; text: string }>;
+		stopReason: string;
+	};
+	completeSimpleError?: Error;
+	/** The loaded module lacks `completeSimple` entirely (C9). */
+	completeSimpleUnavailable?: boolean;
+	/** The completion-module loader itself rejects (import failure). */
+	moduleLoadError?: Error;
+	model?: { provider: string; id: string; baseUrl?: string };
+	findModel?: (p: string, m: string) => unknown;
+	hasUI?: boolean;
+	/** Omit the hasUI key entirely (context with neither host marker — B9). */
+	omitHasUI?: boolean;
+	confirmResult?:
+		| boolean
+		| Promise<boolean>
+		| (() => boolean | Promise<boolean>);
+	selectResult?: string | Promise<string> | (() => string | Promise<string>);
+	/** Hook invoked while the consent selector is open. */
+	selectCall?: () => void;
+	selectUnavailable?: boolean;
+}): {
+	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
+	ctx: unknown;
+	widgetContent: string[] | undefined;
+	editorText: string;
+	setEditorText: (t: string) => void;
+	inputHandler:
+		| ((data: string) => { consume?: boolean } | undefined)
+		| undefined;
+	inputListeners: Array<(data: string) => { consume?: boolean } | undefined>;
+	deliverInput: (data: string) => void;
+	unsubInputCalls: number;
+	editor: import("@earendil-works/pi-tui").Editor;
+	calls: {
+		ompComplete: Array<{
+			model: unknown;
+			systemPrompt?: string | string[];
+			messages: unknown[];
+			apiKey?: unknown;
+			signal?: AbortSignal;
+			reasoning?: unknown;
+		}>;
+		notifies: Array<[string, string]>;
+		confirms: string[];
+		selects: Array<[string, string[]]>;
+	};
+	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
+	setIdle: (v: boolean) => void;
+	/** Number of times the OMP completion-module loader was invoked. */
+	loaderCalls: number;
+} {
+	let idle = opts.idle ?? true;
+	let loaderCalls = 0;
+	const calls = {
+		ompComplete: [] as Array<{
+			model: unknown;
+			systemPrompt?: string | string[];
+			messages: unknown[];
+			apiKey?: unknown;
+			signal?: AbortSignal;
+			reasoning?: unknown;
+		}>,
+		notifies: [] as Array<[string, string]>,
+		confirms: [] as string[],
+		selects: [] as Array<[string, string[]]>,
+	};
+	let editorText = "";
+	let inputHandler:
+		| ((data: string) => { consume?: boolean } | undefined)
+		| undefined;
+	const inputListeners: Array<
+		(data: string) => { consume?: boolean } | undefined
+	> = [];
+	let unsubInputCalls = 0;
+	let widgetContent: string[] | undefined;
+	const editor = makeStubEditor();
+	editor.focused = true;
+	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
+
+	// OMP transport: completeSimple from the lazily loaded (test-seamed)
+	// completion module, invoked with the registry resolver as apiKey.
+	const module: OmpCompletionModule = opts.completeSimpleUnavailable
+		? {}
+		: {
+				completeSimple: async (
+					model,
+					context,
+					options,
+				): Promise<AssistantMessage> => {
+					calls.ompComplete.push({
+						model,
+						systemPrompt: context.systemPrompt,
+						messages: context.messages,
+						apiKey: options?.apiKey,
+						signal: options?.signal,
+						reasoning: options?.reasoning,
+					});
+					if (opts.completeSimpleError) throw opts.completeSimpleError;
+					return (
+						(opts.completeSimpleResult ?? {
+							content: [{ type: "text" as const, text: "suggestion" }],
+							stopReason: "stop",
+						}) as unknown as AssistantMessage
+					);
+				},
+			};
+	setOmpCompletionModuleForTests(() => {
+		loaderCalls += 1;
+		if (opts.moduleLoadError) return Promise.reject(opts.moduleLoadError);
+		return Promise.resolve(module);
+	});
+
+	const ctx = {
+		cwd: "/tmp",
+		// OMP shape: `hasUI` present, `mode` and `isProjectTrusted` absent.
+		// omitHasUI removes the key entirely so tests can model a context
+		// with neither host marker (B9).
+		...(opts.omitHasUI ? {} : { hasUI: opts.hasUI ?? true }),
+		isIdle: () => idle,
+		model: opts.model ?? { provider: "openai", id: "gpt" },
+		modelRegistry: {
+			find: ((p: string, m: string) => opts.findModel?.(p, m)) as never,
+			resolver: (() => OMP_RESOLVER) as never,
+			// deliberately no `complete`
+		},
+		ui: {
+			notify: (m: string, t: "info" | "warning" | "error" = "info") =>
+				calls.notifies.push([m, t]),
+			...(opts.selectUnavailable
+				? {}
+				: {
+						select: async (title: string, options: string[]) => {
+							calls.selects.push([title, options]);
+							opts.selectCall?.();
+							const result =
+								typeof opts.selectResult === "function"
+									? opts.selectResult()
+									: (opts.selectResult ?? "once");
+							return typeof result === "string" ? result : await result;
+						},
+					}),
+			confirm: async (title: string) => {
+				calls.confirms.push(title);
+				const result =
+					typeof opts.confirmResult === "function"
+						? opts.confirmResult()
+						: (opts.confirmResult ?? true);
+				return typeof result === "boolean" ? result : await result;
+			},
+			onTerminalInput: (
+				handler: (data: string) => { consume?: boolean } | undefined,
+			) => {
+				inputHandler = handler;
+				inputListeners.push(handler);
+				return () => {
+					const idx = inputListeners.indexOf(handler);
+					if (idx >= 0) inputListeners.splice(idx, 1);
+					if (inputHandler === handler) inputHandler = undefined;
+					unsubInputCalls += 1;
+				};
+			},
+			getEditorText: () => editorText,
+			setEditorText: (text: string) => {
+				editorText = text;
+			},
+			setWidget: (
+				_key: string,
+				content: string[] | undefined,
+				_options?: { placement?: string },
+			) => {
+				widgetContent = content;
+			},
+			// deliberately no getEditorComponent / setEditorComponent
+		},
+		sessionManager: { getBranch: () => opts.branch ?? [] },
+	};
+	const pi = {
+		// OMP injects its coding-agent exports and a typebox shim onto the API;
+		// detectHost() keys off these capabilities.
+		pi: {},
+		typebox: {},
+		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
+			handlers.set(event, handler);
+		},
+		registerCommand: (_name: string, _options: unknown) => {
+			// No-op stub for tests; the config command is exercised via configureInteractively.
+		},
+	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
+	return {
+		pi,
+		ctx,
+		get widgetContent() {
+			return widgetContent;
+		},
+		get editorText() {
+			return editorText;
+		},
+		setEditorText: (t: string) => {
+			editorText = t;
+		},
+		get inputHandler() {
+			return inputHandler;
+		},
+		get inputListeners() {
+			return inputListeners;
+		},
+		deliverInput: (data: string) => {
+			for (const listener of [...inputListeners]) {
+				const result = listener(data);
+				if (result?.consume) return;
+			}
+			editor.handleInput(data);
+		},
+		get unsubInputCalls() {
+			return unsubInputCalls;
+		},
+		get editor() {
+			return editor;
+		},
+		calls,
+		handlers,
+		setIdle: (v: boolean) => {
+			idle = v;
+		},
+		get loaderCalls() {
+			return loaderCalls;
+		},
+	};
+}
+
+async function setupOmp(opts: Parameters<typeof makeOmpFake>[0]) {
+	const fake = makeOmpFake(opts);
+	const factory = (await import("./next-prompt.ts")).default;
+	factory(fake.pi);
+	// Trigger session_start so the controller installs OMP session state.
 	await fake.handlers.get("session_start")!({}, fake.ctx);
 	return { fake };
 }
@@ -3450,4 +3739,756 @@ test("T124: renderMode picker lists ghost first with descriptions", async () => 
 	expect(seenRenderOptions[0]).toContain("ghost");
 	expect(seenRenderOptions.some((o) => o.startsWith("widget"))).toBe(true);
 	expect(seenRenderOptions.some((o) => o.startsWith("both"))).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// OMP dual-compatibility (host boundary + lifecycle + transport + render)
+// ---------------------------------------------------------------------------
+
+describe("host compatibility boundary", () => {
+	test("B1: detectHost classifies Pi (no injected services) as pi", () => {
+		expect(detectHost({ on: () => {} })).toBe("pi");
+		expect(detectHost(undefined)).toBe("pi");
+	});
+
+	test("B2: detectHost classifies OMP (injected typebox/pi services) as omp", () => {
+		expect(detectHost({ typebox: {}, pi: {} })).toBe("omp");
+		expect(detectHost({ typebox: {} })).toBe("omp");
+		expect(detectHost({ pi: {} })).toBe("omp");
+	});
+
+	test("B3: host classification is deterministic and order-independent", () => {
+		// Same api object, classified twice — identical result; the shape of
+		// the context passed to handlers never influences classification.
+		const ompApi = { typebox: {} };
+		expect(detectHost(ompApi)).toBe("omp");
+		expect(detectHost(ompApi)).toBe("omp");
+	});
+
+	test("H1: Pi TUI context is interactive", () => {
+		expect(isInteractiveContext({ mode: "tui" })).toBe(true);
+	});
+
+	test("H2: Pi RPC/print context is non-interactive", () => {
+		expect(isInteractiveContext({ mode: "rpc" })).toBe(false);
+		expect(isInteractiveContext({ mode: "print" })).toBe(false);
+		expect(isInteractiveContext({ mode: "json" })).toBe(false);
+	});
+
+	test("H3: OMP context with hasUI=true (no mode) is interactive", () => {
+		expect(isInteractiveContext({ hasUI: true })).toBe(true);
+	});
+
+	test("H4: OMP context with hasUI=false (no mode) is non-interactive", () => {
+		expect(isInteractiveContext({ hasUI: false })).toBe(false);
+	});
+
+	test("B4: unknown context with neither field is conservatively non-interactive", () => {
+		expect(isInteractiveContext({})).toBe(false);
+	});
+
+	test("H5: projectTrustedForHost forwards Pi's isProjectTrusted", () => {
+		expect(projectTrustedForHost({ isProjectTrusted: () => true })).toBe(true);
+		expect(projectTrustedForHost({ isProjectTrusted: () => false })).toBe(false);
+	});
+
+	test("H6: projectTrustedForHost defaults to trusted when the method is absent (OMP)", () => {
+		expect(projectTrustedForHost({})).toBe(true);
+	});
+
+	test("B5: Pi fake registers agent_settled and never agent_end; no OMP-only ctx fields", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		// Pi lifecycle: agent_settled registered, agent_end never a trigger.
+		expect(fake.handlers.has("agent_settled")).toBe(true);
+		expect(fake.handlers.has("agent_end")).toBe(false);
+		// Pi context lacks the OMP-only resolver; complete is present.
+		expect(
+			"resolver" in (fake.ctx as { modelRegistry: object }).modelRegistry,
+		).toBe(false);
+		expect(
+			"complete" in (fake.ctx as { modelRegistry: object }).modelRegistry,
+		).toBe(true);
+	});
+
+	test("B6: OMP fake registers agent_end and never agent_settled; no Pi-only ctx fields", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		expect(fake.handlers.has("agent_end")).toBe(true);
+		expect(fake.handlers.has("agent_settled")).toBe(false);
+		// OMP shape: no mode, no isProjectTrusted, no modelRegistry.complete,
+		// no editor getter/setter.
+		expect("mode" in (fake.ctx as object)).toBe(false);
+		expect("isProjectTrusted" in (fake.ctx as object)).toBe(false);
+		expect(
+			"complete" in (fake.ctx as { modelRegistry: object }).modelRegistry,
+		).toBe(false);
+		expect(
+			"resolver" in (fake.ctx as { modelRegistry: object }).modelRegistry,
+		).toBe(true);
+		expect(
+			"getEditorComponent" in (fake.ctx as { ui: object }).ui,
+		).toBe(false);
+		expect(
+			"setEditorComponent" in (fake.ctx as { ui: object }).ui,
+		).toBe(false);
+	});
+
+	test("B7: Pi session starts and computes without any OMP-only field", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("B8: OMP session starts without mode/isProjectTrusted and computes on final agent_end", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+	});
+
+	test("B9: unknown context (no mode, no hasUI) follows the conservative no-compute path", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			omitHasUI: true,
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("H5c: Pi untrusted project keeps project-config trust gating in the controller", async () => {
+		// Untrusted project: the project-level ghost renderMode is ignored, so
+		// no custom editor is installed (default widget mode).
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", JSON.stringify({ renderMode: "ghost" }));
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			projectTrusted: false,
+		});
+		(fake.ctx as { cwd: string }).cwd = cwd;
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(false);
+		// Trusted project: the same project config WOULD install the editor.
+		const { fake: trusted } = await setup({
+			branch: [assistantEntry("a")],
+			projectTrusted: true,
+		});
+		(trusted.ctx as { cwd: string }).cwd = cwd;
+		await trusted.handlers.get("session_start")!({}, trusted.ctx);
+		expect(trusted.editorComponentInstalled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("H6c: OMP session start with no isProjectTrusted does not throw and loads config", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		// Session start already succeeded; effective config loaded through the
+		// documented default and the widget pipeline works end to end.
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion");
+	});
+});
+
+describe("OMP lifecycle (agent_end)", () => {
+	test("L1: Pi agent_settled, idle, empty editor → exactly one computation", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("L2: Pi never registers agent_end as a second trigger", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.handlers.has("agent_end")).toBe(false);
+	});
+
+	test("L3: OMP final agent_end, idle, empty editor → exactly one computation", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+	});
+
+	test("L4: OMP agent_end with willContinue:true → zero computations", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!(
+			{ type: "agent_end", willContinue: true },
+			fake.ctx,
+		);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("L5: OMP final agent_end with non-empty editor → zero computations", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		fake.setEditorText("already typing");
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+	});
+
+	test("L6: OMP final agent_end while not idle → zero computations", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		fake.setIdle(false);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+	});
+
+	test("L7: second OMP agent_end while first is pending → first aborted, stale cannot render", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		const handler = fake.handlers.get("agent_end")!;
+		const p1 = handler({}, fake.ctx);
+		const p2 = handler({}, fake.ctx);
+		await Promise.all([p1, p2]);
+		expect(fake.calls.ompComplete.some((c) => c.signal?.aborted)).toBe(true);
+	});
+
+	test("L8: input while OMP request pending → abort, nothing renders, no error notify", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleError: new Error("boom"),
+		});
+		const handler = fake.handlers.get("agent_end")!;
+		const p = handler({}, fake.ctx);
+		fake.handlers.get("input")!({}, fake.ctx); // user submits while pending
+		await p;
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(([m, t]) => t === "error" && m.includes("failed")),
+		).toBe(false);
+	});
+
+	test("L8b: agent_start while OMP request pending → abort, stale result cannot render", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "stale" }],
+				stopReason: "stop",
+			},
+		});
+		const handler = fake.handlers.get("agent_end")!;
+		const p = handler({}, fake.ctx);
+		fake.handlers.get("agent_start")!({}, fake.ctx);
+		await p;
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("L8c: shutdown while OMP request pending → abort, stale result cannot render", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "stale" }],
+				stopReason: "stop",
+			},
+		});
+		const handler = fake.handlers.get("agent_end")!;
+		const p = handler({}, fake.ctx);
+		fake.handlers.get("session_shutdown")!({}, fake.ctx);
+		await p;
+		expect(fake.widgetContent).toBeUndefined();
+	});
+});
+
+describe("OMP completion transport (completeSimple)", () => {
+	test("C1: Pi completion uses modelRegistry.complete and never invokes the OMP loader", async () => {
+		let loaderCalls = 0;
+		setOmpCompletionModuleForTests(() => {
+			loaderCalls += 1;
+			return Promise.resolve({});
+		});
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(loaderCalls).toBe(0);
+	});
+
+	test("C2: OMP completion calls completeSimple exactly once per settle; loader runs once (cached)", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.loaderCalls).toBe(1);
+		// Second settle: cached module, no second load.
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(2);
+		expect(fake.loaderCalls).toBe(1);
+	});
+
+	test("C3: OMP options — resolved model, exact context, registry resolver as apiKey, signal, reasoning", async () => {
+		const configured = { provider: "anthropic", id: "haiku" };
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku" ? configured : undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+				thinking: "low",
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const c = fake.calls.ompComplete[0]!;
+		expect(c.model).toBe(configured); // resolved after all consent checks
+		// OMP's Context.systemPrompt is an array of system-prompt lines.
+		expect(c.systemPrompt).toEqual([SYSTEM_PROMPT]);
+		expect(c.messages).toHaveLength(1);
+		expect(c.apiKey).toBe(OMP_RESOLVER); // modelRegistry.resolver(model)
+		expect(c.signal instanceof AbortSignal).toBe(true);
+		expect(c.reasoning).toBe("low");
+	});
+
+	test("C4: OMP with no thinking config → reasoning is undefined", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete[0]!.reasoning).toBeUndefined();
+	});
+
+	test("C5: OMP success response → sanitized suggestion published", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "what's next?" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("what's next?");
+	});
+
+	test("C6: OMP length stop → no render, no notify", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "length",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("C6b: OMP error stop → warning notify, no render", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "x" }],
+				stopReason: "error",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.calls.notifies.some((n) => n[1] === "warning")).toBe(true);
+	});
+
+	test("C6c: OMP NONE text → no render", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "NONE" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("C7: OMP transport rejects before abort → exactly one error notification, no unhandled rejection", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleError: new Error("boom"),
+		});
+		// Awaiting the handler settles the rejection inside the controller.
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		const failed = fake.calls.notifies.filter(
+			([m, t]) => t === "error" && m.includes("failed"),
+		);
+		expect(failed).toHaveLength(1);
+	});
+
+	test("C8: abort while OMP transport pending → no error notify, no stale render", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleError: new Error("boom"),
+		});
+		const handler = fake.handlers.get("agent_end")!;
+		const p = handler({}, fake.ctx);
+		fake.handlers.get("input")!({}, fake.ctx); // aborts the in-flight request
+		await p;
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(([m, t]) => t === "error" && m.includes("failed")),
+		).toBe(false);
+	});
+
+	test("C9: completeSimple absent → controlled diagnostic, no crash, no suggestion", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleUnavailable: true,
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) =>
+					t === "warning" && m.includes("completion API unavailable"),
+			),
+		).toBe(true);
+	});
+
+	test("C9b: OMP module import failure → one controlled diagnostic, no crash", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			moduleLoadError: new Error("import failed"),
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(([m, t]) => t === "error" && m.includes("failed")),
+		).toBe(true);
+	});
+});
+
+describe("OMP render downgrade (widget-only)", () => {
+	test("R1: OMP renderMode widget → widget renders; no custom-editor access exists", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "widget suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("↳ next:");
+		expect(fake.widgetContent?.[0] ?? "").toContain("widget suggestion");
+	});
+
+	test("R2: OMP renderMode ghost → widget renders with one downgrade warning, no editor getter/setter", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "ghost downgraded" }],
+				stopReason: "stop",
+			},
+		});
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) =>
+					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
+			),
+		).toHaveLength(1);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("ghost downgraded");
+	});
+
+	test("R3: OMP renderMode both → widget renders with one downgrade warning", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "both downgraded" }],
+				stopReason: "stop",
+			},
+		});
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) =>
+					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
+			),
+		).toHaveLength(1);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("both downgraded");
+	});
+
+	test("R4: additional settles after downgrade → no duplicate warning or listener", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) =>
+					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
+			),
+		).toHaveLength(1);
+		expect(fake.inputListeners).toHaveLength(1);
+	});
+
+	test("R4b: reload after downgrade emits a fresh per-session warning (still once per session)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "both" }),
+		);
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("session_start")!(
+			{ type: "session_start", reason: "reload" },
+			fake.ctx,
+		);
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) =>
+					t === "warning" && m.includes("cannot safely preserve the active editor owner"),
+			),
+		).toHaveLength(2); // one per session_start
+	});
+
+	test("R5: OMP accept key fills the editor exactly once and consumes the raw key", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "suggestion text" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
+		const result = fake.inputHandler!("\x1b/");
+		expect(result).toEqual({ consume: true });
+		expect(fake.editorText).toBe("suggestion text");
+		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.editorText).toBe("suggestion text"); // exactly once, no leak
+	});
+
+	test("R6: OMP non-accept input → widget clears and the key passes through", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "suggestion text" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		const result = fake.inputHandler!("a");
+		expect(result).toBeUndefined(); // not consumed
+		expect(fake.widgetContent).toBeUndefined(); // dismissed
+	});
+
+	test("R7: OMP delete-to-empty re-arms the cached suggestion without another model call", async () => {
+		vi.useFakeTimers();
+		writeRearmConfig(60);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "redo this" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
+		fake.inputHandler!("\x1b/"); // accept
+		expect(fake.editorText).toBe("redo this");
+		fake.inputHandler!("\x7f");
+		fake.setEditorText("");
+		vi.advanceTimersByTime(150);
+		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
+		expect(fake.calls.ompComplete).toHaveLength(1); // no new model call
+	});
+});
+
+describe("OMP acceptance / privacy", () => {
+	test("O1: end-to-end — final agent_end → completeSimple → visible suggestion", async () => {
+		const { fake } = await setupOmp({
+			branch: [userEntry("q"), assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "what's next?" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("what's next?");
+	});
+
+	test("O2: same-destination OMP request proceeds without a cross-destination prompt", async () => {
+		const configured = { provider: "anthropic", id: "haiku" };
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "anthropic", id: "haiku" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku" ? configured : undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ model: { provider: "anthropic", model: "haiku" } }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
+	});
+
+	test("O3: OMP cross-destination decline → zero completeSimple calls, no re-prompt in session", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku"
+					? { provider: "anthropic", id: "haiku" }
+					: undefined,
+			selectResult: "decline",
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(true);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1); // session denial: no re-prompt
+		expect(fake.calls.ompComplete).toHaveLength(0);
+	});
+
+	test("O3b: OMP cross-destination allow-once → completeSimple on the configured model, consent persisted", async () => {
+		const configured = { provider: "anthropic", id: "haiku" };
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku" ? configured : undefined,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
+		const consents = JSON.parse(
+			readFileSync(
+				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
+				"utf-8",
+			),
+		) as Array<{ project: string }>;
+		expect(consents).toHaveLength(1);
+		expect(consents[0]!.project).toBe("/tmp");
+	});
+
+	test("O4: OMP consent resolved AFTER input → zero completeSimple calls, consent not persisted", async () => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
+			resolveConfirm = r;
+		});
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku"
+					? { provider: "anthropic", id: "haiku" }
+					: undefined,
+			selectResult: pending,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const settle = fake.handlers.get("agent_end")!({}, fake.ctx);
+		fake.deliverInput("x"); // ordinary typing invalidates the request
+		resolveConfirm("once"); // late approval
+		await settle;
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(
+			existsSync(
+				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
+			),
+		).toBe(false);
+	});
+
+	test("O4b: OMP consent resolved AFTER shutdown → zero completeSimple calls", async () => {
+		let resolveConfirm!: (v: string) => void;
+		const pending = new Promise<string>((r) => {
+			resolveConfirm = r;
+		});
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+			findModel: (p, m) =>
+				p === "anthropic" && m === "haiku"
+					? { provider: "anthropic", id: "haiku" }
+					: undefined,
+			selectResult: pending,
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		const settle = fake.handlers.get("agent_end")!({}, fake.ctx);
+		fake.handlers.get("session_shutdown")!({}, fake.ctx);
+		resolveConfirm("once");
+		await settle;
+		expect(fake.calls.ompComplete).toHaveLength(0);
+	});
+
+	test("O5: OMP headless (hasUI:false) creates no completion request", async () => {
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			hasUI: false,
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("O6: OMP invalid privacy config fails closed (zero completeSimple)", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ maxTranscriptChars: "unlimited" }),
+		);
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("suggestions disabled"),
+			),
+		).toBe(true);
+	});
+
+	test("O7: OMP config acceptKey is reflected in the widget hint", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ acceptKey: "ctrl+space" }),
+		);
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
+	});
 });

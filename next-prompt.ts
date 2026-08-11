@@ -1,13 +1,15 @@
 /**
- * next-prompt — next-prompt suggestion extension for pi.
+ * next-prompt — next-prompt suggestion extension for pi and Oh My Pi (OMP).
  *
- * TUI-only (see F-03): when the input editor is empty after an agent turn has
- * fully settled, computes the single most logical next instruction the user
- * would type and shows it. Three render modes (config `renderMode`, default
- * "widget"):
+ * Interactive-only (see F-03): when the input editor is empty after an agent
+ * turn has fully settled, computes the single most logical next instruction
+ * the user would type and shows it. Three render modes (config `renderMode`,
+ * default "widget"):
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
+ * OMP runs `widget` fully; until OMP exposes a public editor-owner getter,
+ * `ghost`/`both` safely downgrade to widget (one warning per session).
  *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
@@ -19,17 +21,30 @@
  * Config (all optional), merged global + project. Project config is only
  * honored when the project is trusted, and global privacy settings
  * (`allowCrossProvider`, `maxTranscriptChars`) act as policy floors that
- * project config can tighten but never loosen:
- *   ~/.pi/agent/next-prompt.json
- *   <cwd>/.pi/next-prompt.json
+ * project config can tighten but never loosen. The config root comes from the
+ * host-provided CONFIG_DIR_NAME:
+ *   Pi global:  ~/.pi/agent/next-prompt.json        OMP global:  ~/.omp/agent/next-prompt.json
+ *   Pi project: <cwd>/.pi/next-prompt.json          OMP project: <cwd>/.omp/next-prompt.json
  *
  * Cross-destination disclosure (configured suggestion model on a different
  * provider/endpoint/model-route than the active model) is opt-in: it requires
  * `allowCrossProvider: true` (default false) AND explicit per-project consent,
- * persisted outside the repository in
- * `~/.pi/agent/next-prompt-consent.json`. Destination identity is provider +
- * endpoint origin + resolved model id, so a route/model change behind one
- * gateway never inherits consent (F-02/F-10).
+ * persisted outside the repository in the host agent dir as
+ * `next-prompt-consent.json`. Destination identity is provider + endpoint
+ * origin + resolved model id, so a route/model change behind one gateway never
+ * inherits consent (F-02/F-10).
+ *
+ * Host differences (see the compatibility boundary section):
+ *   - interactive check: Pi `ctx.mode === "tui"` vs OMP `ctx.hasUI === true`;
+ *   - completion lifecycle: Pi `agent_settled` vs OMP terminal `agent_end`
+ *     (skipped when `event.willContinue === true`);
+ *   - completion transport: Pi `modelRegistry.complete` vs OMP
+ *     `completeSimple` from the remapped legacy pi-ai module + the registry's
+ *     auth resolver;
+ *   - editor ownership: Pi can capture/restore `getEditorComponent()`; OMP has
+ *     no such API, hence the widget-only downgrade;
+ *   - project trust: Pi gates project config on `isProjectTrusted()`; OMP has
+ *     no project-trust API and follows the configuration loader default.
  *
  * @module next-prompt
  */
@@ -69,7 +84,6 @@ import type {
 	Context,
 	Message,
 	Model,
-	ThinkingLevel,
 	UserMessage,
 } from "@earendil-works/pi-ai";
 
@@ -83,6 +97,20 @@ export interface NextPromptModelConfig {
 }
 
 export type RenderMode = "widget" | "ghost" | "both";
+
+/**
+ * Reasoning/thinking level for the suggestion model. Defined locally (not
+ * imported from a host package) because Pi exports `ThinkingLevel` from
+ * `@earendil-works/pi-ai` while OMP's remapped pi-ai does not; the string
+ * values are identical on both hosts.
+ */
+export type ThinkingLevel =
+	| "minimal"
+	| "low"
+	| "medium"
+	| "high"
+	| "xhigh"
+	| "max";
 
 export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
@@ -1568,7 +1596,10 @@ class GhostEditor extends CustomEditor {
 	}
 
 	render(width: number): string[] {
-		const base = super.render(width);
+		// `.slice()` normalizes the base render result: Pi returns a mutable
+		// `string[]`, OMP returns `readonly string[]`. The override must return
+		// a mutable array to satisfy both hosts' base signatures.
+		const base = super.render(width).slice();
 		try {
 			return overlayGhost(base, this.suggestionState.suggestion, width);
 		} catch {
@@ -1591,6 +1622,174 @@ class GhostEditor extends CustomEditor {
 export { GhostEditor };
 
 // ---------------------------------------------------------------------------
+// Host compatibility boundary (Pi vs Oh My Pi)
+// ---------------------------------------------------------------------------
+// All host differences live behind this boundary. Controller code consumes
+// the normalized helpers (`isInteractiveContext`, `projectTrustedForHost`,
+// the transport adapter) instead of raw host fields; every host-only property
+// is optional here, and type assertions exist only at this boundary.
+
+/** Runtime host the extension is running under. */
+export type HostKind = "pi" | "omp";
+
+/**
+ * Capabilities unique to the researched OMP `ExtensionAPI` shape: OMP injects
+ * its `pi` coding-agent exports and a TypeBox shim onto the API object; Pi's
+ * `ExtensionAPI` exposes neither. Detection is by capability — never by
+ * package name, version string, or environment — and happens exactly once per
+ * extension factory invocation.
+ */
+export function detectHost(api: unknown): HostKind {
+	const marker = api as { pi?: unknown; typebox?: unknown } | null | undefined;
+	return marker && (marker.typebox !== undefined || marker.pi !== undefined)
+		? "omp"
+		: "pi";
+}
+
+/** Minimal shape of the extension context the capability helpers read. */
+export interface HostContextLike {
+	mode?: unknown;
+	hasUI?: boolean;
+	isProjectTrusted?: () => boolean;
+}
+
+/**
+ * Whether this context is an interactive (TUI) session. Pi exposes `mode`
+ * (`"tui"` = full TUI); OMP exposes `hasUI` and no `mode`. An unknown context
+ * with neither field is conservatively non-interactive.
+ */
+export function isInteractiveContext(ctx: HostContextLike): boolean {
+	return "mode" in ctx && ctx.mode !== undefined
+		? ctx.mode === "tui"
+		: ctx.hasUI === true;
+}
+
+/**
+ * Whether the project is trusted for project-config loading. Pi exposes
+ * `isProjectTrusted()`; OMP has no project-trust API, so it follows the
+ * configuration loader's current default (trusted). OMP still enforces the
+ * global privacy floors and cross-destination consent — there is simply no
+ * host project-trust signal to consult.
+ */
+export function projectTrustedForHost(ctx: HostContextLike): boolean {
+	return typeof ctx.isProjectTrusted === "function"
+		? ctx.isProjectTrusted()
+		: true;
+}
+
+/**
+ * Narrow structural view of the extension context the controller consumes.
+ * Host-specific fields are optional; the compatibility helpers normalize them.
+ */
+export interface HostCtx extends HostContextLike {
+	cwd: string;
+	isIdle: () => boolean;
+	model: Model<Api> | undefined;
+	modelRegistry: {
+		find(provider: string, modelId: string): Model<Api> | undefined;
+		/** Pi completion transport (absent on OMP). */
+		complete?: (
+			model: Model<Api>,
+			context: Context,
+			options?: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+		) => Promise<AssistantMessage>;
+		/** OMP auth resolver (absent on Pi). */
+		resolver?: (model: Model<Api>) => unknown;
+		getAvailable?(): Array<{ provider: string; id: string; name?: string }>;
+	};
+	ui: {
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+		setWidget(
+			key: string,
+			content: string[] | undefined,
+			options?: { placement?: string },
+		): void;
+		getEditorText(): string;
+		setEditorText(text: string): void;
+		onTerminalInput(
+			handler: (data: string) => { consume?: boolean } | undefined,
+		): () => void;
+		/** Pi editor-owner getter (absent on OMP). */
+		getEditorComponent?: () => unknown;
+		setEditorComponent?: (
+			factory?:
+				| ((
+						tui: TUI,
+						theme: EditorTheme,
+						keybindings: KeybindingsManager,
+				  ) => unknown)
+				| undefined,
+		) => void;
+		select?: (
+			title: string,
+			options: string[],
+		) => Promise<string | undefined>;
+		confirm?: (title: string, message: string) => Promise<boolean>;
+		input?: (
+			title: string,
+			placeholder?: string,
+		) => Promise<string | undefined>;
+	};
+	sessionManager: { getBranch(): BranchEntry[] };
+	reload?: () => Promise<void>;
+}
+
+/**
+ * Narrow runtime view of OMP's completion surface, read from the lazily
+ * imported (and OMP-remapped) legacy `@earendil-works/pi-ai` module. Only the
+ * single function the extension consumes is declared; everything is typed
+ * structurally so no host-specific runtime import is ever required.
+ */
+export interface OmpCompletionModule {
+	completeSimple?: (
+		model: Model<Api>,
+		context: Context,
+		options?: {
+			apiKey?: unknown;
+			signal?: AbortSignal;
+			reasoning?: unknown;
+		},
+	) => Promise<AssistantMessage>;
+}
+
+let ompCompletionModuleOverride: (() => Promise<OmpCompletionModule>) | undefined;
+let ompCompletionModulePromise: Promise<OmpCompletionModule> | undefined;
+
+/**
+ * Lazy, cached access to OMP's completion module. The dynamic import only
+ * executes when the OMP branch actually completes a suggestion — Pi never
+ * requires or evaluates it. The promise is cached at module scope so repeated
+ * suggestions do not repeat module lookup/allocation; a load rejection is not
+ * cached so a transient failure can retry.
+ */
+function loadOmpCompletionModule(): Promise<OmpCompletionModule> {
+	if (!ompCompletionModulePromise) {
+		ompCompletionModulePromise = ompCompletionModuleOverride
+			? Promise.resolve().then(ompCompletionModuleOverride)
+			: import("@earendil-works/pi-ai").then(
+					(m) => m as unknown as OmpCompletionModule,
+					(err) => {
+						ompCompletionModulePromise = undefined;
+						throw err;
+					},
+				);
+	}
+	return ompCompletionModulePromise;
+}
+
+/**
+ * Test seam: replace the OMP completion-module loader. Passing `undefined`
+ * restores the real lazy import. Tests use this to make OMP completion
+ * deterministic and to assert Pi never touches the OMP transport.
+ */
+export function setOmpCompletionModuleForTests(
+	loader: (() => Promise<OmpCompletionModule>) | undefined,
+): void {
+	ompCompletionModuleOverride = loader;
+	ompCompletionModulePromise = undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Controller / event wiring
 // ---------------------------------------------------------------------------
 
@@ -1601,6 +1800,7 @@ interface NextPromptRef {
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
+	const host = detectHost(pi);
 	const ref: NextPromptRef = {
 		state: undefined,
 		inflight: undefined,
@@ -1613,6 +1813,26 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const deniedConsents = new Set<string>();
 	let consentDialogOpen = false;
 	let editorInstalled = false;
+	// OMP ghost/both downgrade notice: exactly one warning per session.
+	let ompDowngradeNotified = false;
+
+	// Boundary: register lifecycle events and the config command through a
+	// structural API view so the host-specific event names typecheck under
+	// both hosts' API contracts (Pi has `agent_settled`; OMP has only
+	// `agent_end`).
+	const api = pi as unknown as {
+		on(
+			event: string,
+			handler: (event: unknown, ctx: HostCtx) => unknown,
+		): void;
+		registerCommand(
+			name: string,
+			options: {
+				description?: string;
+				handler: (args: unknown, ctx: HostCtx) => unknown;
+			},
+		): void;
+	};
 
 	function reset(): void {
 		ref.inflight?.abort();
@@ -1620,24 +1840,28 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		clearSuggestion(ref.state);
 	}
 
-	pi.on("session_start", (_e, ctx) => {
+	api.on("session_start", (_e, ctx) => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
 		notifiedFallback.value = false;
 		editorInstalled = false;
+		ompDowngradeNotified = false;
 		deniedConsents.clear();
 
-		// F-03: no TUI => no invisible suggestion work in headless modes.
-		if (ctx.mode !== "tui") {
+		// F-03: no interactive UI => no invisible suggestion work in headless
+		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
+		if (!isInteractiveContext(ctx)) {
 			ref.state = undefined;
 			effective = undefined;
 			return;
 		}
 
-		// F-02: trust-gated, validated config with policy floors applied.
+		// F-02: trust-gated, validated config with policy floors applied. OMP
+		// has no project-trust API, so projectTrustedForHost falls back to the
+		// loader default there.
 		effective = loadEffectiveConfig(ctx.cwd, {
-			projectTrusted: ctx.isProjectTrusted(),
+			projectTrusted: projectTrustedForHost(ctx),
 		});
 		if (effective.computeDisabled) {
 			ctx.ui.notify(
@@ -1654,7 +1878,26 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// (P1-1): only when the ghost actually fails to render do we restore the
 		// prior owner and switch to widget mode. The prior factory is captured
 		// before installation so the fallback can restore it.
-		const renderMode: RenderMode = effective.renderMode ?? "widget";
+		const configuredRenderMode: RenderMode =
+			effective.renderMode ?? "widget";
+		// OMP has no getEditorComponent(): it cannot capture and restore a
+		// prior editor owner, so `ghost`/`both` safely downgrade to the
+		// below-editor widget for this session (saved config is untouched, and
+		// no editor getter/setter is ever called on OMP).
+		const renderMode: RenderMode =
+			host === "omp" &&
+			(configuredRenderMode === "ghost" || configuredRenderMode === "both")
+				? "widget"
+				: configuredRenderMode;
+		if (host === "omp" && renderMode !== configuredRenderMode) {
+			if (!ompDowngradeNotified) {
+				ompDowngradeNotified = true;
+				ctx.ui.notify(
+					"next-prompt: OMP cannot safely preserve the active editor owner; ghost/both mode is shown as the below-editor widget",
+					"warning",
+				);
+			}
+		}
 
 		const state: SuggestionState = {
 			suggestion: "",
@@ -1682,7 +1925,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
-			const prior = ctx.ui.getEditorComponent();
+			const prior = ctx.ui.getEditorComponent?.();
 			// P1-1: permanent, guarded fallback. First call wins; once we are in
 			// widget mode there is nothing left to fall back to, so later calls
 			// (e.g. from a stale GhostEditor instance) are no-ops.
@@ -1692,9 +1935,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				state.renderGhost = undefined;
 				editorInstalled = false;
 				// Restore the previous owner (or the default editor) so the other
-				// extension's surface is not left half-replaced.
+				// extension's surface is not left half-replaced. `prior` is an
+				// opaque factory captured at the boundary and handed back
+				// verbatim.
 				try {
-					ctx.ui.setEditorComponent(prior ?? undefined);
+					ctx.ui.setEditorComponent?.(prior as never);
 				} catch {
 					// Restoration is best-effort; widget mode still works.
 				}
@@ -1706,7 +1951,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			};
 			state.fallbackToWidget = fallbackToWidget;
 			try {
-				ctx.ui.setEditorComponent((tui, theme, kb) => {
+				ctx.ui.setEditorComponent?.((tui, theme, kb) => {
 					const ed = new GhostEditor(tui, theme, kb, state);
 					state.renderGhost = () => {
 						try {
@@ -1738,35 +1983,61 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		);
 	});
 
-	pi.on("agent_settled", async (_e, ctx) => {
+	// Completion lifecycle by host:
+	//  - Pi: `agent_settled` is its fully-settled contract (fires once after
+	//    the agent is completely done).
+	//  - OMP: only terminal `agent_end` events (no `willContinue`) count —
+	//    continuations, automatic retries, and pending continuation turns
+	//    must never produce a suggestion. OMP has no `agent_settled`.
+	// There is exactly one computation gate: handleSettled().
+	if (host === "omp") {
+		api.on("agent_end", (event, ctx) => {
+			if ((event as { willContinue?: boolean } | undefined)?.willContinue === true) {
+				return;
+			}
+			return handleSettled(ctx);
+		});
+	} else {
+		api.on("agent_settled", (_e, ctx) => {
+			return handleSettled(ctx);
+		});
+	}
+
+	/**
+	 * Shared settled-turn handling. Guard order (unchanged from the Pi
+	 * controller): interactive context; session state and effective config
+	 * exist; config remains valid after reload; agent is idle; editor is
+	 * empty; then `maybeCompute` re-checks `shouldTrigger` before any request.
+	 */
+	async function handleSettled(ctx: HostCtx): Promise<void> {
 		try {
-			if (ctx.mode !== "tui") return;
+			if (!isInteractiveContext(ctx)) return;
 			if (!ref.state || !effective) return;
-			// Re-read config so a mid-session edit takes effect on the next settle
-			// without a reload.
+			// Re-read config so a mid-session edit takes effect on the next
+			// settle/end without a reload.
 			effective = loadEffectiveConfig(ctx.cwd, {
-				projectTrusted: ctx.isProjectTrusted(),
+				projectTrusted: projectTrustedForHost(ctx),
 			});
 			if (effective.computeDisabled) return;
 			if (!ctx.isIdle() || ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx);
 		} catch (err) {
-			console.warn("next-prompt: agent_settled handler failed", err);
+			console.warn("next-prompt: settled-turn handler failed", err);
 		}
-	});
+	}
 
 	// Clear suggestion + abort in-flight the instant the user submits or the agent starts.
-	pi.on("input", () => {
+	api.on("input", () => {
 		reset();
 	});
-	pi.on("turn_start", () => {
+	api.on("turn_start", () => {
 		reset();
 	});
-	pi.on("agent_start", () => {
+	api.on("agent_start", () => {
 		reset();
 	});
 
-	pi.on("session_shutdown", () => {
+	api.on("session_shutdown", () => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
@@ -1774,7 +2045,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		effective = undefined;
 	});
 
-	async function maybeCompute(ctx: ExtensionContext): Promise<void> {
+	async function maybeCompute(ctx: HostCtx): Promise<void> {
 		if (!ref.state || !effective) return;
 		const state = ref.state;
 		ref.inflight?.abort();
@@ -1813,8 +2084,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				) &&
 				!hasConsent(ctx.cwd, dest)
 			) {
-				// No dialogs at all -> fail closed.
-				if (!ctx.ui.select && !ctx.ui.confirm) return;
+				// No dialogs at all -> fail closed. Capture locals so the
+				// optional boundary fields narrow correctly below.
+				const { select, confirm } = ctx.ui;
+				if (!select && !confirm) return;
 				const transcriptSize = buildTranscript(
 					ctx.sessionManager.getBranch(),
 					effective,
@@ -1831,15 +2104,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				let choice: string | undefined;
 				consentDialogOpen = true;
 				try {
-					if (ctx.ui.select) {
-						const selected = await ctx.ui.select(title, [
+					if (select) {
+						const selected = await select(title, [
 							allowOnceLabel,
 							alwaysAllowLabel,
 							declineLabel,
 						]);
 						choice = consentChoiceFromLabel(selected);
-					} else {
-						const granted = await ctx.ui.confirm(
+					} else if (confirm) {
+						const granted = await confirm(
 							title,
 							`${detail} Allow for this project?`,
 						);
@@ -1911,14 +2184,18 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			effective,
 		);
 		const messages = buildMessages(transcript);
-		const context: Context = {
-			systemPrompt: effective.systemPrompt ?? SYSTEM_PROMPT,
+		// Boundary: OMP's `Context.systemPrompt` is `string[]` (system-prompt
+		// lines), Pi's is a single `string`. Both hosts accept the same prompt
+		// text — OMP just wants it as an array. The cast is confined here.
+		const systemPrompt = effective.systemPrompt ?? SYSTEM_PROMPT;
+		const context = {
+			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
 			messages,
-		};
+		} as unknown as Context;
 
-		let resp: AssistantMessage;
+		let resp: AssistantMessage | undefined;
 		try {
-			resp = await ctx.modelRegistry.complete(resolved.model, context, {
+			resp = await completeSuggestion(host, ctx, resolved.model, context, {
 				signal: ac.signal,
 				reasoning: effective.thinking,
 			});
@@ -1929,6 +2206,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		if (ac.signal.aborted || generation !== state.inputGeneration) return;
+		if (resp === undefined) return; // transport unavailable; diagnostic already shown
 
 		if (resp.stopReason !== "stop") {
 			if (resp.stopReason === "error") {
@@ -1946,21 +2224,63 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 
+	/**
+	 * Host-specific completion transport.
+	 *  - Pi: `ctx.modelRegistry.complete(model, context, { signal, reasoning })`.
+	 *  - OMP: `completeSimple` from the lazily imported (and OMP-remapped)
+	 *    legacy `@earendil-works/pi-ai` module, invoked with the registry's
+	 *    auth resolver as `apiKey`. The module import is cached at module
+	 *    scope and never evaluated on Pi.
+	 * Returns `undefined` (with one controlled diagnostic) when OMP's
+	 * completion API is unavailable; transport errors propagate to the caller
+	 * (which reports a single error notification when the request was not
+	 * aborted).
+	 */
+	async function completeSuggestion(
+		hostKind: HostKind,
+		ctx: HostCtx,
+		model: Model<Api>,
+		context: Context,
+		options: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+	): Promise<AssistantMessage | undefined> {
+		if (hostKind === "pi") {
+			return ctx.modelRegistry.complete!(model, context, options);
+		}
+		const mod = await loadOmpCompletionModule();
+		if (!mod.completeSimple) {
+			ctx.ui.notify(
+				"next-prompt: OMP completion API unavailable; suggestions disabled",
+				"warning",
+			);
+			return undefined;
+		}
+		return mod.completeSimple(model, context, {
+			apiKey: ctx.modelRegistry.resolver?.(model),
+			signal: options.signal,
+			reasoning: options.reasoning,
+		});
+	}
+
 	// Interactive config command: `/next-prompt-config`. Walks the user through
 	// every configurable option EXCEPT systemPrompt (config-file only, F-15) with
-	// model-picker + dialogs, saves to ~/.pi/agent/next-prompt.json, and reloads
-	// so changes take effect immediately.
-	pi.registerCommand("next-prompt-config", {
+	// model-picker + dialogs, saves to the host agent dir (`~/.pi/agent` on Pi,
+	// `~/.omp/agent` on OMP), and reloads so changes take effect immediately.
+	api.registerCommand("next-prompt-config", {
 		description: "Configure the next-prompt suggestion extension",
 		handler: async (_args, ctx) => {
-			if (ctx.mode !== "tui") {
+			if (!isInteractiveContext(ctx)) {
 				ctx.ui.notify(
 					"next-prompt: /next-prompt-config requires interactive mode",
 					"error",
 				);
 				return;
 			}
-			const next = await configureInteractively(ctx, loadConfig(ctx.cwd));
+			// Boundary: the command context is interactive, so the optional
+			// dialog/model-list fields are present on both hosts.
+			const next = await configureInteractively(
+				ctx as unknown as Parameters<typeof configureInteractively>[0],
+				loadConfig(ctx.cwd),
+			);
 			if (next) {
 				const saved = saveConfig(next);
 				if (!saved.saved) {
@@ -1971,7 +2291,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				ctx.ui.notify("next-prompt: config saved — reloading", "info");
-				await ctx.reload();
+				await ctx.reload?.();
 			}
 		},
 	});
