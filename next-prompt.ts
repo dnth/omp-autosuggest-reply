@@ -1464,6 +1464,19 @@ function scheduleRearmCheck(
 	}, 50);
 }
 
+function isConsentDialogKey(data: string): boolean {
+	// Select/confirm dialogs use Enter, Escape, and CSI/SS3 navigation keys.
+	// Leave printable input untouched so an unrelated interaction still
+	// invalidates a pending consent request (F-08).
+	return (
+		data === "\r" ||
+		data === "\n" ||
+		data === "\x1b" ||
+		data.startsWith("\x1b[") ||
+		data.startsWith("\x1bO")
+	);
+}
+
 /**
  * Raw terminal-input handler. Accept key fills the editor; any other key
  * dismisses the active suggestion immediately (F-04), invalidates in-flight
@@ -1472,8 +1485,14 @@ function scheduleRearmCheck(
  */
 function makeInputHandler(
 	state: SuggestionState,
+	isInputSuppressed: () => boolean = () => false,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
+		// Modal UI dialogs (such as the consent selector) own their navigation
+		// and confirmation keys. Do not treat those keys as editor input or
+		// invalidate the in-flight consent request.
+		if (isInputSuppressed() && isConsentDialogKey(data)) return undefined;
+
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
 			matchesAcceptKeyRaw(data, state.acceptKey);
@@ -1592,6 +1611,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	// Session-scoped denial set: a declined consent never re-prompts (nor
 	// sends) for the remainder of the session.
 	const deniedConsents = new Set<string>();
+	let consentDialogOpen = false;
 	let editorInstalled = false;
 
 	function reset(): void {
@@ -1713,7 +1733,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
-		ref.unsubInput = ctx.ui.onTerminalInput(makeInputHandler(state));
+		ref.unsubInput = ctx.ui.onTerminalInput(
+			makeInputHandler(state, () => consentDialogOpen),
+		);
 	});
 
 	pi.on("agent_settled", async (_e, ctx) => {
@@ -1807,19 +1829,24 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				const alwaysAllowLabel = "Always allow for this provider pair";
 				const declineLabel = "Decline";
 				let choice: string | undefined;
-				if (ctx.ui.select) {
-					const selected = await ctx.ui.select(title, [
-						allowOnceLabel,
-						alwaysAllowLabel,
-						declineLabel,
-					]);
-					choice = consentChoiceFromLabel(selected);
-				} else {
-					const granted = await ctx.ui.confirm(
-						title,
-						`${detail} Allow for this project?`,
-					);
-					choice = granted ? "once" : "decline";
+				consentDialogOpen = true;
+				try {
+					if (ctx.ui.select) {
+						const selected = await ctx.ui.select(title, [
+							allowOnceLabel,
+							alwaysAllowLabel,
+							declineLabel,
+						]);
+						choice = consentChoiceFromLabel(selected);
+					} else {
+						const granted = await ctx.ui.confirm(
+							title,
+							`${detail} Allow for this project?`,
+						);
+						choice = granted ? "once" : "decline";
+					}
+				} finally {
+					consentDialogOpen = false;
 				}
 				// F-08: the dialog may resolve AFTER an interaction, reset, or
 				// shutdown invalidated this request. Require the original
