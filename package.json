@@ -1,6 +1,6 @@
 {
   "name": "@gamaraan/next-prompt",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "pi coding-agent extension that suggests the next logical prompt after an agent turn settles (inline ghost, below-editor widget, or both).",
   "keywords": ["pi-package"],
   "license": "MIT",

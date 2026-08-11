@@ -1680,6 +1680,8 @@ function makeFake(opts: {
 	confirmCall?: () => void;
 	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
 	selectResult?: string | Promise<string> | (() => string | Promise<string>);
+	/** Hook invoked while the consent selector is open. */
+	selectCall?: () => void;
 	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
 	selectUnavailable?: boolean;
 }): {
@@ -1793,6 +1795,7 @@ function makeFake(opts: {
 				: {
 						select: async (title: string, options: string[]) => {
 							calls.selects.push([title, options]);
+							opts.selectCall?.();
 							const result =
 								typeof opts.selectResult === "function"
 									? opts.selectResult()
@@ -2785,6 +2788,7 @@ describe("cross-destination consent", () => {
 				| string
 				| Promise<string>
 				| (() => string | Promise<string>);
+			selectCall?: () => void;
 			selectUnavailable?: boolean;
 			baseUrl?: string;
 		} = {},
@@ -3015,6 +3019,20 @@ describe("cross-destination consent", () => {
 		const { fake } = await setupCross({
 			selectResult: "  \x1b[36mAlways allow for this provider pair\x1b[0m  ",
 		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
+			["openai", "anthropic"],
+		]);
+	});
+
+	test("C7d: selector input does not invalidate consent persistence", async () => {
+		let deliverInput: ((data: string) => void) | undefined;
+		const { fake } = await setupCross({
+			selectResult: "always",
+			selectCall: () => deliverInput?.("\r"),
+		});
+		deliverInput = fake.deliverInput;
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
 		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
