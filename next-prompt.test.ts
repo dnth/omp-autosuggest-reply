@@ -2985,6 +2985,20 @@ describe("cross-destination consent", () => {
 		expect(fake2.calls.selects).toHaveLength(0);
 		expect(fake2.calls.complete).toHaveLength(1);
 	});
+	test("C7b: real select label for always-allow persists and completes", async () => {
+		const { fake } = await setupCross({
+			selectResult: "Always allow for this provider pair",
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
+			["openai", "anthropic"],
+		]);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
+	});
 
 	test("C8: pair grant is directional — reverse pair does not skip the dialog", async () => {
 		const dir = process.env.PI_CODING_AGENT_DIR!;
