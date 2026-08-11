@@ -1528,7 +1528,11 @@ function scheduleRearmCheck(
 	editorTextBefore: string,
 	pollsLeft: number = REARM_CHECK_POLLS,
 ): void {
-	if (editorTextBefore.length === 0) return; // nothing to delete from
+	// Nothing to delete from. IMPORTANT: return BEFORE clearing the pending
+	// check — backspace auto-repeat (or a trailing delete burst) keeps firing
+	// events with an already-empty editor, and clearing here would cancel the
+	// check armed by the last real delete, silently dropping the re-arm.
+	if (editorTextBefore.length === 0) return;
 	clearRearmCheckTimer(state);
 	if (pollsLeft <= 0) return; // delete never settled empty; next key re-arms
 	state.rearmCheckTimer = setTimeout(() => {
@@ -1617,8 +1621,14 @@ function makeInputHandler(
 		}
 
 		// Non-accept key: dismiss any active suggestion, abort in-flight work,
-		// and pass the key through to the editor.
-		dismissSuggestion(state);
+		// and pass the key through to the editor. A delete key arriving on an
+		// already-empty editor (backspace auto-repeat / trailing delete burst)
+		// must NOT cancel a pending re-arm — dismissSuggestion clears the
+		// re-arm timers. Every other key (Escape, arrows, printable) still
+		// cancels a pending re-arm, preserving "dismissing never re-arms".
+		const isDeleteKey =
+			data === "\x7f" || data === "\x08" || data === "\x1b[3~";
+		if (state.suggestion || !isDeleteKey) dismissSuggestion(state);
 		state.inputGeneration += 1;
 		state.abortInflight();
 		scheduleRearmCheck(state, editorTextBefore);
@@ -1676,7 +1686,15 @@ class GhostEditor extends CustomEditor {
 		// a mutable array to satisfy both hosts' base signatures.
 		const base = super.render(width).slice();
 		try {
-			return overlayGhost(base, this.suggestionState.suggestion, width);
+			// Ghost shows the suggestion plus the accept-key hint (mirroring
+			// the widget's "(Alt-/ to accept)"). The hint sits at the END of
+			// the ghost, so width truncation drops the hint first and keeps
+			// the suggestion.
+			const suggestion = this.suggestionState.suggestion;
+			const ghostText = suggestion
+				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
+				: suggestion;
+			return overlayGhost(base, ghostText, width);
 		} catch {
 			// A ghost overlay failure must never break the editor's own render
 			// pass: surface the base lines and permanently fall back to widget

@@ -1535,9 +1535,10 @@ describe("real pi-tui editor integration", () => {
 		ed.handleInput("\x1b[D");
 		ed.handleInput("\x1b[D");
 		const lines = ed.render(40).join("\n");
-		// Cursor sits on the first grapheme: highlighted "a", then ghost, then "bc".
+		// Cursor sits on the first grapheme: highlighted "a", then ghost (+
+		// accept-key hint), then "bc".
 		expect(lines).toContain("\x1b[7ma\x1b[0m");
-		expect(lines).toContain("\x1b[2mghost\x1b[22mbc");
+		expect(lines).toContain("\x1b[2mghost  (Alt-/ to accept)\x1b[22mbc");
 		expect(ed.getText()).toBe("abc");
 	});
 
@@ -2817,6 +2818,31 @@ describe("re-arm after delete-to-empty", () => {
 		vi.advanceTimersByTime(100); // next poll arms the rearm timer
 		vi.advanceTimersByTime(200); // rearmDelayMs (60) fires
 		expect(fake.widgetContent?.[0] ?? "").toContain("late clear");
+		expect(fake.calls.complete).toHaveLength(1); // cached — no new model call
+	});
+
+	test("T98c: delete events arriving AFTER the editor is already empty do NOT cancel the pending re-arm (backspace auto-repeat)", async () => {
+		vi.useFakeTimers();
+		writeRearmConfig(60);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "hold delete" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		fake.inputHandler!("\x1b/"); // accept → editor = "hold delete"
+		// Delete to empty: the key that empties the editor.
+		fake.inputHandler!("\x7f");
+		fake.setEditorText("");
+		// Auto-repeat: MORE delete keys arrive with an already-empty editor.
+		fake.inputHandler!("\x7f");
+		fake.inputHandler!("\x7f");
+		fake.inputHandler!("\x7f");
+		vi.advanceTimersByTime(150); // check survives the trailing events → arms
+		vi.advanceTimersByTime(200); // rearmDelayMs (60) fires
+		expect(fake.widgetContent?.[0] ?? "").toContain("hold delete");
 		expect(fake.calls.complete).toHaveLength(1); // cached — no new model call
 	});
 
