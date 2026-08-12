@@ -1,6 +1,6 @@
 {
   "name": "@gamaraan/next-prompt",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "pi and Oh My Pi (OMP) coding-agent extension that suggests the next logical prompt after an agent turn settles (inline ghost, below-editor widget, or both).",
   "keywords": ["pi-package", "omp"],
   "license": "MIT",
