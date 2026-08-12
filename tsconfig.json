@@ -14,5 +14,6 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["*.ts"]
+  "include": ["*.ts"],
+  "exclude": ["omp-contract.d.ts"]
 }

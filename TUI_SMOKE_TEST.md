@@ -3,15 +3,20 @@
 Terminal-rendering and live-interaction behavior cannot be fully verified in
 unit tests (the automated suite covers the editor/rendering contracts via real
 pi-tui `Editor`/`CustomEditor` integration tests, but not a live terminal).
-Before any release, run every check below in a real pi session (0.84.0+,
-ideally on **at least two terminal emulators**) and record the result.
+Before any release, run every check below in a real pi session (0.84.0+) AND a
+real OMP session (17.2.x), ideally on **at least two terminal emulators** per
+host, and record the result.
 
 **Status legend:** `[ ]` not run · `[x]` passed · `[!]` failed (blocker: fix
 before release, note the failure)
 
-Record date, pi version, terminal emulators, and any failures at the bottom.
+Record date, host + version, terminal emulators, configured render mode,
+provider/model, and any failures at the bottom. **Do not publish until every
+case passes.**
 
-## Render modes
+## Pi smoke cases
+
+### Render modes
 
 - [ ] `widget`, `ghost`, and `both` render correctly at narrow and wide
   terminal sizes; no border corruption, no overflow past the editor width.
@@ -20,7 +25,7 @@ Record date, pi version, terminal emulators, and any failures at the bottom.
 - [ ] Switch terminal/app focus while a ghost is visible (unfocused editor):
   ghost still renders within the box, no overflow or corrupted styling.
 
-## Input state machine (default key `Alt-/`)
+### Input state machine (default key `Alt-/`)
 
 Run each sequence in `widget`, `ghost`, and `both`:
 
@@ -38,7 +43,7 @@ Run each sequence in `widget`, `ghost`, and `both`:
   renders (no consent persisted, no model call);
 - [ ] delete-to-empty after dismissing with Escape does NOT re-arm.
 
-## Autocomplete / conflicting keys
+### Autocomplete / conflicting keys
 
 - [ ] Slash/path autocomplete still works (Tab, up/down, Enter) while a
   suggestion is showing or dismissed; accepting the suggestion never steals
@@ -46,7 +51,7 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Configure `"acceptKey": "tab"` → extension warns and ignores it;
   Tab continues to drive autocomplete and never fills the editor.
 
-## Editor integration
+### Editor integration
 
 - [ ] IME input and wide Unicode cursor placement (CJK/emoji) work with the
   ghost installed; the cursor block stays on the correct grapheme.
@@ -59,7 +64,7 @@ Run each sequence in `widget`, `ghost`, and `both`:
   tries ghost mode, and only falls back to widget mode if ghost rendering
   actually fails (prior owner restored, suggestion still appears below the box).
 
-## Model / lifecycle error paths
+### Model / lifecycle error paths
 
 - [ ] Model error, abort, `NONE`, length stop, slow completion, and provider
   switch behave: no stale suggestion renders, no spurious error notify on
@@ -71,9 +76,39 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Run print/JSON/RPC modes and confirm no hidden suggestion request
   occurs.
 
+## OMP smoke cases
+
+Setup: install the package with `omp plugin install npm:@gamaraan/next-prompt`,
+then run `omp plugin doctor` (expect zero plugin errors) before the interactive
+checks.
+
+- [ ] `omp plugin doctor` passes with the package installed and enabled.
+- [ ] Interactive session reaches a below-editor widget suggestion after the
+  **final** `agent_end` (editor empty, agent idle).
+- [ ] Tool-loop / automatic-retry continuation shows **no** intermediate
+  suggestion (only the terminal completion does).
+- [ ] `renderMode: "ghost"` and `renderMode: "both"` render inline ghost text in
+  the input box after the caret (empty editor), with a usable widget in `both`;
+  accept fills the editor exactly once; delete-to-empty re-arms the last
+  suggestion after `rearmDelayMs` without a second model call; ghost render
+  failure falls back to the default editor + widget.
+- [ ] Widget accept (`Alt-/`) fills the editor exactly once and the raw key is
+  consumed; any other key dismisses and passes through; delete-to-empty re-arms
+  the cached suggestion without a second model call.
+- [ ] Input submit, new agent start, session reload, and shutdown prevent any
+  stale widget output from an in-flight request.
+- [ ] Headless / print / RPC modes create no completion request.
+- [ ] Cross-destination consent: first request prompts once; decline blocks the
+  destination for the session with no request; grant persists across sessions;
+  a route change re-prompts.
+- [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
+
 ## Record
 
 - Date:
-- pi version(s):
+- Pi version(s):
+- OMP version(s):
 - Terminal emulators:
+- Configured render mode:
+- Provider/model:
 - Results / failures:

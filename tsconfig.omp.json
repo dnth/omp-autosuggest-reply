@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@earendil-works/pi-ai": ["./node_modules/@oh-my-pi/pi-ai/dist/types/index.d.ts"],
+      "@earendil-works/pi-coding-agent": [
+        "./node_modules/@oh-my-pi/pi-coding-agent/dist/types/index.d.ts"
+      ],
+      "@earendil-works/pi-tui": ["./node_modules/@oh-my-pi/pi-tui/dist/types/index.d.ts"]
+    }
+  },
+  "include": ["*.ts", "omp-contract.d.ts"],
+  "exclude": []
+}
