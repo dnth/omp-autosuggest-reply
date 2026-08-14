@@ -5218,12 +5218,35 @@ describe("enhance key handling (onTerminalInput)", () => {
 		fake.setEditorText("fix teh parser bug");
 		const press = "\x1b[47;3:1u"; // CSI-u Alt+/ press
 		const release = "\x1b[47;3:3u"; // CSI-u Alt+/ release
+		// Non-vacuous: the press MUST match the enhance key, otherwise consume
+		// would be undefined and complete would stay 0.
+		expect(
+			matchesKey(press, DEFAULT_ENHANCE_KEY) ||
+				matchesAcceptKeyRaw(press, DEFAULT_ENHANCE_KEY),
+		).toBe(true);
 		expect(isKittyKeyRelease(press)).toBe(false);
 		expect(isKittyKeyRelease(release)).toBe(true);
 		expect(fake.inputHandler!(press)).toEqual({ consume: true });
 		expect(fake.inputHandler!(release)).toBeUndefined();
 		await sleep(30);
 		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+	});
+
+	test("EN17-omp: same press/release on the OMP fixture still completes", async () => {
+		const { fake } = await setupOmp({
+			completeSimpleResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		const press = "\x1b[47;3:1u";
+		const release = "\x1b[47;3:3u";
+		expect(fake.inputHandler!(press)).toEqual({ consume: true });
+		expect(fake.inputHandler!(release)).toBeUndefined();
+		await sleep(30);
+		expect(fake.calls.ompComplete).toHaveLength(1);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 });
@@ -5250,6 +5273,17 @@ describe("enhance key encoding under enhanced keyboard protocols", () => {
 		expect(
 			matchesKey("\x1b/", key) || matchesAcceptKeyRaw("\x1b/", key),
 		).toBe(true);
+	});
+
+	test("default alt+/ fires on CSI-u press; release is a key-release not a match", () => {
+		const key = DEFAULT_ENHANCE_KEY;
+		const press = "\x1b[47;3:1u";
+		const release = "\x1b[47;3:3u";
+		expect(matchesKey(press, key) || matchesAcceptKeyRaw(press, key)).toBe(
+			true,
+		);
+		expect(isKittyKeyRelease(press)).toBe(false);
+		expect(isKittyKeyRelease(release)).toBe(true);
 	});
 
 	test("regression: alt+? is DEAD under modifyOtherKeys (why it is not the default)", () => {
