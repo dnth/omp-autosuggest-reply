@@ -1,11 +1,15 @@
 # next-prompt — next-prompt suggestions for pi and Oh My Pi
 
+Fork of [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension)
+with a **batch suggestion carousel**: after a turn settles, one model call returns up to three
+distinct next-prompts, and left/right wrap that turn's list.
+
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
-coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes the single
-most logical next instruction you'd type and shows it. Three render modes:
+coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
+distinct next instructions you'd type and shows the first. Three render modes:
 
 - **`widget`** (default) — a colored below-editor line:
-  `↳ next: <suggestion>  (Alt-/ to accept)`
+  `↳ next: <suggestion>  (Alt-/ · 1/3 ←→)`
 - **`ghost`** — inline greyed ghost text **in the input box** (renders even when the
   editor is unfocused, e.g. after switching tabs/apps)
 - **`both`** — inline ghost AND the below-editor widget simultaneously
@@ -16,27 +20,45 @@ most logical next instruction you'd type and shows it. Three render modes:
 > there (Pi captures and can restore the prior owner). If ghost rendering ever
 > fails, the default editor is restored and the mode falls back to widget.
 
-Accept with **`Alt-/`** (default; configurable) to fill the input box. Any other key
-dismisses; backspace down to empty re-arms the last suggestion after a short delay (no
-new model call). No suggestion while streaming; the suggestion is cleared and any
-in-flight model call aborted the instant you submit, start a turn, or the agent starts.
+Accept with **`Alt-/`** (default; configurable) to fill the input box. While a
+suggestion is showing and the editor is empty, **left** and **right** wrap through
+that turn's batch (one model call, up to 3 distinct lines). A new settle discards
+the previous batch. Escape and up/down dismiss;
+any other key also dismisses. Backspace down to empty re-arms the last
+suggestion after a short delay (no new model call). No suggestion while
+streaming; the suggestion is cleared and any in-flight model call aborted the
+instant you submit, start a turn, or the agent starts.
+
+## Suggestion carousel
+
+Each settled turn is one model call and one batch (up to 3 distinct one-line
+next-prompts). The first item is shown immediately.
+
+- **Right** / **Left** wrap through that turn's list. There is no extra model call
+  and no browsing of previous turns.
+- A new settle, submit, `/new`, or agent start discards the previous batch.
+- Accept with **Alt-/** (default; configurable) to fill the editor with the
+  currently shown item.
+- The hint is `(Alt-/ · ←→)` for a single suggestion and `(Alt-/ · 2/3 ←→)` when
+  the batch has more than one item.
 
 ## Install
 
-Pi and OMP auto-discover extensions from standard locations.
+Pi and OMP auto-discover extensions from standard locations. Install this fork
+from GitHub so you get the batch carousel.
 
-### From npm / the pi package gallery
+### From GitHub (this fork)
 
-The published package is `@gamaraan/next-prompt`, published under the npm account `gamaraan`:
+The source repository is [`dnth/next-prompt-extension`](https://github.com/dnth/next-prompt-extension):
 
 ```bash
-pi install npm:@gamaraan/next-prompt
+pi install git:github.com/dnth/next-prompt-extension
 ```
 
-A specific release can be pinned with:
+To pin a branch, tag, or commit, append the reference:
 
 ```bash
-pi install npm:@gamaraan/next-prompt@0.1.0
+pi install git:github.com/dnth/next-prompt-extension@main
 ```
 
 ### OMP
@@ -45,13 +67,13 @@ Install through the OMP plugin manager (observed from `omp plugin --help` /
 `omp plugin install --dry-run`):
 
 ```bash
-omp plugin install npm:@gamaraan/next-prompt
+omp plugin install git:github.com/dnth/next-prompt-extension
 ```
 
-Pin a specific release the same way:
+Pin a branch, tag, or commit the same way:
 
 ```bash
-omp plugin install npm:@gamaraan/next-prompt@0.1.0
+omp plugin install git:github.com/dnth/next-prompt-extension@main
 ```
 
 After installing, run `omp plugin doctor` and confirm zero plugin errors. The
@@ -59,19 +81,11 @@ package manifest uses the `pi.extensions` form, which OMP accepts directly and
 loads with its legacy `@earendil-works/pi-*` import remapping — there is no
 separate OMP package.
 
-### From GitHub
+### Upstream npm package
 
-The source repository is `gamaraan/next-prompt-extension`:
-
-```bash
-pi install git:github.com/gamaraan/next-prompt-extension
-```
-
-To pin a GitHub release or commit, append the tag or commit reference:
-
-```bash
-pi install git:github.com/gamaraan/next-prompt-extension@v0.1.0
-```
+The published gallery package is still `@gamaraan/next-prompt` from the original
+repo. That path does **not** include this fork's carousel. Prefer the GitHub
+install above.
 
 ### Manual — copy the file
 
@@ -255,15 +269,20 @@ one listener and re-installs the editor once.
      identical on both hosts (input-generation bumps, aborts, and render-time
      guards). Pi never loads the OMP module; OMP never calls
      `modelRegistry.complete`.
-3. The returned text is sanitized (terminal controls stripped, trimmed, de-quoted,
-   de-fenced, collapsed to one line, capped) and shown — via `setWidget`
-   (widget/both), via the inline ghost overlay (ghost/both), or both.
+3. The returned text is parsed as a batch of up to 3 distinct one-line next-prompts
+   (numbered/bulleted lines, duplicates, and `NONE` dropped) and shown — via `setWidget`
+   (widget/both), via the inline ghost overlay (ghost/both), or both. The hint
+   is `(Alt-/ · ←→)` for a single suggestion and `(Alt-/ · 2/3 ←→)` when the batch has more than one item.
 4. The accept key is intercepted **before** the base editor: if a suggestion is
    showing, it fills the editor via `ctx.ui.setEditorText` and swallows the key.
-   Any other key dismisses the suggestion immediately (widget and ghost) and
-   delegates to the base editor; deleting back to empty re-arms the last suggestion
-   after `rearmDelayMs` (no new model call). Dismissing via Escape/arrows never
-   re-arms, and typing invalidates any in-flight suggestion request.
+   Left/right on an empty editor with a visible suggestion wrap through that
+   turn's batch. There is no extra model call; a new settle replaces the list.
+   Any other key
+   dismisses the suggestion immediately
+   (widget and ghost) and delegates to the base editor; deleting back to empty
+   re-arms the last suggestion after `rearmDelayMs` (no new model call).
+   Dismissing via Escape/up/down never re-arms, and typing invalidates any
+   in-flight suggestion request.
 
 ## Develop
 
@@ -328,9 +347,10 @@ session, and record the results.
 
 ## Design & development
 
-Source and design discussion live in the
-[GitHub repository](https://github.com/gamaraan/next-prompt-extension).
+Source and design discussion live in this
+[fork](https://github.com/dnth/next-prompt-extension). The original project is
+[gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension).
 
 ## License
 
-MIT — see [LICENSE](https://github.com/gamaraan/next-prompt-extension/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/dnth/next-prompt-extension/blob/main/LICENSE).

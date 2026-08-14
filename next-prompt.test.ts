@@ -37,14 +37,18 @@ import {
 	destinationOf,
 	detectHost,
 	formatModelOption,
+	formatSuggestionHint,
 	GhostEditor,
 	humanizeKey,
 	isInteractiveContext,
+	isLeftArrow,
+	isRightArrow,
 	loadConfig,
 	loadEffectiveConfig,
 	matchesAcceptKeyRaw,
 	overlayGhost,
 	parseModelOption,
+	parseSuggestionBatch,
 	projectTrustedForHost,
 	redactSecrets,
 	resolveSuggestionModel,
@@ -54,6 +58,8 @@ import {
 	setOmpCompletionModuleForTests,
 	shouldTrigger,
 	suggestionCodePointCap,
+	suggestionKey,
+	SUGGESTION_BATCH_SIZE,
 	SYSTEM_PROMPT,
 	THINKING_OPTIONS,
 	type BranchEntry,
@@ -841,6 +847,58 @@ describe("matchesAcceptKeyRaw", () => {
 	});
 });
 
+describe("arrow keys + suggestionKey + hint", () => {
+	test("CSI and SS3 left/right", () => {
+		expect(isLeftArrow("\x1b[D")).toBe(true);
+		expect(isLeftArrow("\x1bOD")).toBe(true);
+		expect(isLeftArrow("\x1b[C")).toBe(false);
+		expect(isRightArrow("\x1b[C")).toBe(true);
+		expect(isRightArrow("\x1bOC")).toBe(true);
+		expect(isRightArrow("\x1b[A")).toBe(false);
+	});
+	test("suggestionKey collapses case and whitespace", () => {
+		expect(suggestionKey("  Write Tests ")).toBe("write tests");
+		expect(suggestionKey("write   tests")).toBe(suggestionKey("Write Tests"));
+	});
+	test("formatSuggestionHint shows carousel keys and index", () => {
+		const base = {
+			suggestion: "one",
+			lastSuggestion: "one",
+			alternatives: ["one"],
+			altIndex: 0,
+			acceptKey: "alt+/",
+			renderMode: "widget" as const,
+			rearmDelayMs: 2000,
+			rearmTimer: undefined,
+			rearmCheckTimer: undefined,
+			inputGeneration: 0,
+			isIdleGetter: () => true,
+			getEditorText: () => "",
+			setEditorText: () => {},
+			publishWidget: () => {},
+			renderGhost: undefined,
+			fallbackToWidget: undefined,
+			abortInflight: () => {},
+		};
+		expect(formatSuggestionHint(base)).toBe("(Alt-/ · ←→)");
+		expect(
+			formatSuggestionHint({
+				...base,
+				alternatives: ["one", "two"],
+				altIndex: 1,
+			}),
+		).toBe("(Alt-/ · 2/2 ←→)");
+		expect(
+			formatSuggestionHint({
+				...base,
+				alternatives: ["one", "two", "three"],
+				altIndex: 0,
+			}),
+		).toBe("(Alt-/ · 1/3 ←→)");
+		expect(SUGGESTION_BATCH_SIZE).toBe(3);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // redactSecrets
 // ---------------------------------------------------------------------------
@@ -1152,6 +1210,42 @@ describe("sanitizeSuggestion", () => {
 		// Wide CJK under a small width cap still truncates at grapheme boundary.
 		const small = sanitizeSuggestion("日本語", { maxSuggestionChars: 2 });
 		expect(visibleWidth(small)).toBeLessThanOrEqual(2);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// parseSuggestionBatch
+// ---------------------------------------------------------------------------
+
+describe("parseSuggestionBatch", () => {
+	test("splits numbered and bulleted lines, drops NONE and duplicates", () => {
+		expect(
+			parseSuggestionBatch("1. write tests\n2. update the README\n3. NONE"),
+		).toEqual(["write tests", "update the README"]);
+		expect(
+			parseSuggestionBatch("- write tests\n* Write   tests\n• commit the change"),
+		).toEqual(["write tests", "commit the change"]);
+	});
+	test("single line still yields a one-item batch", () => {
+		expect(parseSuggestionBatch("write unit tests")).toEqual([
+			"write unit tests",
+		]);
+	});
+	test("whole-reply NONE is empty", () => {
+		expect(parseSuggestionBatch("NONE")).toEqual([]);
+	});
+	test("strips an outer fence and caps at SUGGESTION_BATCH_SIZE", () => {
+		const raw = "```\n1. a\n2. b\n3. c\n4. d\n```";
+		expect(parseSuggestionBatch(raw)).toEqual(["a", "b", "c"]);
+		expect(parseSuggestionBatch(raw)).toHaveLength(SUGGESTION_BATCH_SIZE);
+	});
+	test("OSC payload with embedded newlines does not become extra items", () => {
+		const raw =
+			"write tests\n\x1b]52;c;PAYLOAD\nsmuggled\x07\nupdate the README";
+		expect(parseSuggestionBatch(raw)).toEqual([
+			"write tests",
+			"update the README",
+		]);
 	});
 });
 
@@ -1491,6 +1585,8 @@ describe("real pi-tui editor integration", () => {
 		return {
 			suggestion: "",
 			lastSuggestion: "",
+			alternatives: [],
+			altIndex: 0,
 			acceptKey: "alt+/",
 			renderMode: "ghost",
 			rearmDelayMs: 2000,
@@ -1570,7 +1666,7 @@ describe("real pi-tui editor integration", () => {
 		// Cursor sits on the first grapheme: highlighted "a", then ghost (+
 		// accept-key hint), then "bc".
 		expect(lines).toContain("\x1b[7ma\x1b[0m");
-		expect(lines).toContain("\x1b[2mghost  (Alt-/ to accept)\x1b[22mbc");
+		expect(lines).toContain("\x1b[2mghost  (Alt-/ · ←→)\x1b[22mbc");
 		expect(ed.getText()).toBe("abc");
 	});
 
@@ -1745,6 +1841,10 @@ function makeFake(opts: {
 		content: Array<{ type: "text"; text: string }>;
 		stopReason: string;
 	};
+	completeResults?: Array<{
+		content: Array<{ type: "text"; text: string }>;
+		stopReason: string;
+	}>;
 	completeError?: Error;
 	model?: { provider: string; id: string; baseUrl?: string };
 	findModel?: (p: string, m: string) => unknown;
@@ -1855,7 +1955,9 @@ function makeFake(opts: {
 					reasoning: options?.reasoning,
 				});
 				if (opts.completeError) throw opts.completeError;
+				const queued = opts.completeResults?.[calls.complete.length - 1];
 				return (
+					queued ??
 					opts.completeResult ?? {
 						content: [{ type: "text" as const, text: "suggestion" }],
 						stopReason: "stop",
@@ -2416,7 +2518,7 @@ describe("controller wiring (agent_settled)", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
+		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space · ←→");
 	});
 
 	test("T74e: no acceptKey config → widget hint shows Alt-/", async () => {
@@ -2426,7 +2528,7 @@ describe("controller wiring (agent_settled)", () => {
 		});
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ to accept");
+		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ · ←→");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {
@@ -2949,8 +3051,10 @@ describe("re-arm after delete-to-empty", () => {
 });
 
 // sanity: SYSTEM_PROMPT is non-empty
-test("SYSTEM_PROMPT is non-empty", () => {
+test("SYSTEM_PROMPT asks for a numbered-free batch", () => {
 	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
+	expect(SYSTEM_PROMPT).toContain("three distinct");
+	expect(SYSTEM_PROMPT).toContain("one per line");
 });
 
 // ---------------------------------------------------------------------------
@@ -3621,6 +3725,181 @@ describe("widget dismissal", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
 		fake.inputHandler!("a"); // ordinary typing
 		expect(fake.widgetContent).toBeUndefined(); // dismissed immediately
+	});
+});
+
+async function waitUntil(
+	pred: () => boolean,
+	ms = 400,
+	label = "condition",
+): Promise<void> {
+	const start = Date.now();
+	while (!pred()) {
+		if (Date.now() - start > ms) {
+			throw new Error(`timed out waiting for ${label}`);
+		}
+		await new Promise((r) => setTimeout(r, 5));
+	}
+}
+
+function widgetText(fake: { widgetContent: string[] | undefined }): string {
+	return fake.widgetContent?.[0] ?? "";
+}
+
+describe("suggestion carousel", () => {
+	test("C1: settle batch is navigable with wrap and no extra model calls", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{
+						type: "text",
+						text: "write unit tests\nupdate the README\ncommit the change",
+					},
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("write unit tests");
+		expect(widgetText(fake)).toContain("1/3");
+		expect(fake.calls.complete).toHaveLength(1);
+
+		const right = fake.inputHandler!("\x1b[C");
+		expect(right).toEqual({ consume: true });
+		expect(widgetText(fake)).toContain("update the README");
+		expect(widgetText(fake)).toContain("2/3");
+		expect(fake.calls.complete).toHaveLength(1);
+
+		fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("commit the change");
+		expect(widgetText(fake)).toContain("3/3");
+
+		// Right at the last item wraps to the first — still one model call.
+		fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("write unit tests");
+		expect(widgetText(fake)).toContain("1/3");
+		expect(fake.calls.complete).toHaveLength(1);
+
+		const left = fake.inputHandler!("\x1b[D");
+		expect(left).toEqual({ consume: true });
+		expect(widgetText(fake)).toContain("commit the change");
+		expect(widgetText(fake)).toContain("3/3");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("C2: left on the first item wraps to the last", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "only one\ntry the other task" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("only one");
+		expect(widgetText(fake)).toContain("1/2");
+
+		const left = fake.inputHandler!("\x1bOD");
+		expect(left).toEqual({ consume: true });
+		expect(widgetText(fake)).toContain("try the other task");
+		expect(widgetText(fake)).toContain("2/2");
+		expect(fake.calls.complete).toHaveLength(1);
+
+		fake.inputHandler!("\x1b[D");
+		expect(widgetText(fake)).toContain("only one");
+		expect(widgetText(fake)).toContain("1/2");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("C3: duplicates and NONE in the batch are dropped", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{
+						type: "text",
+						text: "Write tests\nwrite   tests\nNONE\ncommit the change",
+					},
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("Write tests");
+		expect(widgetText(fake)).toContain("1/2");
+		fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("commit the change");
+		expect(widgetText(fake)).toContain("2/2");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("C4: up arrow still dismisses and is not consumed", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "go away" }],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		const up = fake.inputHandler!("\x1b[A");
+		expect(up).toBeUndefined();
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("C5: extra arrows never start another model call", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{
+						type: "text",
+						text: "option 1\noption 2\noption 3\noption 4",
+					},
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("option 1");
+		expect(widgetText(fake)).toContain("1/3");
+		for (let i = 0; i < 8; i++) fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("option 3");
+		expect(widgetText(fake)).toContain("3/3");
+		expect(fake.calls.complete).toHaveLength(1);
+		fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("option 1");
+		expect(widgetText(fake)).toContain("1/3");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("C6: a new settle replaces the previous turn's batch", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResults: [
+				{
+					content: [{ type: "text", text: "old one\nold two\nold three" }],
+					stopReason: "stop",
+				},
+				{
+					content: [{ type: "text", text: "new one\nnew two" }],
+					stopReason: "stop",
+				},
+			],
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("old one");
+		fake.handlers.get("input")!({}, fake.ctx);
+		expect(fake.widgetContent).toBeUndefined();
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("new one");
+		expect(widgetText(fake)).toContain("1/2");
+		expect(widgetText(fake)).not.toContain("old");
+		fake.inputHandler!("\x1b[C");
+		expect(widgetText(fake)).toContain("new two");
+		expect(widgetText(fake)).not.toContain("old");
+		expect(fake.calls.complete).toHaveLength(2);
 	});
 });
 
@@ -4669,6 +4948,6 @@ describe("OMP acceptance / privacy", () => {
 		);
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space to accept");
+		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space · ←→");
 	});
 });

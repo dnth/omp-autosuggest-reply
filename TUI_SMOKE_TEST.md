@@ -30,7 +30,11 @@ case passes.**
 Run each sequence in `widget`, `ghost`, and `both`:
 
 - [ ] settle → show → non-accept printable key → all UI clears immediately;
-- [ ] settle → show → Escape/arrow → clear with no later re-arm;
+- [ ] settle → show → Escape/up/down → clear with no later re-arm;
+- [ ] settle → show → right → the next item in this turn's batch (or wrap to the
+      first); left restores the previous; hint shows `1/3` / `2/3`; no extra model call;
+- [ ] settle → show → left on the first item wraps to the last of this batch;
+      a new turn replaces the list entirely;
 - [ ] settle → show → accept → editor fills exactly once, key is swallowed
   (no `/` typed);
 - [ ] accept → edit but do not submit → delete back to empty → the last
@@ -93,8 +97,9 @@ checks.
   suggestion after `rearmDelayMs` without a second model call; ghost render
   failure falls back to the default editor + widget.
 - [ ] Widget accept (`Alt-/`) fills the editor exactly once and the raw key is
-  consumed; any other key dismisses and passes through; delete-to-empty re-arms
-  the cached suggestion without a second model call.
+  consumed; left/right wrap this turn's batch; any other key dismisses and passes
+  through; delete-to-empty re-arms the cached suggestion without a second model
+  call.
 - [ ] Input submit, new agent start, session reload, and shutdown prevent any
   stale widget output from an in-flight request.
 - [ ] Headless / print / RPC modes create no completion request.

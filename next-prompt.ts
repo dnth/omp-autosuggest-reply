@@ -2,10 +2,10 @@
  * next-prompt — next-prompt suggestion extension for pi and Oh My Pi (OMP).
  *
  * Interactive-only (see F-03): when the input editor is empty after an agent
- * turn has fully settled, computes the single most logical next instruction
- * the user would type and shows it. Three render modes (config `renderMode`,
- * default "widget"):
- *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ to accept)`.
+ * turn has fully settled, computes up to three distinct next instructions
+ * the user might type and shows the first. Three render modes (config
+ * `renderMode`, default "widget"):
+ *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ · 1/3 ←→)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
  * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
@@ -15,10 +15,12 @@
  *
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
- * via `ctx.ui.setEditorText` — editor-independent. Any other key dismisses the
- * suggestion immediately; deleting back to empty re-arms the last suggestion
- * after `rearmDelayMs` (default 2000, no new model call). No suggestion while
- * streaming.
+ * via `ctx.ui.setEditorText` — editor-independent. While a suggestion is
+ * showing and the editor is empty, left/right wrap through that turn's batch
+ * (one model call, no extra fetches). A new settle discards the previous batch.
+ * Any other key dismisses the suggestion immediately; deleting back to empty
+ * re-arms the last suggestion after `rearmDelayMs` (default 2000, no new
+ * model call). No suggestion while streaming.
  *
  * Config (all optional), merged global + project. Project config is only
  * honored when the project is trusted, and global privacy settings
@@ -213,6 +215,8 @@ const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
 export const DEFAULT_ACCEPT_KEY = "alt+/";
 export const DEFAULT_REARM_MS = 2000;
+/** Distinct next-prompts requested and cached per settled turn. */
+export const SUGGESTION_BATCH_SIZE = 3;
 
 const MIN_REARM_DELAY = 50;
 const MIN_TRANSCRIPT_CHARS = 500;
@@ -259,6 +263,14 @@ export function humanizeKey(key: string): string {
  * Only the last modifier+key segment is considered. Returns true if `data`
  * matches any of the candidate byte forms for the configured key.
  */
+export function isLeftArrow(data: string): boolean {
+	return data === "\x1b[D" || data === "\x1bOD";
+}
+
+export function isRightArrow(data: string): boolean {
+	return data === "\x1b[C" || data === "\x1bOC";
+}
+
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	const parts = acceptKey.split("+");
 	if (parts.length === 0) return false;
@@ -980,6 +992,11 @@ export function buildTranscript(
 	return joined;
 }
 
+/** Case-insensitive collapsed-whitespace key for alternative de-duplication. */
+export function suggestionKey(text: string): string {
+	return text.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
 export function buildMessages(transcript: string): Message[] {
 	const userMessage: UserMessage = {
 		role: "user",
@@ -1052,7 +1069,10 @@ function consumeCsi(text: string, i: number, n: number): number {
 	return Math.min(j + 1, n);
 }
 
-export function sanitizeTerminalText(text: string): string {
+export function sanitizeTerminalText(
+	text: string,
+	opts: { preserveNewlines?: boolean } = {},
+): string {
 	let out = "";
 	let i = 0;
 	const n = text.length;
@@ -1109,7 +1129,8 @@ export function sanitizeTerminalText(text: string): string {
 		}
 
 		if (isC0(cp)) {
-			if (ch === "\n" || ch === "\t") out += " ";
+			if (ch === "\n") out += opts.preserveNewlines ? "\n" : " ";
+			else if (ch === "\t") out += " ";
 			i += 1;
 			continue;
 		}
@@ -1214,6 +1235,40 @@ export function sanitizeSuggestion(
 	if (visibleWidth(s) > max)
 		s = truncateToWidth(s, max, "").replace(/\x1b\[[0-9;]*m$/g, "");
 	return s;
+}
+
+const LIST_ITEM_PREFIX = /^(?:(?:\d+[\.\)\:]|[-*•])\s+)/;
+
+/**
+ * Parse a settle-time model reply into up to SUGGESTION_BATCH_SIZE distinct
+ * one-line next-prompts. Numbered/bulleted lines, blank lines, duplicates,
+ * and NONE are dropped. A single-line reply still yields a one-item batch.
+ */
+export function parseSuggestionBatch(
+	raw: string,
+	config: NextPromptConfig = {},
+): string[] {
+	// Keep newlines so we can split the batch, but still strip terminal
+	// controls on the whole reply first (a control string may contain \n).
+	let s = sanitizeTerminalText(raw, { preserveNewlines: true }).trim();
+	const fence = /^```[a-zA-Z0-9]*\n?([\s\S]*?)\n?```$/;
+	const fenceMatch = s.match(fence);
+	if (fenceMatch) s = fenceMatch[1]!.trim();
+
+	const out: string[] = [];
+	for (const line of s.split("\n")) {
+		let t = line.trim();
+		if (!t) continue;
+		t = t.replace(LIST_ITEM_PREFIX, "");
+		const clean = sanitizeSuggestion(t, config);
+		if (!clean) continue;
+		if (out.some((item) => suggestionKey(item) === suggestionKey(clean))) {
+			continue;
+		}
+		out.push(clean);
+		if (out.length >= SUGGESTION_BATCH_SIZE) break;
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1450,10 @@ function stripAnsi(s: string): string {
 export interface SuggestionState {
 	suggestion: string;
 	lastSuggestion: string;
+	/** Distinct suggestions for this settle, newest last. */
+	alternatives: string[];
+	/** Index into `alternatives` currently shown. */
+	altIndex: number;
 	acceptKey: string;
 	renderMode: RenderMode;
 	rearmDelayMs: number;
@@ -1421,12 +1480,25 @@ export interface SuggestionState {
 	abortInflight: () => void;
 }
 
+/** Accept-key + carousel hint, e.g. `(Alt-/ · ←→)` or `(Alt-/ · 2/3 ←→)`. */
+export function formatSuggestionHint(state: SuggestionState): string {
+	const key = humanizeKey(state.acceptKey);
+	const n =
+		state.alternatives.length > 0
+			? state.alternatives.length
+			: state.suggestion
+				? 1
+				: 0;
+	const i = state.alternatives.length > 0 ? state.altIndex + 1 : 1;
+	if (n <= 1) return `(${key} · ←→)`;
+	return `(${key} · ${i}/${n} ←→)`;
+}
+
 /** Publish the below-editor widget (or clear it when there's no suggestion). */
 function renderWidget(state: SuggestionState): void {
 	if (state.suggestion) {
-		const hint = humanizeKey(state.acceptKey);
 		state.publishWidget([
-			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}(${hint} to accept)${RESET}`,
+			`${ACCENT}↳ next:${RESET} ${state.suggestion}  ${ACCENT}${DIM}${formatSuggestionHint(state)}${RESET}`,
 		]);
 	} else {
 		state.publishWidget(undefined);
@@ -1462,9 +1534,58 @@ function showSuggestion(
 	if (checkIdle && !state.isIdleGetter()) return;
 	state.suggestion = text;
 	state.lastSuggestion = text;
+	const existing = state.alternatives.findIndex(
+		(s) => suggestionKey(s) === suggestionKey(text),
+	);
+	if (existing >= 0) state.altIndex = existing;
+	else {
+		state.alternatives = [text];
+		state.altIndex = 0;
+	}
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
 	renderSuggestion(state);
+}
+
+function showSuggestionBatch(
+	state: SuggestionState,
+	texts: readonly string[],
+	generation: number,
+	checkIdle: boolean,
+): void {
+	if (generation !== state.inputGeneration) return;
+	if (state.getEditorText().length > 0) return;
+	if (checkIdle && !state.isIdleGetter()) return;
+	const first = texts[0];
+	if (!first) return;
+	state.alternatives = texts.slice(0, SUGGESTION_BATCH_SIZE);
+	state.altIndex = 0;
+	state.suggestion = first;
+	state.lastSuggestion = first;
+	clearRearmTimer(state);
+	clearRearmCheckTimer(state);
+	renderSuggestion(state);
+}
+
+function applyAltIndex(state: SuggestionState, index: number): void {
+	const text = state.alternatives[index];
+	if (!text) return;
+	state.altIndex = index;
+	state.suggestion = text;
+	state.lastSuggestion = text;
+	renderSuggestion(state);
+}
+
+function cyclePrevious(state: SuggestionState): void {
+	const n = state.alternatives.length;
+	if (n === 0) return;
+	applyAltIndex(state, (state.altIndex - 1 + n) % n);
+}
+
+function cycleNext(state: SuggestionState): void {
+	const n = state.alternatives.length;
+	if (n === 0) return;
+	applyAltIndex(state, (state.altIndex + 1) % n);
 }
 
 /**
@@ -1491,6 +1612,8 @@ function clearSuggestion(state: SuggestionState | undefined): void {
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
 	state.inputGeneration += 1;
+	state.alternatives = [];
+	state.altIndex = 0;
 	if (state.suggestion) {
 		state.suggestion = "";
 		renderSuggestion(state);
@@ -1515,8 +1638,9 @@ function clearRearmCheckTimer(state: SuggestionState): void {
 /**
  * After a delete-to-empty transition, re-arm the last suggestion after
  * rearmDelayMs (no new model call). Only a genuine non-empty -> empty
- * transition arms the timers (F-09); dismissal via Escape/arrows/focus never
- * does. The 50ms outer check defers until the editor has processed the key,
+ * transition arms the timers (F-09); dismissal via Escape/up/down/focus never
+ * does. Left/right while a suggestion is showing wrap this turn's batch.
+ * The 50ms outer check defers until the editor has processed the key,
  * and re-polls for a bounded window (REARM_CHECK_POLLS) so a slow or
  * chunked delete that has not finished emptying the editor at the first
  * check still arms once it does — a one-shot check silently dropped the
@@ -1582,10 +1706,11 @@ function isConsentDialogKey(data: string): boolean {
 }
 
 /**
- * Raw terminal-input handler. Accept key fills the editor; any other key
- * dismisses the active suggestion immediately (F-04), invalidates in-flight
- * work (F-08), and schedules a re-arm only for a genuine delete-to-empty
- * transition (F-09). Editor-independent via ctx.ui.onTerminalInput.
+ * Raw terminal-input handler. Accept key fills the editor; left/right wrap
+ * this turn's batch while a suggestion is showing on an empty editor; any other
+ * key dismisses immediately (F-04), invalidates in-flight work (F-08), and
+ * schedules a re-arm only for a genuine delete-to-empty transition (F-09).
+ * Editor-independent via ctx.ui.onTerminalInput.
  */
 function makeInputHandler(
 	state: SuggestionState,
@@ -1623,11 +1748,24 @@ function makeInputHandler(
 			return { consume: true };
 		}
 
+		// Carousel: left/right while a suggestion is showing on an empty editor.
+		// Wrap within this turn's batch. No extra model call.
+		if (
+			state.suggestion &&
+			state.isIdleGetter() &&
+			editorTextBefore.length === 0 &&
+			(isLeftArrow(data) || isRightArrow(data))
+		) {
+			if (isLeftArrow(data)) cyclePrevious(state);
+			else cycleNext(state);
+			return { consume: true };
+		}
+
 		// Non-accept key: dismiss any active suggestion, abort in-flight work,
 		// and pass the key through to the editor. A delete key arriving on an
 		// already-empty editor (backspace auto-repeat / trailing delete burst)
 		// must NOT cancel a pending re-arm — dismissSuggestion clears the
-		// re-arm timers. Every other key (Escape, arrows, printable) still
+		// re-arm timers. Every other key (Escape, up/down, printable) still
 		// cancels a pending re-arm, preserving "dismissing never re-arms".
 		const isDeleteKey =
 			data === "\x7f" || data === "\x08" || data === "\x1b[3~";
@@ -1643,7 +1781,7 @@ function makeInputHandler(
 // Default system prompt
 // ---------------------------------------------------------------------------
 
-export const SYSTEM_PROMPT = `You predict the single most logical next instruction the user would type into a coding agent, given the conversation so far. Reply with ONLY that instruction, one line, no quotes, no markdown, no explanation. If there is nothing useful to suggest, reply with the single word: NONE`;
+export const SYSTEM_PROMPT = `You predict up to three distinct next instructions the user might type into a coding agent, given the conversation so far. Rank the most likely first. Reply with ONLY those instructions, one per line, no numbering, no quotes, no markdown, no explanation. Each line must be a different plausible take (another option, unfinished task, or next step already present in the conversation). If fewer than three are useful, return fewer lines. If there is nothing useful to suggest, reply with the single word: NONE`;
 
 // ---------------------------------------------------------------------------
 // Ghost editor (inline overlay mode — renderMode: "ghost")
@@ -1705,13 +1843,12 @@ class GhostEditor extends CustomEditor {
 		// a mutable array to satisfy both hosts' base signatures.
 		const base = super.render(width).slice();
 		try {
-			// Ghost shows the suggestion plus the accept-key hint (mirroring
-			// the widget's "(Alt-/ to accept)"). The hint sits at the END of
-			// the ghost, so width truncation drops the hint first and keeps
-			// the suggestion.
+			// Ghost shows the suggestion plus the accept-key / carousel hint
+			// (mirroring the widget). The hint sits at the END of the ghost, so
+			// width truncation drops the hint first and keeps the suggestion.
 			const suggestion = this.suggestionState.suggestion;
 			const ghostText = suggestion
-				? `${suggestion}  (${humanizeKey(this.suggestionState.acceptKey)} to accept)`
+				? `${suggestion}  ${formatSuggestionHint(this.suggestionState)}`
 				: suggestion;
 			return overlayGhost(base, ghostText, width);
 		} catch {
@@ -2008,6 +2145,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const state: SuggestionState = {
 			suggestion: "",
 			lastSuggestion: "",
+			alternatives: [],
+			altIndex: 0,
 			acceptKey: effective.acceptKey ?? DEFAULT_ACCEPT_KEY,
 			renderMode,
 			rearmDelayMs: effective.rearmDelayMs ?? DEFAULT_REARM_MS,
@@ -2370,9 +2509,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
-		const clean = sanitizeSuggestion(raw, effective);
-		if (clean && ref.state === state)
-			showSuggestion(state, clean, generation, host === "pi");
+		const batch = parseSuggestionBatch(raw, effective);
+		if (batch.length > 0 && ref.state === state) {
+			showSuggestionBatch(state, batch, generation, host === "pi");
+		}
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
 

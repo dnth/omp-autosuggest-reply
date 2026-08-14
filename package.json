@@ -9,11 +9,11 @@
   "files": ["next-prompt.ts", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gamaraan/next-prompt-extension.git"
+    "url": "git+https://github.com/dnth/next-prompt-extension.git"
   },
-  "homepage": "https://github.com/gamaraan/next-prompt-extension",
+  "homepage": "https://github.com/dnth/next-prompt-extension",
   "bugs": {
-    "url": "https://github.com/gamaraan/next-prompt-extension/issues"
+    "url": "https://github.com/dnth/next-prompt-extension/issues"
   },
   "engines": {
     "node": ">=18"
