@@ -16,8 +16,9 @@
  * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
  * via `ctx.ui.setEditorText` — editor-independent. While a suggestion is
- * showing and the editor is empty, left/right wrap through that turn's batch
- * (one model call, no extra fetches). A new settle discards the previous batch.
+ * showing and the editor is empty, left/right (or Alt+< / Alt+>) wrap through
+ * that turn's batch (one model call, no extra fetches). A new settle discards
+ * the previous batch.
  * Any other key dismisses the suggestion immediately; deleting back to empty
  * re-arms the last suggestion after `rearmDelayMs` (default 2000, no new
  * model call). No suggestion while streaming.
@@ -264,11 +265,27 @@ export function humanizeKey(key: string): string {
  * matches any of the candidate byte forms for the configured key.
  */
 export function isLeftArrow(data: string): boolean {
-	return data === "\x1b[D" || data === "\x1bOD";
+	return (
+		data === "\x1b[D" ||
+		data === "\x1bOD" ||
+		// Alt+< (and unshifted Alt+, on the same key).
+		data === "\x1b<" ||
+		data === "\x1b," ||
+		data === "\x1bO<" ||
+		data === "\x1bO,"
+	);
 }
 
 export function isRightArrow(data: string): boolean {
-	return data === "\x1b[C" || data === "\x1bOC";
+	return (
+		data === "\x1b[C" ||
+		data === "\x1bOC" ||
+		// Alt+> (and unshifted Alt+. on the same key).
+		data === "\x1b>" ||
+		data === "\x1b." ||
+		data === "\x1bO>" ||
+		data === "\x1bO."
+	);
 }
 
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
@@ -1639,7 +1656,8 @@ function clearRearmCheckTimer(state: SuggestionState): void {
  * After a delete-to-empty transition, re-arm the last suggestion after
  * rearmDelayMs (no new model call). Only a genuine non-empty -> empty
  * transition arms the timers (F-09); dismissal via Escape/up/down/focus never
- * does. Left/right while a suggestion is showing wrap this turn's batch.
+ * does. Left/right (or Alt+< / Alt+>) while a suggestion is showing wrap this
+ * turn's batch.
  * The 50ms outer check defers until the editor has processed the key,
  * and re-polls for a bounded window (REARM_CHECK_POLLS) so a slow or
  * chunked delete that has not finished emptying the editor at the first
@@ -1706,8 +1724,9 @@ function isConsentDialogKey(data: string): boolean {
 }
 
 /**
- * Raw terminal-input handler. Accept key fills the editor; left/right wrap
- * this turn's batch while a suggestion is showing on an empty editor; any other
+ * Raw terminal-input handler. Accept key fills the editor; left/right (or
+ * Alt+< / Alt+>) wrap this turn's batch while a suggestion is showing on an
+ * empty editor; any other
  * key dismisses immediately (F-04), invalidates in-flight work (F-08), and
  * schedules a re-arm only for a genuine delete-to-empty transition (F-09).
  * Editor-independent via ctx.ui.onTerminalInput.
@@ -1748,8 +1767,8 @@ function makeInputHandler(
 			return { consume: true };
 		}
 
-		// Carousel: left/right while a suggestion is showing on an empty editor.
-		// Wrap within this turn's batch. No extra model call.
+		// Carousel: left/right (or Alt+< / Alt+>) while a suggestion is showing
+		// on an empty editor. Wrap within this turn's batch. No extra model call.
 		if (
 			state.suggestion &&
 			state.isIdleGetter() &&

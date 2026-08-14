@@ -856,6 +856,16 @@ describe("arrow keys + suggestionKey + hint", () => {
 		expect(isRightArrow("\x1bOC")).toBe(true);
 		expect(isRightArrow("\x1b[A")).toBe(false);
 	});
+	test("Alt+< / Alt+> are left/right aliases", () => {
+		expect(isLeftArrow("\x1b<")).toBe(true);
+		expect(isLeftArrow("\x1b,")).toBe(true);
+		expect(isLeftArrow("\x1bO<")).toBe(true);
+		expect(isRightArrow("\x1b>")).toBe(true);
+		expect(isRightArrow("\x1b.")).toBe(true);
+		expect(isRightArrow("\x1bO>")).toBe(true);
+		expect(isLeftArrow("\x1b>")).toBe(false);
+		expect(isRightArrow("\x1b<")).toBe(false);
+	});
 	test("suggestionKey collapses case and whitespace", () => {
 		expect(suggestionKey("  Write Tests ")).toBe("write tests");
 		expect(suggestionKey("write   tests")).toBe(suggestionKey("Write Tests"));
@@ -3900,6 +3910,42 @@ describe("suggestion carousel", () => {
 		expect(widgetText(fake)).toContain("new two");
 		expect(widgetText(fake)).not.toContain("old");
 		expect(fake.calls.complete).toHaveLength(2);
+	});
+
+	test("C7: Alt+< / Alt+> wrap the same batch as left/right", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [
+					{
+						type: "text",
+						text: "write unit tests\nupdate the README\ncommit the change",
+					},
+				],
+				stopReason: "stop",
+			},
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(widgetText(fake)).toContain("write unit tests");
+
+		const next = fake.inputHandler!("\x1b>");
+		expect(next).toEqual({ consume: true });
+		expect(widgetText(fake)).toContain("update the README");
+		expect(widgetText(fake)).toContain("2/3");
+
+		fake.inputHandler!("\x1b.");
+		expect(widgetText(fake)).toContain("commit the change");
+		expect(widgetText(fake)).toContain("3/3");
+
+		const prev = fake.inputHandler!("\x1b<");
+		expect(prev).toEqual({ consume: true });
+		expect(widgetText(fake)).toContain("update the README");
+		expect(widgetText(fake)).toContain("2/3");
+
+		fake.inputHandler!("\x1b,");
+		expect(widgetText(fake)).toContain("write unit tests");
+		expect(widgetText(fake)).toContain("1/3");
+		expect(fake.calls.complete).toHaveLength(1);
 	});
 });
 

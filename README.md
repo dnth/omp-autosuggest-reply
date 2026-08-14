@@ -2,9 +2,9 @@
 
 Fork of [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension)
 with a **batch suggestion carousel**: after a turn settles, one model call returns up to three
-distinct next-prompts, and left/right wrap that turn's list.
+distinct next-prompts, and left/right (or **Alt+<** / **Alt+>**) wrap that turn's list.
 
-![After a turn settles, left and right wrap through up to three next-prompt suggestions](demo.gif)
+![After a turn settles, Alt+< / Alt+> (or left/right) wrap through up to three next-prompt suggestions](demo.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
@@ -23,9 +23,9 @@ distinct next instructions you'd type and shows the first. Three render modes:
 > fails, the default editor is restored and the mode falls back to widget.
 
 Accept with **`Alt-/`** (default; configurable) to fill the input box. While a
-suggestion is showing and the editor is empty, **left** and **right** wrap through
-that turn's batch (one model call, up to 3 distinct lines). A new settle discards
-the previous batch. Escape and up/down dismiss;
+suggestion is showing and the editor is empty, **left** / **right** or **Alt+<** /
+**Alt+>** wrap through that turn's batch (one model call, up to 3 distinct lines).
+A new settle discards the previous batch. Escape and up/down dismiss;
 any other key also dismisses. Backspace down to empty re-arms the last
 suggestion after a short delay (no new model call). No suggestion while
 streaming; the suggestion is cleared and any in-flight model call aborted the
@@ -36,8 +36,8 @@ instant you submit, start a turn, or the agent starts.
 Each settled turn is one model call and one batch (up to 3 distinct one-line
 next-prompts). The first item is shown immediately.
 
-- **Right** / **Left** wrap through that turn's list. There is no extra model call
-  and no browsing of previous turns.
+- **Right** / **Left**, or **Alt+>** / **Alt+<**, wrap through that turn's list.
+  There is no extra model call and no browsing of previous turns.
 - A new settle, submit, `/new`, or agent start discards the previous batch.
 - Accept with **Alt-/** (default; configurable) to fill the editor with the
   currently shown item.
@@ -277,8 +277,8 @@ one listener and re-installs the editor once.
    is `(Alt-/ · ←→)` for a single suggestion and `(Alt-/ · 2/3 ←→)` when the batch has more than one item.
 4. The accept key is intercepted **before** the base editor: if a suggestion is
    showing, it fills the editor via `ctx.ui.setEditorText` and swallows the key.
-   Left/right on an empty editor with a visible suggestion wrap through that
-   turn's batch. There is no extra model call; a new settle replaces the list.
+   Left/right (or Alt+< / Alt+>) on an empty editor with a visible suggestion wrap
+   through that turn's batch. There is no extra model call; a new settle replaces the list.
    Any other key
    dismisses the suggestion immediately
    (widget and ghost) and delegates to the base editor; deleting back to empty
