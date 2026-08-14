@@ -156,6 +156,19 @@ export interface NextPromptConfig {
 	allowCrossProviderPairs?: Array<[string, string]>;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
 	rearmDelayMs?: number;
+	/**
+	 * Whether the enhance-prompt keybinding is active. When enabled, pressing
+	 * `enhanceKey` on a non-empty, idle editor rewrites the typed text in place
+	 * for clarity (revert with the same key or Escape). Default true.
+	 */
+	enhanceEnabled?: boolean;
+	/**
+	 * Key id (any pi-tui KeyId) that enhances the current editor text. Defaults
+	 * to "alt+?". Must differ from `acceptKey`; "enter"/"tab" are rejected.
+	 */
+	enhanceKey?: string;
+	/** System-prompt override for the enhance model (config-file only). */
+	enhanceSystemPrompt?: string;
 }
 
 /**
@@ -219,6 +232,13 @@ export const DEFAULT_ACCEPT_KEY = "enter";
 export const DEFAULT_REARM_MS = 2000;
 /** Distinct next-prompts requested and cached per settled turn. */
 export const SUGGESTION_BATCH_SIZE = 3;
+
+/** Default keybinding that rewrites the current editor text in place. */
+export const DEFAULT_ENHANCE_KEY = "alt+?";
+/** Whether the enhance-prompt keybinding is active when unset in config. */
+export const DEFAULT_ENHANCE_ENABLED = true;
+/** Hard cap (code points) on an enhanced prompt written back to the editor. */
+const ENHANCE_MAX_CHARS = 4000;
 
 const MIN_REARM_DELAY = 50;
 const MIN_TRANSCRIPT_CHARS = 500;
@@ -522,6 +542,29 @@ function parseConfig(text: string): {
 						`next-prompt: acceptKey "tab" conflicts with autocomplete; ignoring`,
 					);
 				else cfg.acceptKey = value;
+				break;
+			case "enhanceEnabled":
+				if (typeof value !== "boolean")
+					console.warn(`next-prompt: invalid enhanceEnabled in config; ignoring`);
+				else cfg.enhanceEnabled = value;
+				break;
+			case "enhanceKey":
+				if (typeof value !== "string" || value.trim().length === 0)
+					console.warn(`next-prompt: invalid enhanceKey in config; ignoring`);
+				else if (value.trim().toLowerCase() === "tab")
+					console.warn(
+						`next-prompt: enhanceKey "tab" conflicts with autocomplete; ignoring`,
+					);
+				else if (value.trim().toLowerCase() === "enter")
+					console.warn(
+						`next-prompt: enhanceKey "enter" conflicts with submit/accept; ignoring`,
+					);
+				else cfg.enhanceKey = value;
+				break;
+			case "enhanceSystemPrompt":
+				if (typeof value !== "string")
+					console.warn(`next-prompt: invalid enhanceSystemPrompt in config; ignoring`);
+				else cfg.enhanceSystemPrompt = value;
 				break;
 			default:
 				console.warn(`next-prompt: unknown config key "${key}" ignored`);
@@ -1296,6 +1339,39 @@ export function parseSuggestionBatch(
 	return out;
 }
 
+/**
+ * Sanitize a model reply into an enhanced prompt for in-place editor
+ * replacement. Unlike a suggestion, an enhanced prompt MAY span multiple lines,
+ * so newlines are preserved. Terminal control sequences are stripped (F-01), a
+ * single surrounding code fence and one layer of matching quotes are removed,
+ * and the result is capped at ENHANCE_MAX_CHARS code points. Returns "" for the
+ * NONE sentinel or a blank/punctuation-only reply.
+ */
+export function sanitizeEnhancedPrompt(raw: string): string {
+	let s = sanitizeTerminalText(raw, { preserveNewlines: true }).trim();
+	const fence = /^```[a-zA-Z0-9]*\n?([\s\S]*?)\n?```$/;
+	const fenceMatch = s.match(fence);
+	if (fenceMatch) s = fenceMatch[1]!.trim();
+	if (s.length >= 2) {
+		const first = s[0]!;
+		const last = s[s.length - 1]!;
+		if (
+			(first === '"' && last === '"') ||
+			(first === "'" && last === "'") ||
+			(first === "`" && last === "`")
+		) {
+			s = s.slice(1, -1).trim();
+		}
+	}
+	if (s === "NONE") return "";
+	if (/^[\s.,;:!?'"]+$/.test(s)) return "";
+	const cps = Array.from(s);
+	if (cps.length > ENHANCE_MAX_CHARS) {
+		s = stripTrailingZeroWidth(cps.slice(0, ENHANCE_MAX_CHARS).join(""));
+	}
+	return s;
+}
+
 // ---------------------------------------------------------------------------
 // Trigger decision
 // ---------------------------------------------------------------------------
@@ -1718,6 +1794,100 @@ function scheduleRearmCheck(
 	}, REARM_CHECK_INTERVAL_MS);
 }
 
+// ---------------------------------------------------------------------------
+// Enhance-prompt state + key handling (in-place rewrite of the typed prompt)
+// ---------------------------------------------------------------------------
+
+export type EnhanceHintKind = "enhancing" | "enhanced" | "original";
+
+/** Which of the two texts the editor holds, and whether a rewrite is in flight. */
+export interface EnhanceRuntime {
+	/** The user's text before the last enhance (for revert). */
+	original?: string;
+	/** The last enhanced result (cached so toggling never re-calls the model). */
+	enhanced?: string;
+	showing: "none" | "enhanced" | "original";
+	pending: boolean;
+}
+
+/** Everything the input handler needs to drive enhance without the controller. */
+export interface EnhanceController {
+	enabled: boolean;
+	key: string;
+	runtime: EnhanceRuntime;
+	/** Kick off an async rewrite of `text` (fire-and-forget). */
+	trigger: (text: string) => void;
+	/** Publish (or clear, with undefined) the below-editor enhance hint. */
+	showHint: (kind: EnhanceHintKind | undefined) => void;
+	/** Abort an in-flight rewrite. */
+	abort: () => void;
+}
+
+export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
+	rt.original = undefined;
+	rt.enhanced = undefined;
+	rt.showing = "none";
+	rt.pending = false;
+}
+
+/**
+ * Enhance-key press on a non-empty, idle editor. Toggles between the cached
+ * enhanced text and the original when the box still holds one of them;
+ * otherwise starts a fresh rewrite of the current text. Ignored while a rewrite
+ * is already in flight.
+ */
+export function handleEnhanceKey(
+	state: SuggestionState,
+	enhance: EnhanceController,
+): void {
+	if (!state.isIdleGetter()) return;
+	const rt = enhance.runtime;
+	if (rt.pending) return;
+	const text = state.getEditorText();
+	if (
+		rt.showing === "enhanced" &&
+		rt.enhanced !== undefined &&
+		rt.original !== undefined &&
+		text === rt.enhanced
+	) {
+		state.setEditorText(rt.original);
+		rt.showing = "original";
+		enhance.showHint("original");
+		return;
+	}
+	if (
+		rt.showing === "original" &&
+		rt.enhanced !== undefined &&
+		rt.original !== undefined &&
+		text === rt.original
+	) {
+		state.setEditorText(rt.enhanced);
+		rt.showing = "enhanced";
+		enhance.showHint("enhanced");
+		return;
+	}
+	if (text.trim().length === 0) return;
+	resetEnhanceRuntime(rt);
+	enhance.trigger(text);
+}
+
+/** Escape while an enhancement is showing: restore the original and clear state. */
+export function revertEnhance(
+	state: SuggestionState,
+	enhance: EnhanceController,
+): void {
+	const rt = enhance.runtime;
+	if (
+		rt.showing === "enhanced" &&
+		rt.original !== undefined &&
+		state.getEditorText() === rt.enhanced
+	) {
+		state.setEditorText(rt.original);
+	}
+	resetEnhanceRuntime(rt);
+	enhance.showHint(undefined);
+}
+
 function isConsentDialogKey(data: string): boolean {
 	// Select/confirm dialogs use Enter, Escape, and CSI/SS3 navigation keys.
 	// Leave printable input untouched so an unrelated interaction still
@@ -1742,12 +1912,32 @@ function isConsentDialogKey(data: string): boolean {
 function makeInputHandler(
 	state: SuggestionState,
 	isInputSuppressed: () => boolean = () => false,
+	enhance?: EnhanceController,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
 		// Modal UI dialogs (such as the consent selector) own their navigation
 		// and confirmation keys. Do not treat those keys as editor input or
 		// invalidate the in-flight consent request.
 		if (isInputSuppressed() && isConsentDialogKey(data)) return undefined;
+
+		// Enhance: rewrite the current (non-empty) editor text in place. Placed
+		// before the empty-editor accept/carousel branches so it is never
+		// shadowed. The enhance key returns here, so it never bumps the input
+		// generation — an in-flight rewrite is invalidated only by a real edit
+		// or a lifecycle reset.
+		if (enhance?.enabled) {
+			if (
+				matchesKey(data, enhance.key as KeyId) ||
+				matchesAcceptKeyRaw(data, enhance.key)
+			) {
+				handleEnhanceKey(state, enhance);
+				return { consume: true };
+			}
+			if (data === "\x1b" && enhance.runtime.showing !== "none") {
+				revertEnhance(state, enhance);
+				return { consume: true };
+			}
+		}
 
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
@@ -1788,6 +1978,17 @@ function makeInputHandler(
 			return { consume: true };
 		}
 
+		// A real edit (or any other key) commits/aborts a pending or shown
+		// enhancement: drop the cached original/enhanced and clear the hint.
+		if (
+			enhance &&
+			(enhance.runtime.showing !== "none" || enhance.runtime.pending)
+		) {
+			enhance.abort();
+			resetEnhanceRuntime(enhance.runtime);
+			enhance.showHint(undefined);
+		}
+
 		// Non-accept key: dismiss any active suggestion, abort in-flight work,
 		// and pass the key through to the editor. A delete key arriving on an
 		// already-empty editor (backspace auto-repeat / trailing delete burst)
@@ -1809,6 +2010,13 @@ function makeInputHandler(
 // ---------------------------------------------------------------------------
 
 export const SYSTEM_PROMPT = `You predict up to three distinct next instructions the user might type into a coding agent, given the conversation so far. Rank the most likely first. Reply with ONLY those instructions, one per line, no numbering, no quotes, no markdown, no explanation. Each line must be a different plausible take (another option, unfinished task, or next step already present in the conversation). If fewer than three are useful, return fewer lines. If there is nothing useful to suggest, reply with the single word: NONE`;
+
+/**
+ * System prompt for the enhance-prompt feature. The model rewrites a single
+ * user instruction for clarity WITHOUT changing meaning, intent, or scope, and
+ * replies with only the rewritten instruction.
+ */
+export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a coding agent so it is clearer and more precise, WITHOUT changing its meaning, intent, or scope. Fix grammar, ambiguity, and structure only. Do NOT add new requirements, remove details, answer the request, or invent specifics (names, paths, versions) the user did not provide. You have no other context, so never resolve references the user left implicit — keep them as written. Preserve the user's language and any code, paths, or identifiers verbatim. Reply with ONLY the rewritten instruction: no quotes, no markdown, no code fences, no preamble, no explanation. If it is already clear, reply with it unchanged. If there is no instruction to rewrite, reply with the single word: NONE`;
 
 // ---------------------------------------------------------------------------
 // Ghost editor (inline overlay mode — renderMode: "ghost")
@@ -2073,6 +2281,8 @@ interface NextPromptRef {
 	state: SuggestionState | undefined;
 	inflight: AbortController | undefined;
 	unsubInput: (() => void) | undefined;
+	enhance: EnhanceController | undefined;
+	enhanceInflight: AbortController | undefined;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -2081,6 +2291,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		state: undefined,
 		inflight: undefined,
 		unsubInput: undefined,
+		enhance: undefined,
+		enhanceInflight: undefined,
 	};
 	let effective: EffectiveConfig | undefined;
 	const notifiedFallback = { value: false };
@@ -2114,7 +2326,13 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	function reset(): void {
 		ref.inflight?.abort();
 		ref.inflight = undefined;
+		ref.enhanceInflight?.abort();
+		ref.enhanceInflight = undefined;
 		clearSuggestion(ref.state);
+		if (ref.enhance) {
+			resetEnhanceRuntime(ref.enhance.runtime);
+			ref.enhance.showHint(undefined);
+		}
 	}
 
 	api.on("session_start", (_e, ctx) => {
@@ -2193,6 +2411,45 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		ref.state = state;
 
+		// Enhance-prompt controller: shares the below-editor widget and the
+		// suggestion-model resolution/consent path. Disabled when the privacy
+		// config failed closed.
+		const enhanceKeyValue = effective.enhanceKey ?? DEFAULT_ENHANCE_KEY;
+		const showEnhanceHint = (kind: EnhanceHintKind | undefined) => {
+			if (kind === undefined) {
+				publishWidget(undefined);
+				return;
+			}
+			const key = humanizeKey(enhanceKeyValue);
+			let line: string;
+			if (kind === "enhancing") line = `${DIM}↳ enhancing prompt…${RESET}`;
+			else if (kind === "enhanced")
+				line = `${ACCENT}↳ enhanced${RESET}${DIM}  (${key} · Esc to revert)${RESET}`;
+			else line = `${ACCENT}↳ original${RESET}${DIM}  (${key} to re-enhance)${RESET}`;
+			publishWidget([line]);
+		};
+		const enhance: EnhanceController = {
+			enabled:
+				(effective.enhanceEnabled ?? DEFAULT_ENHANCE_ENABLED) &&
+				!effective.computeDisabled,
+			key: enhanceKeyValue,
+			runtime: {
+				original: undefined,
+				enhanced: undefined,
+				showing: "none",
+				pending: false,
+			},
+			trigger: (text: string) => {
+				void maybeEnhance(ctx, text);
+			},
+			showHint: showEnhanceHint,
+			abort: () => {
+				ref.enhanceInflight?.abort();
+				ref.enhanceInflight = undefined;
+			},
+		};
+		ref.enhance = enhance;
+
 		const wantGhost =
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
@@ -2257,7 +2514,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
 		ref.unsubInput = ctx.ui.onTerminalInput(
-			makeInputHandler(state, () => consentDialogOpen),
+			makeInputHandler(state, () => consentDialogOpen, enhance),
 		);
 	});
 
@@ -2345,8 +2602,100 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
 		ref.state = undefined;
+		ref.enhance = undefined;
 		effective = undefined;
 	});
+
+	/**
+	 * Cross-destination disclosure gate shared by suggestion compute and enhance.
+	 * Returns true when the resolved model may receive text: same destination,
+	 * an allow-listed provider pair, existing per-project consent, or a fresh
+	 * grant. Returns false on decline, a dismissed dialog, a missing dialog UI,
+	 * or when an interaction/reset invalidated the request mid-dialog.
+	 */
+	async function ensureCrossDestinationConsent(
+		ctx: HostCtx,
+		resolved: ResolvedModel,
+		ac: AbortController,
+		generation: number,
+		state: SuggestionState,
+		disclosure: { title: string; noun: string; chars: () => number },
+	): Promise<boolean> {
+		if (!resolved.crossDestination || !resolved.model) return true;
+		const model = resolved.model;
+		const dest = destinationOf(model);
+		const key = dest ? destinationKey(dest) : "";
+		if (!dest || deniedConsents.has(key)) return false;
+		const fromProvider = ctx.model?.provider ?? "";
+		const toProvider = model.provider ?? "";
+		if (
+			pairAllowed(effective!.allowCrossProviderPairs, fromProvider, toProvider) ||
+			hasConsent(ctx.cwd, dest)
+		) {
+			return true;
+		}
+		const { select, confirm } = ctx.ui;
+		if (!select && !confirm) return false;
+		const detail = `Suggestion model ${model.provider}/${model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${disclosure.chars()} chars of ${disclosure.noun} there.`;
+		const allowOnceLabel = "Allow once (this project)";
+		const alwaysAllowLabel = "Always allow for this provider pair";
+		const declineLabel = "Decline";
+		let choice: "once" | "always" | "decline" | undefined;
+		consentDialogOpen = true;
+		try {
+			if (select) {
+				const selected = await select(disclosure.title, [
+					allowOnceLabel,
+					alwaysAllowLabel,
+					declineLabel,
+				]);
+				choice = consentChoiceFromLabel(selected);
+			} else if (confirm) {
+				const granted = await confirm(
+					disclosure.title,
+					`${detail} Allow for this project?`,
+				);
+				choice = granted ? "once" : "decline";
+			}
+		} finally {
+			consentDialogOpen = false;
+		}
+		if (
+			ac.signal.aborted ||
+			ref.state !== state ||
+			generation !== state.inputGeneration
+		) {
+			return false;
+		}
+		if (choice === "always") {
+			const updated = saveConfig({
+				allowCrossProviderPairs: [
+					...(effective!.allowCrossProviderPairs ?? []),
+					[fromProvider, toProvider],
+				],
+			});
+			grantConsent(ctx.cwd, dest, `${model.provider}/${model.id}`);
+			if (updated.saved) {
+				ctx.ui.notify(
+					`next-prompt: always allow ${fromProvider} → ${toProvider} saved to global config`,
+					"info",
+				);
+			} else {
+				ctx.ui.notify(
+					"next-prompt: failed to save provider pair in global config (consent kept for this project)",
+					"warning",
+				);
+			}
+			return true;
+		}
+		if (choice === "once") {
+			grantConsent(ctx.cwd, dest, `${model.provider}/${model.id}`);
+			return true;
+		}
+		deniedConsents.add(key);
+		ctx.ui.notify("next-prompt: cross-provider suggestion declined", "warning");
+		return false;
+	}
 
 	async function maybeCompute(ctx: HostCtx): Promise<void> {
 		if (!ref.state || !effective) return;
@@ -2377,113 +2726,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// A directional provider pair in the global config (set via the dialog's
 		// "Always allow" option) skips the dialog for that active→suggestion
 		// provider direction.
-		if (resolved.crossDestination) {
-			const dest = destinationOf(resolved.model);
-			const key = dest ? destinationKey(dest) : "";
-			if (!dest || deniedConsents.has(key)) return;
-			const fromProvider = ctx.model?.provider ?? "";
-			const toProvider = resolved.model.provider ?? "";
-			if (
-				!pairAllowed(
-					effective.allowCrossProviderPairs,
-					fromProvider,
-					toProvider,
-				) &&
-				!hasConsent(ctx.cwd, dest)
-			) {
-				// No dialogs at all -> fail closed. Capture locals so the
-				// optional boundary fields narrow correctly below.
-				const { select, confirm } = ctx.ui;
-				if (!select && !confirm) return;
-				const transcriptSize = buildTranscript(
-					ctx.sessionManager.getBranch(),
-					effective,
-				).length;
-				const title = "next-prompt: send transcript to another provider?";
-				const detail = `Suggestion model ${resolved.model.provider}/${resolved.model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${transcriptSize} chars of conversation text there.`;
-				// Prefer the 3-option selector (allow once / always allow this
-				// provider pair / decline); fall back to a plain confirm dialog
-				// when the UI does not offer select. The selector returns the
-				// selected label, not an internal choice id.
-				const allowOnceLabel = "Allow once (this project)";
-				const alwaysAllowLabel = "Always allow for this provider pair";
-				const declineLabel = "Decline";
-				let choice: string | undefined;
-				consentDialogOpen = true;
-				try {
-					if (select) {
-						const selected = await select(title, [
-							allowOnceLabel,
-							alwaysAllowLabel,
-							declineLabel,
-						]);
-						choice = consentChoiceFromLabel(selected);
-					} else if (confirm) {
-						const granted = await confirm(
-							title,
-							`${detail} Allow for this project?`,
-						);
-						choice = granted ? "once" : "decline";
-					}
-				} finally {
-					consentDialogOpen = false;
-				}
-				// F-08: the dialog may resolve AFTER an interaction, reset, or
-				// shutdown invalidated this request. Require the original
-				// controller/state identity, request signal, and input generation
-				// to still be current before persisting consent or calling the
-				// model — otherwise return without disclosing anything.
-				if (
-					ac.signal.aborted ||
-					ref.state !== state ||
-					generation !== state.inputGeneration
-				) {
-					if (ref.inflight === ac) ref.inflight = undefined;
-					return;
-				}
-				if (choice === "always") {
-					// Persist the directional provider pair in the global config.
-					const updated = saveConfig({
-						allowCrossProviderPairs: [
-							...(effective.allowCrossProviderPairs ?? []),
-							[fromProvider, toProvider],
-						],
-					});
-					// The pair grant also covers this exact destination, but keep
-					// the per-project record so the dialog never re-appears even
-					// if the config write was refused.
-					grantConsent(
-						ctx.cwd,
-						dest,
-						`${resolved.model.provider}/${resolved.model.id}`,
-					);
-					if (updated.saved) {
-						ctx.ui.notify(
-							`next-prompt: always allow ${fromProvider} → ${toProvider} saved to global config`,
-							"info",
-						);
-					} else {
-						ctx.ui.notify(
-							"next-prompt: failed to save provider pair in global config (consent kept for this project)",
-							"warning",
-						);
-					}
-				} else if (choice === "once") {
-					grantConsent(
-						ctx.cwd,
-						dest,
-						`${resolved.model.provider}/${resolved.model.id}`,
-					);
-				} else {
-					// Decline (or dialog dismissed without a choice).
-					deniedConsents.add(key);
-					ctx.ui.notify(
-						"next-prompt: cross-provider suggestion declined",
-						"warning",
-					);
-					return;
-				}
-			}
+		if (
+			!(await ensureCrossDestinationConsent(ctx, resolved, ac, generation, state, {
+				title: "next-prompt: send transcript to another provider?",
+				noun: "conversation text",
+				chars: () =>
+					buildTranscript(ctx.sessionManager.getBranch(), effective!).length,
+			}))
+		) {
+			if (ref.inflight === ac) ref.inflight = undefined;
+			return;
 		}
 
 		const transcript = buildTranscript(
@@ -2541,6 +2793,139 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			showSuggestionBatch(state, batch, generation, host === "pi");
 		}
 		if (ref.inflight === ac) ref.inflight = undefined;
+	}
+
+	/** Clear enhance in-flight state; also clears the progress hint if nothing is shown. */
+	function finishEnhance(enhance: EnhanceController, ac: AbortController): void {
+		enhance.runtime.pending = false;
+		if (enhance.runtime.showing === "none") enhance.showHint(undefined);
+		if (ref.enhanceInflight === ac) ref.enhanceInflight = undefined;
+	}
+
+	/**
+	 * Rewrite the current editor text for clarity and replace it in place. Sends
+	 * ONLY the typed text (redacted), never the transcript. Reuses the suggestion
+	 * model resolution and cross-destination consent gate. Staleness is guarded
+	 * by the input generation and by requiring the editor to still hold exactly
+	 * what was sent before the result is applied.
+	 */
+	async function maybeEnhance(ctx: HostCtx, rawText: string): Promise<void> {
+		if (!ref.state || !effective || !ref.enhance) return;
+		const state = ref.state;
+		const enhance = ref.enhance;
+		if (!enhance.enabled) return;
+		const text = rawText;
+		if (text.trim().length === 0 || !ctx.isIdle()) return;
+
+		ref.enhanceInflight?.abort();
+		const ac = new AbortController();
+		ref.enhanceInflight = ac;
+		const generation = state.inputGeneration;
+
+		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
+		if (!resolved.model) {
+			ctx.ui.notify("next-prompt: no model available to enhance", "warning");
+			finishEnhance(enhance, ac);
+			return;
+		}
+
+		enhance.runtime.pending = true;
+		enhance.runtime.original = text;
+		enhance.showHint("enhancing");
+
+		const redacted = redactSecrets(text);
+		const consented = await ensureCrossDestinationConsent(
+			ctx,
+			resolved,
+			ac,
+			generation,
+			state,
+			{
+				title: "next-prompt: send your prompt to another provider?",
+				noun: "prompt text",
+				chars: () => redacted.length,
+			},
+		);
+		if (
+			!consented ||
+			ac.signal.aborted ||
+			ref.state !== state ||
+			generation !== state.inputGeneration
+		) {
+			finishEnhance(enhance, ac);
+			return;
+		}
+
+		const systemPrompt = effective.enhanceSystemPrompt ?? ENHANCE_SYSTEM_PROMPT;
+		const context = {
+			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
+			messages: buildMessages(redacted),
+		} as unknown as Context;
+
+		let resp: AssistantMessage | undefined;
+		const ENHANCE_TIMEOUT_MS = 20_000;
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			ac.abort();
+		}, ENHANCE_TIMEOUT_MS);
+		try {
+			resp = await completeSuggestion(host, ctx, resolved.model, context, {
+				signal: ac.signal,
+				reasoning: effective.thinking,
+			});
+		} catch (err) {
+			if (!ac.signal.aborted)
+				ctx.ui.notify("next-prompt: enhance failed", "error");
+			else if (timedOut && generation === state.inputGeneration)
+				ctx.ui.notify("next-prompt: enhance timed out", "warning");
+			finishEnhance(enhance, ac);
+			return;
+		} finally {
+			clearTimeout(timeout);
+		}
+
+		if (
+			ac.signal.aborted ||
+			generation !== state.inputGeneration ||
+			ref.state !== state
+		) {
+			finishEnhance(enhance, ac);
+			return;
+		}
+		if (resp === undefined) {
+			finishEnhance(enhance, ac);
+			return;
+		}
+		if (resp.stopReason !== "stop") {
+			if (resp.stopReason === "error")
+				ctx.ui.notify("next-prompt: enhance model error", "warning");
+			finishEnhance(enhance, ac);
+			return;
+		}
+
+		const raw = resp.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
+		const enhanced = sanitizeEnhancedPrompt(raw);
+		if (
+			enhanced.length > 0 &&
+			enhanced !== text &&
+			ctx.ui.getEditorText() === text
+		) {
+			enhance.runtime.enhanced = enhanced;
+			enhance.runtime.showing = "enhanced";
+			enhance.runtime.pending = false;
+			ctx.ui.setEditorText(enhanced);
+			enhance.showHint("enhanced");
+		} else {
+			if (enhanced.length === 0 || enhanced === text) {
+				ctx.ui.notify("next-prompt: prompt already clear", "info");
+			}
+			finishEnhance(enhance, ac);
+		}
+		if (ref.enhanceInflight === ac) ref.enhanceInflight = undefined;
 	}
 
 	/**
@@ -2744,6 +3129,20 @@ export async function configureInteractively(
 		"Yes = use the configured model even if it's on a different provider (requires per-project consent). No = fall back to the current model.",
 	);
 	update.allowCrossProvider = cross;
+
+	// 10. enhanceEnabled (confirm)
+	const enhanceOn = await ctx.ui.confirm(
+		`next-prompt: enable enhance-prompt keybinding? [${current.enhanceEnabled ?? DEFAULT_ENHANCE_ENABLED}]`,
+		"Yes = a keybinding rewrites your current prompt in place for clarity (same key or Esc reverts). No = disable.",
+	);
+	update.enhanceEnabled = enhanceOn;
+
+	// 11. enhanceKey (free text)
+	const enhanceKeyPick = await ctx.ui.input(
+		`next-prompt: enhance key [${current.enhanceKey ?? DEFAULT_ENHANCE_KEY}]`,
+		current.enhanceKey ?? DEFAULT_ENHANCE_KEY,
+	);
+	if (enhanceKeyPick) update.enhanceKey = enhanceKeyPick.trim();
 
 	return update;
 }

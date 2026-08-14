@@ -7,6 +7,8 @@ fills the box without sending.
 
 ![After a turn settles, arrows or Alt+< / Alt+> wrap through up to three next-prompt suggestions; Enter fills the box](demo.gif)
 
+![Enhance: press Alt+? to rewrite the typed prompt in place for clarity — without changing intent or meaning; Alt+? or Esc reverts](enhance.gif)
+
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
 distinct next instructions you'd type and shows the first. Three render modes:
@@ -45,6 +47,25 @@ next-prompts). The first item is shown immediately.
   item and does not submit. A second Enter sends the filled prompt.
 - The hint is `(Enter · ←→)` for a single suggestion and `(Enter · 2/3 ←→)` when
   the batch has more than one item.
+
+## Enhance prompt
+
+Type a prompt, press **Alt+?** (configurable `enhanceKey`, default `alt+?`), and
+next-prompt rewrites what's in the box for clarity **without changing your intent
+or meaning** — grammar, ambiguity, and structure only. The rewrite replaces the
+box in place; press **Alt+?** again or **Esc** to revert to your original (cached,
+no extra model call), and Alt+? once more to re-apply. Editing the box commits the
+current text and drops the revert.
+
+- Only the text you typed is sent — never the conversation transcript. Secrets
+  are redacted first; since the original is always one keystroke away, redaction
+  never loses your text.
+- Uses the same model resolution and cross-provider consent gate as suggestions
+  (see Security). A model on a different destination still requires consent.
+- Fires only on a non-empty, idle editor — no effect while the agent is running
+  or the box is empty. Submitting, a new turn, or agent start aborts an in-flight
+  rewrite.
+- Disable with `"enhanceEnabled": false`.
 
 ## Install
 
@@ -85,11 +106,15 @@ package manifest uses the `pi.extensions` form, which OMP accepts directly and
 loads with its legacy `@earendil-works/pi-*` import remapping — there is no
 separate OMP package.
 
-### Upstream npm package
+### Not on npm
 
-The published gallery package is still `@gamaraan/next-prompt` from the original
-repo. That path does **not** include this fork's carousel. Prefer the GitHub
-install above.
+There is **no npm/gallery package for this fork** — GitHub is the only install
+path (use the `omp plugin install github:dnth/omp-autosuggest-reply` command
+above). The npm package `@gamaraan/next-prompt` is the **separate upstream
+project** and does **not** include this fork's carousel or enhance-prompt, so
+don't install it expecting these features. This fork keeps the same package
+*name*, so once installed from GitHub it still shows as `@gamaraan/next-prompt`
+in `omp plugin list` / `pi` — that entry is this fork.
 
 ### Manual — copy the file
 
@@ -125,10 +150,11 @@ Restart `pi` (or start a new session) after installing.
 ### Interactive: `/next-prompt-config`
 
 Run the `/next-prompt-config` slash command for a guided walkthrough of
-**every configurable option except `systemPrompt`** (that one is config-file-only) —
-a model picker (lists all available models), render mode, thinking level, accept
-key, re-arm delay, transcript/recent-turn/suggestion caps, and cross-provider
-disclosure. Changes are saved to the host agent dir
+**every configurable option except `systemPrompt` and `enhanceSystemPrompt`**
+(those two are config-file-only) — a model picker (lists all available models),
+render mode, thinking level, accept key, re-arm delay,
+transcript/recent-turn/suggestion caps, cross-provider disclosure, and the
+enhance-prompt toggle + key. Changes are saved to the host agent dir
 (`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP)
 and the host reloads so they take effect immediately.
 
@@ -153,7 +179,9 @@ comes from the host's `CONFIG_DIR_NAME`:
   "maxTranscriptChars": 12000,
   "maxRecentTurns": 10,
   "maxSuggestionChars": 240,
-  "allowCrossProvider": false
+  "allowCrossProvider": false,
+  "enhanceEnabled": true,
+  "enhanceKey": "alt+?"
 }
 ```
 
@@ -170,6 +198,9 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
+| `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires only on a non-empty, idle editor; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
+| `enhanceKey` | `"alt+?"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. |
+| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/next-prompt-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
 
@@ -293,6 +324,12 @@ one listener and re-installs the editor once.
    re-arms the last suggestion after `rearmDelayMs` (no new model call).
    Dismissing via Escape/up/down never re-arms, and typing invalidates any
    in-flight suggestion request.
+5. The enhance key (`enhanceKey`, default `alt+?`) is intercepted the same way,
+   but acts on a **non-empty** editor: it sends only the typed text (redacted)
+   to the resolved model with `ENHANCE_SYSTEM_PROMPT`, then replaces the box with
+   the rewrite via `ctx.ui.setEditorText`. The same key or Escape restores the
+   cached original; editing commits and drops the cache. Staleness is guarded by
+   the input generation and by requiring the editor to still hold the sent text.
 
 ## Develop
 

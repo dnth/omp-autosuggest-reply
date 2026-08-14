@@ -52,6 +52,7 @@ import {
 	projectTrustedForHost,
 	redactSecrets,
 	resolveSuggestionModel,
+	sanitizeEnhancedPrompt,
 	sanitizeSuggestion,
 	sanitizeTerminalText,
 	saveConfig,
@@ -828,6 +829,10 @@ describe("matchesAcceptKeyRaw", () => {
 
 	test('alt+e matches "\x1be"', () => {
 		expect(matchesAcceptKeyRaw("\x1be", "alt+e")).toBe(true);
+	});
+
+	test('alt+? matches "\x1b?" (default enhance key)', () => {
+		expect(matchesAcceptKeyRaw("\x1b?", "alt+?")).toBe(true);
 	});
 
 	test('ctrl+space matches NUL "\x00"', () => {
@@ -4115,6 +4120,8 @@ describe("configureInteractively", () => {
 				maxRecentTurns: "12",
 				maxSuggestionChars: "200",
 				allowCrossProvider: false,
+				enhanceEnabled: true,
+				enhanceKey: "alt+?",
 			},
 		});
 		const out = await configureInteractively(ctx, {});
@@ -4128,6 +4135,8 @@ describe("configureInteractively", () => {
 			maxRecentTurns: 12,
 			maxSuggestionChars: 200,
 			allowCrossProvider: false,
+			enhanceEnabled: true,
+			enhanceKey: "alt+?",
 		});
 	});
 
@@ -5005,5 +5014,194 @@ describe("OMP acceptance / privacy", () => {
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space · ←→");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Enhance-prompt (in-place rewrite of the typed prompt)
+// ---------------------------------------------------------------------------
+
+describe("sanitizeEnhancedPrompt", () => {
+	test("EN1: passes clean text through unchanged", () => {
+		expect(sanitizeEnhancedPrompt("Fix the parser bug.")).toBe(
+			"Fix the parser bug.",
+		);
+	});
+	test("EN2: strips a surrounding code fence", () => {
+		expect(sanitizeEnhancedPrompt("```\nFix the bug.\n```")).toBe("Fix the bug.");
+	});
+	test("EN3: strips one layer of matching quotes", () => {
+		expect(sanitizeEnhancedPrompt('"Fix the bug."')).toBe("Fix the bug.");
+	});
+	test("EN4: preserves internal newlines (multi-line prompt)", () => {
+		expect(sanitizeEnhancedPrompt("Step one.\nStep two.")).toBe(
+			"Step one.\nStep two.",
+		);
+	});
+	test("EN5: NONE sentinel and blank/punctuation replies become empty", () => {
+		expect(sanitizeEnhancedPrompt("NONE")).toBe("");
+		expect(sanitizeEnhancedPrompt("   ")).toBe("");
+		expect(sanitizeEnhancedPrompt("...")).toBe("");
+	});
+	test("EN6: strips terminal control sequences", () => {
+		expect(sanitizeEnhancedPrompt("Fix\x1b[31m the bug.")).toBe("Fix the bug.");
+	});
+});
+
+describe("enhance config parsing", () => {
+	test("EN7: valid enhance keys load", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				enhanceEnabled: false,
+				enhanceKey: "alt+j",
+				enhanceSystemPrompt: "rewrite it",
+			}),
+		);
+		const cfg = loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-")));
+		expect(cfg.enhanceEnabled).toBe(false);
+		expect(cfg.enhanceKey).toBe("alt+j");
+		expect(cfg.enhanceSystemPrompt).toBe("rewrite it");
+	});
+	test("EN8: enhanceKey 'enter'/'tab'/empty/non-string are rejected", () => {
+		for (const bad of ["enter", "tab", ""]) {
+			writeFile(
+				process.env.PI_CODING_AGENT_DIR!,
+				"next-prompt.json",
+				JSON.stringify({ enhanceKey: bad }),
+			);
+			expect(
+				loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).enhanceKey,
+			).toBeUndefined();
+		}
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enhanceKey: 7 }),
+		);
+		expect(
+			loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).enhanceKey,
+		).toBeUndefined();
+	});
+});
+
+const ENHANCE_KEY = "\x1b?"; // alt+? default (ESC ?)
+
+describe("enhance key handling (onTerminalInput)", () => {
+	test("EN9: enhance rewrites the editor in place with one model call", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		const result = fake.inputHandler!(ENHANCE_KEY);
+		expect(result).toEqual({ consume: true });
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+		// Only the typed text is sent (no transcript); enhance system prompt used.
+		const call = fake.calls.complete[0]!;
+		expect(String(call.systemPrompt)).toContain("rewrite a single instruction");
+		expect(JSON.stringify(call.messages)).toContain("fix teh parser bug");
+	});
+
+	test("EN10: same key toggles to original and re-applies (no new call)", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+		fake.inputHandler!(ENHANCE_KEY);
+		expect(fake.editorText).toBe("fix teh parser bug");
+		fake.inputHandler!(ENHANCE_KEY);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("EN11: Escape reverts to the original", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+		const result = fake.inputHandler!("\x1b");
+		expect(result).toEqual({ consume: true });
+		expect(fake.editorText).toBe("fix teh parser bug");
+	});
+
+	test("EN12: empty editor is a no-op (nothing to enhance)", async () => {
+		const { fake } = await setup({});
+		fake.setEditorText("");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(20);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("EN13: not idle → key consumed but no model call", async () => {
+		const { fake } = await setup({});
+		fake.setIdle(false);
+		fake.setEditorText("do the thing");
+		const result = fake.inputHandler!(ENHANCE_KEY);
+		expect(result).toEqual({ consume: true });
+		await sleep(20);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("EN14: disabled → key not consumed, no model call", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enhanceEnabled: false }),
+		);
+		const { fake } = await setup({});
+		fake.setEditorText("do the thing");
+		const result = fake.inputHandler!(ENHANCE_KEY);
+		await sleep(20);
+		expect(result).toBeUndefined();
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("EN15: 'already clear' reply keeps the typed text and notifies", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "do the thing" }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("do the thing");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("do the thing");
+		expect(fake.calls.notifies.some(([m]) => m.includes("already clear"))).toBe(
+			true,
+		);
+	});
+
+	test("EN16: editing after triggering discards the stale result", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "SHOULD NOT APPLY" }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("original text");
+		fake.inputHandler!(ENHANCE_KEY); // start async enhance
+		fake.inputHandler!("x"); // user edits: bumps generation + aborts enhance
+		fake.setEditorText("edited text");
+		await sleep(30);
+		expect(fake.editorText).toBe("edited text");
 	});
 });
