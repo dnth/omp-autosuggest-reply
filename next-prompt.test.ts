@@ -5089,7 +5089,7 @@ describe("enhance config parsing", () => {
 	});
 });
 
-const ENHANCE_KEY = "\x1b/"; // alt+/ default (legacy ESC /, protocol-independent)
+const ENHANCE_KEY = "\x1b[1;5A"; // ctrl+up default (xterm modified-arrow form)
 
 describe("enhance key handling (onTerminalInput)", () => {
 	test("EN9: enhance rewrites the editor in place with one model call", async () => {
@@ -5208,7 +5208,7 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(fake.editorText).toBe("edited text");
 	});
 
-	test("EN17: kitty Alt+/ release after press does not abort enhance", async () => {
+	test("EN17: kitty Ctrl+Up release after press does not abort enhance", async () => {
 		const { fake } = await setup({
 			completeResult: {
 				content: [{ type: "text", text: "Fix the parser bug." }],
@@ -5216,8 +5216,8 @@ describe("enhance key handling (onTerminalInput)", () => {
 			},
 		});
 		fake.setEditorText("fix teh parser bug");
-		const press = "\x1b[47;3:1u"; // CSI-u Alt+/ press
-		const release = "\x1b[47;3:3u"; // CSI-u Alt+/ release
+		const press = "\x1b[1;5:1A"; // kitty Ctrl+Up press
+		const release = "\x1b[1;5:3A"; // kitty Ctrl+Up release
 		// Non-vacuous: the press MUST match the enhance key, otherwise consume
 		// would be undefined and complete would stay 0.
 		expect(
@@ -5241,8 +5241,8 @@ describe("enhance key handling (onTerminalInput)", () => {
 			},
 		});
 		fake.setEditorText("fix teh parser bug");
-		const press = "\x1b[47;3:1u";
-		const release = "\x1b[47;3:3u";
+		const press = "\x1b[1;5:1A";
+		const release = "\x1b[1;5:3A";
 		expect(fake.inputHandler!(press)).toEqual({ consume: true });
 		expect(fake.inputHandler!(release)).toBeUndefined();
 		await sleep(30);
@@ -5260,33 +5260,41 @@ describe("enhance key encoding under enhanced keyboard protocols", () => {
 	// must therefore be a non-shift key. Each assertion mirrors the input
 	// handler check: matchesKey(data, key) || matchesAcceptKeyRaw(data, key).
 
-	// xterm modifyOtherKeys form: CSI 27 ; (modifier+1) ; codepoint ~
-	const MOK_ALT_SHIFT_SLASH = "\x1b[27;4;47~"; // Alt+Shift+/ (base '/', 47)
-	const MOK_ALT_SHIFT_QMARK = "\x1b[27;4;63~"; // Alt+Shift+/ (shifted '?', 63)
-	const MOK_ALT_SLASH = "\x1b[27;3;47~"; // Alt+/ (no shift)
+	// Ctrl+Up arrives as a modified arrow in every protocol (never a bare
+	// ESC+char), so matchesKey() — not matchesAcceptKeyRaw() — must carry it:
+	//   xterm legacy / modifyOtherKeys → CSI 1;5A
+	//   SS3 variant                     → ESC O a
+	//   kitty CSI-u press/release       → CSI 1;5:1A / CSI 1;5:3A
+	const LEGACY_CTRL_UP = "\x1b[1;5A";
+	const SS3_CTRL_UP = "\x1bOa";
+	const KITTY_CTRL_UP_PRESS = "\x1b[1;5:1A";
+	const KITTY_CTRL_UP_RELEASE = "\x1b[1;5:3A";
 
-	test("default alt+/ fires under modifyOtherKeys and legacy", () => {
+	test("default ctrl+up fires under legacy, SS3, and kitty forms", () => {
 		const key = DEFAULT_ENHANCE_KEY;
-		expect(
-			matchesKey(MOK_ALT_SLASH, key) || matchesAcceptKeyRaw(MOK_ALT_SLASH, key),
-		).toBe(true);
-		expect(
-			matchesKey("\x1b/", key) || matchesAcceptKeyRaw("\x1b/", key),
-		).toBe(true);
+		for (const seq of [LEGACY_CTRL_UP, SS3_CTRL_UP, KITTY_CTRL_UP_PRESS])
+			expect(matchesKey(seq, key) || matchesAcceptKeyRaw(seq, key)).toBe(
+				true,
+			);
+		// Bare Up and Shift+Up must NOT fire the enhance key.
+		expect(matchesKey("\x1b[A", key)).toBe(false);
+		expect(matchesKey("\x1b[1;2A", key)).toBe(false);
 	});
 
-	test("default alt+/ fires on CSI-u press; release is a key-release not a match", () => {
+	test("default ctrl+up fires on kitty press; release is a key-release not a match", () => {
 		const key = DEFAULT_ENHANCE_KEY;
-		const press = "\x1b[47;3:1u";
-		const release = "\x1b[47;3:3u";
-		expect(matchesKey(press, key) || matchesAcceptKeyRaw(press, key)).toBe(
-			true,
-		);
-		expect(isKittyKeyRelease(press)).toBe(false);
-		expect(isKittyKeyRelease(release)).toBe(true);
+		expect(
+			matchesKey(KITTY_CTRL_UP_PRESS, key) ||
+				matchesAcceptKeyRaw(KITTY_CTRL_UP_PRESS, key),
+		).toBe(true);
+		expect(isKittyKeyRelease(KITTY_CTRL_UP_PRESS)).toBe(false);
+		expect(isKittyKeyRelease(KITTY_CTRL_UP_RELEASE)).toBe(true);
 	});
 
-	test("regression: alt+? is DEAD under modifyOtherKeys (why it is not the default)", () => {
+	test("regression: alt+? is DEAD under modifyOtherKeys (why shift-bearing keys are rejected)", () => {
+		// xterm modifyOtherKeys form: CSI 27 ; (modifier+1) ; codepoint ~
+		const MOK_ALT_SHIFT_SLASH = "\x1b[27;4;47~"; // Alt+Shift+/ (base '/', 47)
+		const MOK_ALT_SHIFT_QMARK = "\x1b[27;4;63~"; // Alt+Shift+/ (shifted '?', 63)
 		expect(
 			matchesKey(MOK_ALT_SHIFT_SLASH, "alt+?") ||
 				matchesAcceptKeyRaw(MOK_ALT_SHIFT_SLASH, "alt+?"),
@@ -5303,7 +5311,7 @@ describe("enhance key encoding under enhanced keyboard protocols", () => {
 	});
 
 	test("DEFAULT_ENHANCE_KEY is a non-shift key", () => {
-		expect(DEFAULT_ENHANCE_KEY).toBe("alt+/");
+		expect(DEFAULT_ENHANCE_KEY).toBe("ctrl+up");
 		expect(DEFAULT_ENHANCE_KEY.includes("shift")).toBe(false);
 	});
 });

@@ -164,7 +164,7 @@ export interface NextPromptConfig {
 	enhanceEnabled?: boolean;
 	/**
 	 * Key id (any pi-tui KeyId) that enhances the current editor text. Defaults
-	 * to "alt+/". Must differ from `acceptKey`; "enter"/"tab" are rejected.
+	 * to "ctrl+up". Must differ from `acceptKey`; "enter"/"tab" are rejected.
 	 */
 	enhanceKey?: string;
 	/** System-prompt override for the enhance model (config-file only). */
@@ -234,7 +234,7 @@ export const DEFAULT_REARM_MS = 2000;
 export const SUGGESTION_BATCH_SIZE = 3;
 
 /** Default keybinding that rewrites the current editor text in place. */
-export const DEFAULT_ENHANCE_KEY = "alt+/";
+export const DEFAULT_ENHANCE_KEY = "ctrl+up";
 /** Whether the enhance-prompt keybinding is active when unset in config. */
 export const DEFAULT_ENHANCE_ENABLED = true;
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
@@ -315,7 +315,7 @@ export function isRightArrow(data: string): boolean {
  * NOTE: a shift-bearing symbol keyid (e.g. "alt+?") cannot match under the
  * enhanced keyboard protocols — the terminal reports modifier shift|alt while
  * the keyid carries only alt, and matchesKey() requires exact modifier
- * equality. Keep DEFAULT_ENHANCE_KEY on a non-shift key such as "alt+/".
+ * equality. Keep DEFAULT_ENHANCE_KEY on a non-shift key such as "ctrl+up".
  */
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	const parts = acceptKey.split("+");
@@ -350,9 +350,9 @@ export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 /**
  * Kitty keyboard protocol key-release (event type 3), e.g. CSI `47;3:3u`.
  * OMP delivers these to `onTerminalInput` before the editor filters them.
- * They must not be treated as a real edit: after Alt+/ press starts enhance,
- * the matching release would abort the in-flight rewrite (OMP's matchesKey
- * does not classify release as the same keyid).
+ * They must not be treated as a real edit: after the enhance key press starts
+ * enhance, the matching release would abort the in-flight rewrite (OMP's
+ * matchesKey does not classify release as the same keyid).
  */
 export function isKittyKeyRelease(data: string): boolean {
 	return /^\x1b\[[\d:;]*:3[u~ABCDHF]$/.test(data);
