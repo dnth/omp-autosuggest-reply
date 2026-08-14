@@ -80,17 +80,17 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Run print/JSON/RPC modes and confirm no hidden suggestion request
   occurs.
 
-### Enhance prompt (default key `Alt+?`)
+### Enhance prompt (default key `Alt+/`)
 
-- [ ] Type a prompt, press Alt+?: the box is replaced by a clearer rewrite with
-  the same meaning; a below-editor `↳ enhanced (Alt-? · Esc to revert)` hint
+- [ ] Type a prompt, press Alt+/: the box is replaced by a clearer rewrite with
+  the same meaning; a below-editor `↳ enhanced (Alt-/ · Esc to revert)` hint
   shows; exactly one model call.
-- [ ] Press Alt+? again → original text restored (`↳ original`); Alt+? once more
+- [ ] Press Alt+/ again → original text restored (`↳ original`); Alt+/ once more
   → enhanced text restored; NO additional model call on either toggle.
 - [ ] Press Esc while enhanced → original restored, hint cleared.
-- [ ] Edit the box after enhancing → the revert hint clears and Alt+? starts a
+- [ ] Edit the box after enhancing → the revert hint clears and Alt+/ starts a
   fresh rewrite of the edited text.
-- [ ] Alt+? on an empty editor or while the agent is running does nothing (no
+- [ ] Alt+/ on an empty editor or while the agent is running does nothing (no
   model call).
 - [ ] Submit the enhanced prompt → it sends normally; an in-flight rewrite is
   aborted by submit/new turn/agent start with no stale replacement.
@@ -127,8 +127,8 @@ checks.
   destination for the session with no request; grant persists across sessions;
   a route change re-prompts.
 - [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
-- [ ] Enhance prompt: type a prompt, press Alt+? → box replaced by a clearer
-  rewrite (one `completeSimple` call, only the typed text sent); Alt+?/Esc
+- [ ] Enhance prompt: type a prompt, press Alt+/ → box replaced by a clearer
+  rewrite (one `completeSimple` call, only the typed text sent); Alt+/ or Esc
   revert to the original with no extra call; disabled cleanly with
   `"enhanceEnabled": false`.
 

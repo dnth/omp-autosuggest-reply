@@ -7,7 +7,7 @@ fills the box without sending.
 
 ![After a turn settles, arrows or Alt+< / Alt+> wrap through up to three next-prompt suggestions; Enter fills the box](demo.gif)
 
-![Enhance: press Alt+? to rewrite the typed prompt in place for clarity — without changing intent or meaning; Alt+? or Esc reverts](enhance.gif)
+![Enhance: press Alt+/ to rewrite the typed prompt in place for clarity — without changing intent or meaning; Alt+/ or Esc reverts](enhance.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
@@ -50,11 +50,11 @@ next-prompts). The first item is shown immediately.
 
 ## Enhance prompt
 
-Type a prompt, press **Alt+?** (configurable `enhanceKey`, default `alt+?`), and
+Type a prompt, press **Alt+/** (configurable `enhanceKey`, default `alt+/`), and
 next-prompt rewrites what's in the box for clarity **without changing your intent
 or meaning** — grammar, ambiguity, and structure only. The rewrite replaces the
-box in place; press **Alt+?** again or **Esc** to revert to your original (cached,
-no extra model call), and Alt+? once more to re-apply. Editing the box commits the
+box in place; press **Alt+/** again or **Esc** to revert to your original (cached,
+no extra model call), and Alt+/ once more to re-apply. Editing the box commits the
 current text and drops the revert.
 
 - Only the text you typed is sent — never the conversation transcript. Secrets
@@ -177,7 +177,7 @@ comes from the host's `CONFIG_DIR_NAME`:
   "maxSuggestionChars": 240,
   "allowCrossProvider": false,
   "enhanceEnabled": true,
-  "enhanceKey": "alt+?"
+  "enhanceKey": "alt+/"
 }
 ```
 
@@ -195,7 +195,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires only on a non-empty, idle editor; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
-| `enhanceKey` | `"alt+?"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. |
+| `enhanceKey` | `"alt+/"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
 | `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/next-prompt-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
@@ -320,7 +320,7 @@ one listener and re-installs the editor once.
    re-arms the last suggestion after `rearmDelayMs` (no new model call).
    Dismissing via Escape/up/down never re-arms, and typing invalidates any
    in-flight suggestion request.
-5. The enhance key (`enhanceKey`, default `alt+?`) is intercepted the same way,
+5. The enhance key (`enhanceKey`, default `alt+/`) is intercepted the same way,
    but acts on a **non-empty** editor: it sends only the typed text (redacted)
    to the resolved model with `ENHANCE_SYSTEM_PROMPT`, then replaces the box with
    the rewrite via `ctx.ui.setEditorText`. The same key or Escape restores the

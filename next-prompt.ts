@@ -164,7 +164,7 @@ export interface NextPromptConfig {
 	enhanceEnabled?: boolean;
 	/**
 	 * Key id (any pi-tui KeyId) that enhances the current editor text. Defaults
-	 * to "alt+?". Must differ from `acceptKey`; "enter"/"tab" are rejected.
+	 * to "alt+/". Must differ from `acceptKey`; "enter"/"tab" are rejected.
 	 */
 	enhanceKey?: string;
 	/** System-prompt override for the enhance model (config-file only). */
@@ -234,7 +234,7 @@ export const DEFAULT_REARM_MS = 2000;
 export const SUGGESTION_BATCH_SIZE = 3;
 
 /** Default keybinding that rewrites the current editor text in place. */
-export const DEFAULT_ENHANCE_KEY = "alt+?";
+export const DEFAULT_ENHANCE_KEY = "alt+/";
 /** Whether the enhance-prompt keybinding is active when unset in config. */
 export const DEFAULT_ENHANCE_ENABLED = true;
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
@@ -302,14 +302,20 @@ export function isRightArrow(data: string): boolean {
 }
 
 /**
- * Raw-byte fallback for accept-key detection, for terminals where pi-tui's
- * matchesKey() doesn't recognize a legacy alt+symbol sequence. Handles the
- * common forms an accept key can arrive in:
- *   enter    → "\r" / "\n"
- *   alt+/    → "\x1b/"  (or sometimes "\x1bO/" / kitty CSI-u)
+ * Raw-byte fallback for accept-key detection, covering the LEGACY escape forms
+ * that pi-tui's matchesKey() does not recognize on its own. Modern CSI-u (kitty)
+ * and xterm modifyOtherKeys encodings are matched by matchesKey(); this only
+ * adds the pre-protocol forms:
+ *   enter      → "\r" / "\n"
+ *   alt+<char> → "\x1b<char>" (or SS3 "\x1bO<char>")
  *   ctrl+space → "\x00"
  * Only the last modifier+key segment is considered. Returns true if `data`
- * matches any of the candidate byte forms for the configured key.
+ * matches any candidate byte form for the configured key.
+ *
+ * NOTE: a shift-bearing symbol keyid (e.g. "alt+?") cannot match under the
+ * enhanced keyboard protocols — the terminal reports modifier shift|alt while
+ * the keyid carries only alt, and matchesKey() requires exact modifier
+ * equality. Keep DEFAULT_ENHANCE_KEY on a non-shift key such as "alt+/".
  */
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	const parts = acceptKey.split("+");

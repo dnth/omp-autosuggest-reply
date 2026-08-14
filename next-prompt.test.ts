@@ -22,6 +22,7 @@ import {
 	CURSOR_MARKER,
 	Editor,
 	getKeybindings,
+	matchesKey,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
@@ -33,6 +34,7 @@ import {
 	configureInteractively,
 	consentChoiceFromLabel,
 	DEFAULT_ACCEPT_KEY,
+	DEFAULT_ENHANCE_KEY,
 	destinationKey,
 	destinationOf,
 	detectHost,
@@ -831,7 +833,7 @@ describe("matchesAcceptKeyRaw", () => {
 		expect(matchesAcceptKeyRaw("\x1be", "alt+e")).toBe(true);
 	});
 
-	test('alt+? matches "\x1b?" (default enhance key)', () => {
+	test('alt+? matches legacy "\x1b?" (shift-symbol; not the default)', () => {
 		expect(matchesAcceptKeyRaw("\x1b?", "alt+?")).toBe(true);
 	});
 
@@ -5086,7 +5088,7 @@ describe("enhance config parsing", () => {
 	});
 });
 
-const ENHANCE_KEY = "\x1b?"; // alt+? default (ESC ?)
+const ENHANCE_KEY = "\x1b/"; // alt+/ default (legacy ESC /, protocol-independent)
 
 describe("enhance key handling (onTerminalInput)", () => {
 	test("EN9: enhance rewrites the editor in place with one model call", async () => {
@@ -5203,5 +5205,51 @@ describe("enhance key handling (onTerminalInput)", () => {
 		fake.setEditorText("edited text");
 		await sleep(30);
 		expect(fake.editorText).toBe("edited text");
+	});
+});
+
+describe("enhance key encoding under enhanced keyboard protocols", () => {
+	// Reproduces the alt+? bug: pi-tui enables xterm modifyOtherKeys=2 / kitty,
+	// so a modified keypress arrives as a CSI sequence, not a bare ESC+char.
+	// "alt+?" is physically Alt+Shift+/, so the terminal reports modifier
+	// shift|alt, but the keyid parses to alt only and matchesKey() requires
+	// exact modifier equality — the match can never succeed. The default key
+	// must therefore be a non-shift key. Each assertion mirrors the input
+	// handler check: matchesKey(data, key) || matchesAcceptKeyRaw(data, key).
+
+	// xterm modifyOtherKeys form: CSI 27 ; (modifier+1) ; codepoint ~
+	const MOK_ALT_SHIFT_SLASH = "\x1b[27;4;47~"; // Alt+Shift+/ (base '/', 47)
+	const MOK_ALT_SHIFT_QMARK = "\x1b[27;4;63~"; // Alt+Shift+/ (shifted '?', 63)
+	const MOK_ALT_SLASH = "\x1b[27;3;47~"; // Alt+/ (no shift)
+
+	test("default alt+/ fires under modifyOtherKeys and legacy", () => {
+		const key = DEFAULT_ENHANCE_KEY;
+		expect(
+			matchesKey(MOK_ALT_SLASH, key) || matchesAcceptKeyRaw(MOK_ALT_SLASH, key),
+		).toBe(true);
+		expect(
+			matchesKey("\x1b/", key) || matchesAcceptKeyRaw("\x1b/", key),
+		).toBe(true);
+	});
+
+	test("regression: alt+? is DEAD under modifyOtherKeys (why it is not the default)", () => {
+		expect(
+			matchesKey(MOK_ALT_SHIFT_SLASH, "alt+?") ||
+				matchesAcceptKeyRaw(MOK_ALT_SHIFT_SLASH, "alt+?"),
+		).toBe(false);
+		expect(
+			matchesKey(MOK_ALT_SHIFT_QMARK, "alt+?") ||
+				matchesAcceptKeyRaw(MOK_ALT_SHIFT_QMARK, "alt+?"),
+		).toBe(false);
+		// Only the pre-protocol form matches — which a real VTE/xterm never sends
+		// once modifyOtherKeys/kitty is negotiated. This false-positive hid the bug.
+		expect(
+			matchesKey("\x1b?", "alt+?") || matchesAcceptKeyRaw("\x1b?", "alt+?"),
+		).toBe(true);
+	});
+
+	test("DEFAULT_ENHANCE_KEY is a non-shift key", () => {
+		expect(DEFAULT_ENHANCE_KEY).toBe("alt+/");
+		expect(DEFAULT_ENHANCE_KEY.includes("shift")).toBe(false);
 	});
 });
