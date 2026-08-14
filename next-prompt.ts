@@ -1416,6 +1416,15 @@ export interface SuggestionState {
 	fallbackToWidget: (() => void) | undefined;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
+	/**
+	 * Set by the global terminal-input listener for the current dispatch.
+	 * Custom editors consume this marker so they do not process the same key
+	 * twice, while still providing a fallback when OMP bypasses the global
+	 * listener during editor dispatch. The generation avoids a stale marker
+	 * suppressing a later identical key if another listener consumed the input.
+	 */
+	globalInputData?: string;
+	globalInputGeneration?: number;
 }
 
 /** Publish the below-editor widget (or clear it when there's no suggestion). */
@@ -1577,22 +1586,30 @@ function isConsentDialogKey(data: string): boolean {
 		data.startsWith("\x1bO")
 	);
 }
-
 /**
- * Raw terminal-input handler. Accept key fills the editor; any other key
- * dismisses the active suggestion immediately (F-04), invalidates in-flight
- * work (F-08), and schedules a re-arm only for a genuine delete-to-empty
- * transition (F-09). Editor-independent via ctx.ui.onTerminalInput.
+ * Raw terminal-input handler. The same policy is also used by GhostEditor as
+ * an editor-local fallback because OMP versions can dispatch custom-editor
+ * input without invoking the extension's global listener.
  */
 function makeInputHandler(
 	state: SuggestionState,
 	isInputSuppressed: () => boolean = () => false,
+	recordGlobalInput = true,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
+		const markGlobalInput = () => {
+			if (!recordGlobalInput) return;
+			state.globalInputData = data;
+			state.globalInputGeneration = state.inputGeneration;
+		};
+
 		// Modal UI dialogs (such as the consent selector) own their navigation
 		// and confirmation keys. Do not treat those keys as editor input or
 		// invalidate the in-flight consent request.
-		if (isInputSuppressed() && isConsentDialogKey(data)) return undefined;
+		if (isInputSuppressed() && isConsentDialogKey(data)) {
+			markGlobalInput();
+			return undefined;
+		}
 
 		const isAcceptKey =
 			matchesKey(data, state.acceptKey as KeyId) ||
@@ -1630,6 +1647,7 @@ function makeInputHandler(
 			data === "\x7f" || data === "\x08" || data === "\x1b[3~";
 		if (state.suggestion || !isDeleteKey) dismissSuggestion(state);
 		state.inputGeneration += 1;
+		markGlobalInput();
 		state.abortInflight();
 		scheduleRearmCheck(state, editorTextBefore);
 		return undefined;
@@ -1647,8 +1665,8 @@ export const SYSTEM_PROMPT = `You predict the single most logical next instructi
 // ---------------------------------------------------------------------------
 // A render-only CustomEditor that overlays the current suggestion
 // (state.suggestion) as greyed inline text after the caret via overlayGhost().
-// Acceptance/dismissal is handled by the global onTerminalInput handler, so
-// this class never decides policy. Installed once per session; pi's
+// Acceptance/dismissal is normally handled by the global onTerminalInput
+// handler; GhostEditor repeats that policy only when OMP bypasses the listener.
 // resetExtensionUI on reload/switch is followed by a fresh session_start that
 // re-installs it (no per-settle re-installation — F-05).
 
@@ -1705,8 +1723,18 @@ class GhostEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		// The global handler already dismissed/accepted; delegate everything to the
-		// base editor (autocomplete, history, paste, app keybindings) untouched.
+		// OMP normally runs the global listener before the focused editor. If
+		// that listener was bypassed, apply the same accept/dismiss policy here.
+		// A per-dispatch marker prevents duplicate handling when both paths run.
+		const globallyHandled =
+			this.suggestionState.globalInputData === data &&
+			this.suggestionState.globalInputGeneration === this.suggestionState.inputGeneration;
+		this.suggestionState.globalInputData = undefined;
+		this.suggestionState.globalInputGeneration = undefined;
+		if (!globallyHandled) {
+			const result = makeInputHandler(this.suggestionState, () => false, false)?.(data);
+			if (result?.consume) return;
+		}
 		super.handleInput(data);
 		this.tui?.requestRender();
 	}

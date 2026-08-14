@@ -1530,10 +1530,12 @@ describe("real pi-tui editor integration", () => {
 		);
 		ed.focused = true;
 		ed.setText("abc");
-		// Move cursor to the start: left, left, left.
-		ed.handleInput("\x1b[D");
-		ed.handleInput("\x1b[D");
-		ed.handleInput("\x1b[D");
+		// Mark each cursor movement as already handled by the global listener;
+		for (let i = 0; i < 3; i++) {
+			state.globalInputData = "\x1b[D";
+			state.globalInputGeneration = state.inputGeneration;
+			ed.handleInput("\x1b[D");
+		}
 		const lines = ed.render(40).join("\n");
 		// Cursor sits on the first grapheme: highlighted "a", then ghost (+
 		// accept-key hint), then "bc".
@@ -1558,6 +1560,27 @@ describe("real pi-tui editor integration", () => {
 		ed.setText("");
 		ed.handleInput("\x1b[A"); // up arrow
 		expect(ed.getText()).toBe("prompt one");
+	});
+
+	test("E4c: GhostEditor fallback clears and accepts when global input interception is bypassed", () => {
+		let ed: GhostEditor;
+		const state = mkGhostState({
+			suggestion: "npm test",
+			getEditorText: () => ed.getText(),
+			setEditorText: text => ed.setText(text),
+		});
+		ed = new GhostEditor(mkTui(), mkTheme(), getKeybindings() as never, state);
+		ed.focused = true;
+
+		ed.handleInput("a");
+		expect(ed.getText()).toBe("a");
+		expect(state.suggestion).toBe("");
+
+		ed.setText("");
+		state.suggestion = "npm test";
+		ed.handleInput("\x1b/");
+		expect(ed.getText()).toBe("npm test");
+		expect(state.suggestion).toBe("");
 	});
 
 	test("E4b: ghost overlay failure → render still returns base lines and falls back to widget exactly once (P1-1)", () => {
