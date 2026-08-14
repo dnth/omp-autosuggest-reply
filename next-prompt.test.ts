@@ -780,8 +780,8 @@ describe("resolveSuggestionModel", () => {
 // ---------------------------------------------------------------------------
 
 describe("acceptKey / humanizeKey", () => {
-	test('DEFAULT_ACCEPT_KEY is "alt+/"', () => {
-		expect(DEFAULT_ACCEPT_KEY).toBe("alt+/");
+	test('DEFAULT_ACCEPT_KEY is "enter"', () => {
+		expect(DEFAULT_ACCEPT_KEY).toBe("enter");
 	});
 
 	test("humanizeKey: ctrl+tab → Ctrl-Tab", () => {
@@ -794,6 +794,10 @@ describe("acceptKey / humanizeKey", () => {
 
 	test("humanizeKey: ctrl+shift+enter → Ctrl-Shift-Enter", () => {
 		expect(humanizeKey("ctrl+shift+enter")).toBe("Ctrl-Shift-Enter");
+	});
+
+	test("humanizeKey: enter → Enter", () => {
+		expect(humanizeKey("enter")).toBe("Enter");
 	});
 
 	test("humanizeKey: alt+/ → Alt-/", () => {
@@ -845,6 +849,12 @@ describe("matchesAcceptKeyRaw", () => {
 	test("empty acceptKey → false", () => {
 		expect(matchesAcceptKeyRaw("\x1b/", "")).toBe(false);
 	});
+	test("enter matches CR and LF", () => {
+		expect(matchesAcceptKeyRaw("\r", "enter")).toBe(true);
+		expect(matchesAcceptKeyRaw("\n", "enter")).toBe(true);
+		expect(matchesAcceptKeyRaw("\r", "shift+enter")).toBe(false);
+		expect(matchesAcceptKeyRaw("a", "enter")).toBe(false);
+	});
 });
 
 describe("arrow keys + suggestionKey + hint", () => {
@@ -876,7 +886,7 @@ describe("arrow keys + suggestionKey + hint", () => {
 			lastSuggestion: "one",
 			alternatives: ["one"],
 			altIndex: 0,
-			acceptKey: "alt+/",
+			acceptKey: "enter",
 			renderMode: "widget" as const,
 			rearmDelayMs: 2000,
 			rearmTimer: undefined,
@@ -890,21 +900,21 @@ describe("arrow keys + suggestionKey + hint", () => {
 			fallbackToWidget: undefined,
 			abortInflight: () => {},
 		};
-		expect(formatSuggestionHint(base)).toBe("(Alt-/ · ←→)");
+		expect(formatSuggestionHint(base)).toBe("(Enter · ←→)");
 		expect(
 			formatSuggestionHint({
 				...base,
 				alternatives: ["one", "two"],
 				altIndex: 1,
 			}),
-		).toBe("(Alt-/ · 2/2 ←→)");
+		).toBe("(Enter · 2/2 ←→)");
 		expect(
 			formatSuggestionHint({
 				...base,
 				alternatives: ["one", "two", "three"],
 				altIndex: 0,
 			}),
-		).toBe("(Alt-/ · 1/3 ←→)");
+		).toBe("(Enter · 1/3 ←→)");
 		expect(SUGGESTION_BATCH_SIZE).toBe(3);
 	});
 });
@@ -1597,7 +1607,7 @@ describe("real pi-tui editor integration", () => {
 			lastSuggestion: "",
 			alternatives: [],
 			altIndex: 0,
-			acceptKey: "alt+/",
+			acceptKey: "enter",
 			renderMode: "ghost",
 			rearmDelayMs: 2000,
 			rearmTimer: undefined,
@@ -1676,7 +1686,7 @@ describe("real pi-tui editor integration", () => {
 		// Cursor sits on the first grapheme: highlighted "a", then ghost (+
 		// accept-key hint), then "bc".
 		expect(lines).toContain("\x1b[7ma\x1b[0m");
-		expect(lines).toContain("\x1b[2mghost  (Alt-/ · ←→)\x1b[22mbc");
+		expect(lines).toContain("\x1b[2mghost  (Enter · ←→)\x1b[22mbc");
 		expect(ed.getText()).toBe("abc");
 	});
 
@@ -1772,7 +1782,7 @@ describe("real pi-tui editor integration", () => {
 			return undefined;
 		});
 		// Accept key: our handler consumes → later listener and editor never see it.
-		fake.deliverInput("\x1b/");
+		fake.deliverInput("\r");
 		expect(spyCalls).toBe(0);
 		expect(fake.editor.getText()).toBe("");
 		expect(fake.editorText).toBe("accept me");
@@ -2531,14 +2541,14 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent?.[0] ?? "").toContain("Ctrl-Space · ←→");
 	});
 
-	test("T74e: no acceptKey config → widget hint shows Alt-/", async () => {
+	test("T74e: no acceptKey config → widget hint shows Enter", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
 		});
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.widgetContent?.[0] ?? "").toContain("Alt-/ · ←→");
+		expect(fake.widgetContent?.[0] ?? "").toContain("Enter · ←→");
 	});
 
 	test("T75: allowCrossProvider=false + different provider → ctx.model used", async () => {
@@ -2820,7 +2830,7 @@ describe("acceptance / regression", () => {
 		});
 		// Turn 1: suggestion shown, accepted into the editor.
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/");
+		fake.inputHandler!("\r");
 		expect(fake.editorText).toBe("stale");
 		// User submits; reset clears the cached suggestion.
 		fake.handlers.get("input")!({}, fake.ctx);
@@ -2847,8 +2857,8 @@ describe("accept handler (onTerminalInput)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
-		// Fire the accept key (alt+/ → \x1b/)
-		const result = fake.inputHandler!("\x1b/");
+		// Fire the accept key (enter → \r)
+		const result = fake.inputHandler!("\r");
 		expect(result).toEqual({ consume: true });
 		expect(fake.editorText).toBe("suggestion text");
 		expect(fake.widgetContent).toBeUndefined();
@@ -2871,7 +2881,7 @@ describe("accept handler (onTerminalInput)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.setIdle(false);
-		const result = fake.inputHandler!("\x1b/");
+		const result = fake.inputHandler!("\r");
 		expect(result).toBeUndefined();
 	});
 
@@ -2885,7 +2895,7 @@ describe("accept handler (onTerminalInput)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		fake.setEditorText("already typed");
-		const result = fake.inputHandler!("\x1b/");
+		const result = fake.inputHandler!("\r");
 		expect(result).toBeUndefined();
 		expect(fake.editorText).toBe("already typed");
 	});
@@ -2895,7 +2905,7 @@ describe("accept handler (onTerminalInput)", () => {
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		// No suggestion computed (default completeResult text "suggestion" — but clear it first)
 		fake.handlers.get("input")!({}, fake.ctx);
-		const result = fake.inputHandler!("\x1b/");
+		const result = fake.inputHandler!("\r");
 		expect(result).toBeUndefined();
 	});
 });
@@ -2929,7 +2939,7 @@ describe("re-arm after delete-to-empty", () => {
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
 		// Accept → fills editor, clears widget.
-		fake.inputHandler!("\x1b/");
+		fake.inputHandler!("\r");
 		expect(fake.editorText).toBe("redo this");
 		expect(fake.widgetContent).toBeUndefined();
 		// Delete back to empty (backspace, then clear editor text).
@@ -2953,7 +2963,7 @@ describe("re-arm after delete-to-empty", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/"); // accept → editor = "late clear"
+		fake.inputHandler!("\r"); // accept → editor = "late clear"
 		// Delete key arrives; the editor text does NOT empty within the first
 		// 50ms check (chunked/laggy terminal delivery), then settles empty.
 		fake.inputHandler!("\x7f");
@@ -2976,7 +2986,7 @@ describe("re-arm after delete-to-empty", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/"); // accept → editor = "hold delete"
+		fake.inputHandler!("\r"); // accept → editor = "hold delete"
 		// Delete to empty: the key that empties the editor.
 		fake.inputHandler!("\x7f");
 		fake.setEditorText("");
@@ -3012,7 +3022,7 @@ describe("re-arm after delete-to-empty", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/");
+		fake.inputHandler!("\r");
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
 		// Type something before the rearm timer fires.
@@ -3032,7 +3042,7 @@ describe("re-arm after delete-to-empty", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/");
+		fake.inputHandler!("\r");
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
 		fake.setIdle(false);
@@ -3052,7 +3062,7 @@ describe("re-arm after delete-to-empty", () => {
 			},
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/");
+		fake.inputHandler!("\r");
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f");
 		vi.advanceTimersByTime(150);
@@ -4142,7 +4152,7 @@ describe("configureInteractively", () => {
 				model: "(use current model)",
 				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
-				acceptKey: "alt+/",
+				acceptKey: "enter",
 				rearmDelayMs: "2000",
 				maxTranscriptChars: "12000",
 				maxRecentTurns: "",
@@ -4161,7 +4171,7 @@ describe("configureInteractively", () => {
 				model: "(use current model)",
 				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
-				acceptKey: "alt+/",
+				acceptKey: "enter",
 				rearmDelayMs: "not a number",
 				maxTranscriptChars: "abc",
 				maxRecentTurns: "abc",
@@ -4429,7 +4439,7 @@ describe("OMP lifecycle (agent_end)", () => {
 			},
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		fake.inputHandler!("\x1b/"); // accept into the editor
+		fake.inputHandler!("\r"); // accept into the editor
 		fake.setEditorText("");
 		fake.inputHandler!("\x7f"); // delete-to-empty schedules re-arm
 		fake.setIdle(false); // agent busy when the re-arm timer fires
@@ -4761,7 +4771,7 @@ describe("OMP render downgrade (widget-only)", () => {
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("suggestion text");
-		const result = fake.inputHandler!("\x1b/");
+		const result = fake.inputHandler!("\r");
 		expect(result).toEqual({ consume: true });
 		expect(fake.editorText).toBe("suggestion text");
 		expect(fake.widgetContent).toBeUndefined();
@@ -4794,7 +4804,7 @@ describe("OMP render downgrade (widget-only)", () => {
 		});
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.widgetContent?.[0] ?? "").toContain("redo this");
-		fake.inputHandler!("\x1b/"); // accept
+		fake.inputHandler!("\r"); // accept
 		expect(fake.editorText).toBe("redo this");
 		fake.inputHandler!("\x7f");
 		fake.setEditorText("");

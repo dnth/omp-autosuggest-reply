@@ -25,7 +25,7 @@ case passes.**
 - [ ] Switch terminal/app focus while a ghost is visible (unfocused editor):
   ghost still renders within the box, no overflow or corrupted styling.
 
-### Input state machine (default key `Alt-/`)
+### Input state machine (default key `Enter`)
 
 Run each sequence in `widget`, `ghost`, and `both`:
 
@@ -35,8 +35,8 @@ Run each sequence in `widget`, `ghost`, and `both`:
       first); left or Alt+< restores the previous; hint shows `1/3` / `2/3`; no extra model call;
 - [ ] settle → show → left or Alt+< on the first item wraps to the last of this batch;
       a new turn replaces the list entirely;
-- [ ] settle → show → accept → editor fills exactly once, key is swallowed
-  (no `/` typed);
+- [ ] settle → show → Enter → editor fills exactly once, key is swallowed
+  (the prompt is not sent); a second Enter submits;
 - [ ] accept → edit but do not submit → delete back to empty → the last
   suggestion re-appears after `rearmDelayMs` (no new model call);
 - [ ] accept → submit → next turn returns `NONE`/error → the old suggestion
@@ -49,9 +49,9 @@ Run each sequence in `widget`, `ghost`, and `both`:
 
 ### Autocomplete / conflicting keys
 
-- [ ] Slash/path autocomplete still works (Tab, up/down, Enter) while a
-  suggestion is showing or dismissed; accepting the suggestion never steals
-  autocomplete input.
+- [ ] Slash/path autocomplete still works (Tab, up/down, Enter) after typing
+  `/` (which dismisses a visible suggestion); Enter never steals autocomplete
+  because accept only fires on an empty editor.
 - [ ] Configure `"acceptKey": "tab"` → extension warns and ignores it;
   Tab continues to drive autocomplete and never fills the editor.
 
@@ -96,10 +96,10 @@ checks.
   accept fills the editor exactly once; delete-to-empty re-arms the last
   suggestion after `rearmDelayMs` without a second model call; ghost render
   failure falls back to the default editor + widget.
-- [ ] Widget accept (`Alt-/`) fills the editor exactly once and the raw key is
-  consumed; left/right or Alt+< / Alt+> wrap this turn's batch; any other key dismisses and passes
-  through; delete-to-empty re-arms the cached suggestion without a second model
-  call.
+- [ ] Widget accept (Enter) fills the editor exactly once and the raw key is
+  consumed so the prompt is not sent; left/right or Alt+< / Alt+> wrap this
+  turn's batch; any other key dismisses and passes through; delete-to-empty
+  re-arms the cached suggestion without a second model call.
 - [ ] Input submit, new agent start, session reload, and shutdown prevent any
   stale widget output from an in-flight request.
 - [ ] Headless / print / RPC modes create no completion request.

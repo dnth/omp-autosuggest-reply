@@ -5,7 +5,7 @@
  * turn has fully settled, computes up to three distinct next instructions
  * the user might type and shows the first. Three render modes (config
  * `renderMode`, default "widget"):
- *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Alt-/ · 1/3 ←→)`.
+ *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Enter · 1/3 ←→)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
  *   - "both":   inline ghost AND the below-editor line.
  * All three modes run on Pi and OMP. OMP has no editor-owner getter, so a ghost
@@ -13,12 +13,13 @@
  * owner), and another custom-editor extension installed first in the same OMP
  * session is not detected (last installer wins).
  *
- * The accept key (default `alt+/`, configurable) is handled via a GLOBAL
+ * The accept key (default `enter`, configurable) is handled via a GLOBAL
  * `ctx.ui.onTerminalInput` listener that swallows the key and fills the editor
- * via `ctx.ui.setEditorText` — editor-independent. While a suggestion is
- * showing and the editor is empty, left/right (or Alt+< / Alt+>) wrap through
- * that turn's batch (one model call, no extra fetches). A new settle discards
- * the previous batch.
+ * via `ctx.ui.setEditorText` — editor-independent. Enter on an empty editor
+ * with a visible suggestion fills the box and does not submit. While a
+ * suggestion is showing and the editor is empty, left/right (or Alt+< / Alt+>)
+ * wrap through that turn's batch (one model call, no extra fetches). A new
+ * settle discards the previous batch.
  * Any other key dismisses the suggestion immediately; deleting back to empty
  * re-arms the last suggestion after `rearmDelayMs` (default 2000, no new
  * model call). No suggestion while streaming.
@@ -121,7 +122,7 @@ export interface NextPromptConfig {
 	model?: NextPromptModelConfig;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
-	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "alt+/". */
+	/** Key id that accepts the suggestion (any pi-tui KeyId). Defaults to "enter". */
 	acceptKey?: string;
 	/** How the suggestion is shown. "widget" (default) = below-editor line; "ghost" = inline overlay in the input box. */
 	renderMode?: RenderMode;
@@ -214,7 +215,7 @@ export interface SuggestionCtx {
 
 const DEFAULT_MAX_TRANSCRIPT = 12000;
 const DEFAULT_MAX_SUGGESTION = 240;
-export const DEFAULT_ACCEPT_KEY = "alt+/";
+export const DEFAULT_ACCEPT_KEY = "enter";
 export const DEFAULT_REARM_MS = 2000;
 /** Distinct next-prompts requested and cached per settled turn. */
 export const SUGGESTION_BATCH_SIZE = 3;
@@ -255,15 +256,7 @@ export function humanizeKey(key: string): string {
 		.join("-");
 }
 
-/**
- * Raw-byte fallback for accept-key detection, for terminals where pi-tui's
- * matchesKey() doesn't recognize a legacy alt+symbol sequence. Handles the
- * common forms an Alt+key or Ctrl+Alt+key can arrive in:
- *   alt+/   → "\x1b/"  (or sometimes "\x1bO/" / kitty CSI-u)
- *   ctrl+space → "\x00"
- * Only the last modifier+key segment is considered. Returns true if `data`
- * matches any of the candidate byte forms for the configured key.
- */
+/** Left / Alt+< / Alt+, — previous item in the current suggestion batch. */
 export function isLeftArrow(data: string): boolean {
 	return (
 		data === "\x1b[D" ||
@@ -288,6 +281,16 @@ export function isRightArrow(data: string): boolean {
 	);
 }
 
+/**
+ * Raw-byte fallback for accept-key detection, for terminals where pi-tui's
+ * matchesKey() doesn't recognize a legacy alt+symbol sequence. Handles the
+ * common forms an accept key can arrive in:
+ *   enter    → "\r" / "\n"
+ *   alt+/    → "\x1b/"  (or sometimes "\x1bO/" / kitty CSI-u)
+ *   ctrl+space → "\x00"
+ * Only the last modifier+key segment is considered. Returns true if `data`
+ * matches any of the candidate byte forms for the configured key.
+ */
 export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	const parts = acceptKey.split("+");
 	if (parts.length === 0) return false;
@@ -295,6 +298,11 @@ export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	const modifiers = parts.slice(0, -1);
 	const hasAlt = modifiers.includes("alt");
 	const hasCtrl = modifiers.includes("ctrl");
+
+	// Bare Enter (no modifiers): CR or LF. Shift/Ctrl/Alt+Enter must not match.
+	if (modifiers.length === 0 && keyPart === "enter") {
+		return data === "\r" || data === "\n";
+	}
 
 	// ctrl+space special-case: legacy terminals send NUL.
 	if (hasCtrl && !hasAlt && keyPart === "space" && data === "\x00") return true;
@@ -1497,7 +1505,7 @@ export interface SuggestionState {
 	abortInflight: () => void;
 }
 
-/** Accept-key + carousel hint, e.g. `(Alt-/ · ←→)` or `(Alt-/ · 2/3 ←→)`. */
+/** Accept-key + carousel hint, e.g. `(Enter · ←→)` or `(Enter · 2/3 ←→)`. */
 export function formatSuggestionHint(state: SuggestionState): string {
 	const key = humanizeKey(state.acceptKey);
 	const n =
@@ -2673,8 +2681,8 @@ export async function configureInteractively(
 
 	// 4. acceptKey (free text)
 	const acceptPick = await ctx.ui.input(
-		`next-prompt: accept key [${current.acceptKey ?? "alt+/"}]`,
-		current.acceptKey ?? "alt+/",
+		`next-prompt: accept key [${current.acceptKey ?? DEFAULT_ACCEPT_KEY}]`,
+		current.acceptKey ?? DEFAULT_ACCEPT_KEY,
 	);
 	if (acceptPick) update.acceptKey = acceptPick.trim();
 

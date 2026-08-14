@@ -2,16 +2,17 @@
 
 Fork of [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension)
 with a **batch suggestion carousel**: after a turn settles, one model call returns up to three
-distinct next-prompts, and left/right (or **Alt+<** / **Alt+>**) wrap that turn's list.
+distinct next-prompts. Left/right (or **Alt+<** / **Alt+>**) wrap that turn's list; **Enter**
+fills the box without sending.
 
-![After a turn settles, Alt+< / Alt+> (or left/right) wrap through up to three next-prompt suggestions](demo.gif)
+![After a turn settles, arrows or Alt+< / Alt+> wrap through up to three next-prompt suggestions; Enter fills the box](demo.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
 distinct next instructions you'd type and shows the first. Three render modes:
 
 - **`widget`** (default) — a colored below-editor line:
-  `↳ next: <suggestion>  (Alt-/ · 1/3 ←→)`
+  `↳ next: <suggestion>  (Enter · 1/3 ←→)`
 - **`ghost`** — inline greyed ghost text **in the input box** (renders even when the
   editor is unfocused, e.g. after switching tabs/apps)
 - **`both`** — inline ghost AND the below-editor widget simultaneously
@@ -22,14 +23,15 @@ distinct next instructions you'd type and shows the first. Three render modes:
 > there (Pi captures and can restore the prior owner). If ghost rendering ever
 > fails, the default editor is restored and the mode falls back to widget.
 
-Accept with **`Alt-/`** (default; configurable) to fill the input box. While a
-suggestion is showing and the editor is empty, **left** / **right** or **Alt+<** /
-**Alt+>** wrap through that turn's batch (one model call, up to 3 distinct lines).
-A new settle discards the previous batch. Escape and up/down dismiss;
-any other key also dismisses. Backspace down to empty re-arms the last
-suggestion after a short delay (no new model call). No suggestion while
-streaming; the suggestion is cleared and any in-flight model call aborted the
-instant you submit, start a turn, or the agent starts.
+Accept with **Enter** (default; configurable) to fill the input box — the first
+press does not send. While a suggestion is showing and the editor is empty,
+**left** / **right** or **Alt+<** / **Alt+>** wrap through that turn's batch
+(one model call, up to 3 distinct lines). A new settle discards the previous
+batch. Escape and up/down dismiss; any other key also dismisses. Backspace
+down to empty re-arms the last suggestion after a short delay (no new model
+call). No suggestion while streaming; the suggestion is cleared and any
+in-flight model call aborted the instant you submit, start a turn, or the
+agent starts.
 
 ## Suggestion carousel
 
@@ -39,9 +41,9 @@ next-prompts). The first item is shown immediately.
 - **Right** / **Left**, or **Alt+>** / **Alt+<**, wrap through that turn's list.
   There is no extra model call and no browsing of previous turns.
 - A new settle, submit, `/new`, or agent start discards the previous batch.
-- Accept with **Alt-/** (default; configurable) to fill the editor with the
-  currently shown item.
-- The hint is `(Alt-/ · ←→)` for a single suggestion and `(Alt-/ · 2/3 ←→)` when
+- **Enter** (default; configurable) fills the editor with the currently shown
+  item and does not submit. A second Enter sends the filled prompt.
+- The hint is `(Enter · ←→)` for a single suggestion and `(Enter · 2/3 ←→)` when
   the batch has more than one item.
 
 ## Install
@@ -145,7 +147,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 {
   "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
   "thinking": "low",
-  "acceptKey": "alt+/",
+  "acceptKey": "enter",
   "renderMode": "both",
   "rearmDelayMs": 2000,
   "maxTranscriptChars": 12000,
@@ -159,7 +161,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | --- | --- | --- |
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
-| `acceptKey` | `"alt+/"` | Any pi-tui `KeyId` (e.g. `"alt+/"`, `"ctrl+space"`, `"shift+enter"`). Intercepted **before** the base editor, so keys like `ctrl+space` (`\x00`) won't pollute the box. Accept only fires when a suggestion is showing and the autocomplete dropdown is closed. |
+| `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/next-prompt-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |
@@ -169,14 +171,19 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
 
-### Why `alt+/` is the default accept key
+### Why `enter` is the default accept key
 
+- **`enter`** — while a suggestion is showing on an empty editor, the first
+  Enter fills the box and is consumed so it does not send. After the box has
+  text, Enter is a normal submit. Matches picker UX: arrows browse, Enter
+  chooses.
 - **`tab`** — conflicts with pi's path-autocomplete and `/template` dropdown.
 - **`ctrl+tab`** — many terminals send it as plain `tab`/`\t` or swallow it (window/tab switcher), so it's unreliable.
 - **`ctrl+space`** — works (sends `\x00`, which pi-tui maps to `ctrl+space`); the extension intercepts it before the base editor so it no longer pollutes, but some terminals remap Ctrl-Space to IME toggle.
-- **`alt+/`** — sends an unambiguous `\x1b/` sequence, not bound by pi or most terminals, and is memorable ("accept the suggested next command"). Recommended.
+- **`alt+/`** — still a good custom binding (`"acceptKey": "alt+/"`) if you
+  want Enter to always submit.
 
-Override with any `KeyId`, e.g. `"acceptKey": "ctrl+space"`.
+Override with any `KeyId`, e.g. `"acceptKey": "alt+/"`.
 
 ## Security: cross-provider transcript disclosure
 
@@ -274,11 +281,12 @@ one listener and re-installs the editor once.
 3. The returned text is parsed as a batch of up to 3 distinct one-line next-prompts
    (numbered/bulleted lines, duplicates, and `NONE` dropped) and shown — via `setWidget`
    (widget/both), via the inline ghost overlay (ghost/both), or both. The hint
-   is `(Alt-/ · ←→)` for a single suggestion and `(Alt-/ · 2/3 ←→)` when the batch has more than one item.
+   is `(Enter · ←→)` for a single suggestion and `(Enter · 2/3 ←→)` when the batch has more than one item.
 4. The accept key is intercepted **before** the base editor: if a suggestion is
-   showing, it fills the editor via `ctx.ui.setEditorText` and swallows the key.
-   Left/right (or Alt+< / Alt+>) on an empty editor with a visible suggestion wrap
-   through that turn's batch. There is no extra model call; a new settle replaces the list.
+   showing on an empty editor, it fills the editor via `ctx.ui.setEditorText`
+   and swallows the key (Enter does not submit). Left/right (or Alt+< / Alt+>)
+   on an empty editor with a visible suggestion wrap through that turn's batch.
+   There is no extra model call; a new settle replaces the list.
    Any other key
    dismisses the suggestion immediately
    (widget and ghost) and delegates to the base editor; deleting back to empty
