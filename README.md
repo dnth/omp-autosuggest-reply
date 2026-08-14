@@ -143,9 +143,9 @@ Restart `pi` (or start a new session) after installing.
 
 ## Configure
 
-### Interactive: `/next-prompt-config`
+### Interactive: `/autosuggest-reply-config`
 
-Run the `/next-prompt-config` slash command for a guided walkthrough of
+Run the `/autosuggest-reply-config` slash command for a guided walkthrough of
 **every configurable option except `systemPrompt` and `enhanceSystemPrompt`**
 (those two are config-file-only) — a model picker (lists all available models),
 render mode, thinking level, accept key, re-arm delay,
@@ -188,7 +188,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
-| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/next-prompt-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
@@ -196,7 +196,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires only on a non-empty, idle editor; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"alt+/"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/next-prompt-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
 

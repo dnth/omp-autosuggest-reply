@@ -347,6 +347,17 @@ export function matchesAcceptKeyRaw(data: string, acceptKey: string): boolean {
 	return false;
 }
 
+/**
+ * Kitty keyboard protocol key-release (event type 3), e.g. CSI `47;3:3u`.
+ * OMP delivers these to `onTerminalInput` before the editor filters them.
+ * They must not be treated as a real edit: after Alt+/ press starts enhance,
+ * the matching release would abort the in-flight rewrite (OMP's matchesKey
+ * does not classify release as the same keyid).
+ */
+export function isKittyKeyRelease(data: string): boolean {
+	return /^\x1b\[[\d:;]*:3[u~ABCDHF]$/.test(data);
+}
+
 export function loadConfig(
 	cwd: string,
 	opts: { projectTrusted?: boolean } = {},
@@ -1921,6 +1932,9 @@ function makeInputHandler(
 	enhance?: EnhanceController,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
+		// Kitty protocol sends press then release. Release is not a real edit.
+		if (isKittyKeyRelease(data)) return undefined;
+
 		// Modal UI dialogs (such as the consent selector) own their navigation
 		// and confirmation keys. Do not treat those keys as editor input or
 		// invalidate the in-flight consent request.
@@ -2971,16 +2985,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	// Interactive config command: `/next-prompt-config`. Walks the user through
+	// Interactive config command: `/autosuggest-reply-config`. Walks the user through
 	// every configurable option EXCEPT systemPrompt (config-file only, F-15) with
 	// model-picker + dialogs, saves to the host agent dir (`~/.pi/agent` on Pi,
 	// `~/.omp/agent` on OMP), and reloads so changes take effect immediately.
-	api.registerCommand("next-prompt-config", {
-		description: "Configure the next-prompt suggestion extension",
+	api.registerCommand("autosuggest-reply-config", {
+		description: "Configure the omp-autosuggest-reply suggestion extension",
 		handler: async (_args, ctx) => {
 			if (!isInteractiveContext(ctx)) {
 				ctx.ui.notify(
-					"next-prompt: /next-prompt-config requires interactive mode",
+					"next-prompt: /autosuggest-reply-config requires interactive mode",
 					"error",
 				);
 				return;

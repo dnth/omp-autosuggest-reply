@@ -47,6 +47,7 @@ import {
 	isRightArrow,
 	loadConfig,
 	loadEffectiveConfig,
+	isKittyKeyRelease,
 	matchesAcceptKeyRaw,
 	overlayGhost,
 	parseModelOption,
@@ -5205,6 +5206,25 @@ describe("enhance key handling (onTerminalInput)", () => {
 		fake.setEditorText("edited text");
 		await sleep(30);
 		expect(fake.editorText).toBe("edited text");
+	});
+
+	test("EN17: kitty Alt+/ release after press does not abort enhance", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		const press = "\x1b[47;3:1u"; // CSI-u Alt+/ press
+		const release = "\x1b[47;3:3u"; // CSI-u Alt+/ release
+		expect(isKittyKeyRelease(press)).toBe(false);
+		expect(isKittyKeyRelease(release)).toBe(true);
+		expect(fake.inputHandler!(press)).toEqual({ consume: true });
+		expect(fake.inputHandler!(release)).toBeUndefined();
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 });
 
