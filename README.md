@@ -106,15 +106,11 @@ package manifest uses the `pi.extensions` form, which OMP accepts directly and
 loads with its legacy `@earendil-works/pi-*` import remapping — there is no
 separate OMP package.
 
-### Not on npm
+### GitHub only
 
-There is **no npm/gallery package for this fork** — GitHub is the only install
-path (use the `omp plugin install github:dnth/omp-autosuggest-reply` command
-above). The npm package `@gamaraan/next-prompt` is the **separate upstream
-project** and does **not** include this fork's carousel or enhance-prompt, so
-don't install it expecting these features. This fork keeps the same package
-*name*, so once installed from GitHub it still shows as `@gamaraan/next-prompt`
-in `omp plugin list` / `pi` — that entry is this fork.
+Install **only from GitHub** with a command above — that's the whole story.
+There is no separate npm or registry package for this fork, and no package name
+to install.
 
 ### Manual — copy the file
 
