@@ -1178,6 +1178,38 @@ describe("shouldTrigger", () => {
 	test("T49: has assistant stop, idle, editor empty → compute", () => {
 		expect(shouldTrigger([assistantEntry("a")], true, "")).toBe("compute");
 	});
+	test("T49b: trailing toolResult after assistant stop still computes (OMP persist order)", () => {
+		expect(
+			shouldTrigger(
+				[
+					userEntry("q"),
+					assistantEntry("a"),
+					toolResultEntry(),
+					toolResultEntry(),
+				],
+				true,
+				"",
+			),
+		).toBe("compute");
+	});
+	test("T49c: trailing toolResult after assistant toolUse still skips", () => {
+		expect(
+			shouldTrigger(
+				[userEntry("q"), assistantEntry("a", "toolUse"), toolResultEntry()],
+				true,
+				"",
+			),
+		).toBe("skip");
+	});
+	test("T49d: non-message entries after assistant stop still compute", () => {
+		expect(
+			shouldTrigger(
+				[assistantEntry("a"), { type: "custom" }],
+				true,
+				"",
+			),
+		).toBe("compute");
+	});
 });
 
 // ---------------------------------------------------------------------------

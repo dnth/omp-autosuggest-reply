@@ -1227,15 +1227,18 @@ export function shouldTrigger(
 ): TriggerDecision {
 	if (!isIdle) return "skip";
 	if (editorText.length > 0) return "skip";
-	// Find the last message entry; it must be a completed assistant message.
+	// Walk from the end. OMP persists toolResult messages AFTER the assistant
+	// stop that closed the turn, so a last-entry-only check skips every tool
+	// turn. Skip non-user/non-assistant roles (toolResult, etc.) and require
+	// the last user/assistant message to be assistant+stop.
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i]!;
-		if (entry.type === "message" && entry.message) {
-			const msg = entry.message;
-			if (msg.role === "assistant" && msg.stopReason === "stop")
-				return "compute";
-			return "skip";
-		}
+		if (entry.type !== "message" || !entry.message) continue;
+		const msg = entry.message;
+		if (msg.role !== "assistant" && msg.role !== "user") continue;
+		if (msg.role === "assistant" && msg.stopReason === "stop")
+			return "compute";
+		return "skip";
 	}
 	return "skip";
 }
@@ -1672,12 +1675,28 @@ class GhostEditor extends CustomEditor {
 
 	/** Public so the controller can trigger a re-render when the ghost value changes. */
 	requestGhostRender(): void {
-		try {
-			this.tui?.requestRender();
-		} catch {
-			// Render pipeline broken -> treat as a ghost failure (P1-1).
-			this.suggestionState.fallbackToWidget?.();
-		}
+		const paint = (): void => {
+			try {
+				const tui = this.tui;
+				if (!tui || typeof tui.requestRender !== "function") {
+					// Missing TUI is a silent no-op on OMP unless we fall back.
+					this.suggestionState.fallbackToWidget?.();
+					return;
+				}
+				// Ordinary requestRender() coalesces (`if (#renderRequested) return`)
+				// and can be swallowed by the in-flight agent_end frame. Force a
+				// new compose so the overlay is not stuck with empty editor lines.
+				tui.requestRender(true);
+			} catch {
+				// Render pipeline broken -> treat as a ghost failure (P1-1).
+				this.suggestionState.fallbackToWidget?.();
+			}
+		};
+		// Sync first: Pi tests (and Pi itself) expect a thrown requestRender to
+		// fall back immediately. Then one macrotask later for OMP, whose
+		// terminal agent_end fires before the session/TUI fully unwinds.
+		paint();
+		setTimeout(paint, 0);
 	}
 
 	render(width: number): string[] {
@@ -2088,7 +2107,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if ((event as { willContinue?: boolean } | undefined)?.willContinue === true) {
 				return;
 			}
-			return handleSettled(ctx);
+			// OMP awaits this handler with a 30s timeout and aborts it. The
+			// suggestion model call (especially grok/high-thinking) routinely
+			// exceeds that, so the widget never paints. Kick off compute and
+			// return immediately; stale-result guards still abort on input.
+			// Tests replace the completion-module loader and still await the
+			// handler, so return the promise only on that seam.
+			const p = handleSettled(ctx);
+			if (ompCompletionModuleOverride) return p;
+			void p;
 		});
 	} else {
 		api.on("agent_settled", (_e, ctx) => {
@@ -2308,6 +2335,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		} as unknown as Context;
 
 		let resp: AssistantMessage | undefined;
+		const SUGGESTION_TIMEOUT_MS = 20_000;
+		let timedOut = false;
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			ac.abort();
+		}, SUGGESTION_TIMEOUT_MS);
 		try {
 			resp = await completeSuggestion(host, ctx, resolved.model, context, {
 				signal: ac.signal,
@@ -2316,8 +2349,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		} catch (err) {
 			if (!ac.signal.aborted) {
 				ctx.ui.notify("next-prompt: suggestion failed", "error");
+			} else if (timedOut && generation === state.inputGeneration) {
+				ctx.ui.notify("next-prompt: suggestion timed out", "warning");
 			}
 			return;
+		} finally {
+			clearTimeout(timeout);
 		}
 		if (ac.signal.aborted || generation !== state.inputGeneration) return;
 		if (resp === undefined) return; // transport unavailable; diagnostic already shown
