@@ -1,8 +1,10 @@
-# next-prompt — next-prompt suggestions for pi and Oh My Pi
+# omp-autosuggest-reply
 
 Fork of [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension)
 with a **batch suggestion carousel**: after a turn settles, one model call returns up to three
 distinct next-prompts, and left/right wrap that turn's list.
+
+![After a turn settles, left and right wrap through up to three next-prompt suggestions](demo.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
@@ -49,16 +51,16 @@ from GitHub so you get the batch carousel.
 
 ### From GitHub (this fork)
 
-The source repository is [`dnth/next-prompt-extension`](https://github.com/dnth/next-prompt-extension):
+The source repository is [`dnth/omp-autosuggest-reply`](https://github.com/dnth/omp-autosuggest-reply):
 
 ```bash
-pi install git:github.com/dnth/next-prompt-extension
+pi install git:github.com/dnth/omp-autosuggest-reply
 ```
 
 To pin a branch, tag, or commit, append the reference:
 
 ```bash
-pi install git:github.com/dnth/next-prompt-extension@main
+pi install git:github.com/dnth/omp-autosuggest-reply@main
 ```
 
 ### OMP
@@ -67,13 +69,13 @@ Install through the OMP plugin manager (observed from `omp plugin --help` /
 `omp plugin install --dry-run`):
 
 ```bash
-omp plugin install git:github.com/dnth/next-prompt-extension
+omp plugin install github:dnth/omp-autosuggest-reply
 ```
 
 Pin a branch, tag, or commit the same way:
 
 ```bash
-omp plugin install git:github.com/dnth/next-prompt-extension@main
+omp plugin install github:dnth/omp-autosuggest-reply@main
 ```
 
 After installing, run `omp plugin doctor` and confirm zero plugin errors. The
@@ -348,9 +350,9 @@ session, and record the results.
 ## Design & development
 
 Source and design discussion live in this
-[fork](https://github.com/dnth/next-prompt-extension). The original project is
+[fork](https://github.com/dnth/omp-autosuggest-reply). The original project is
 [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension).
 
 ## License
 
-MIT — see [LICENSE](https://github.com/dnth/next-prompt-extension/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/dnth/omp-autosuggest-reply/blob/main/LICENSE).
