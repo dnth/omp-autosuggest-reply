@@ -62,8 +62,8 @@ current text and drops the revert.
   never loses your text.
 - Uses the same model resolution and `allowCrossProvider` setting as suggestions
   (see Security). No separate prompt appears for a different destination.
-- Fires only on a non-empty, idle editor — no effect while the agent is running
-  or the box is empty. Submitting, a new turn, or agent start aborts an in-flight
+- Fires whenever the key is pressed on a non-empty editor, including while the
+  agent is running. Submitting, a new turn, or agent start aborts an in-flight
   rewrite.
 - Disable with `"enhanceEnabled": false`.
 
@@ -193,7 +193,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
-| `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires only on a non-empty, idle editor; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
+| `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
 | `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 

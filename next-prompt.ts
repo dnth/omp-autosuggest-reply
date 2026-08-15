@@ -143,8 +143,8 @@ export interface NextPromptConfig {
 	rearmDelayMs?: number;
 	/**
 	 * Whether the enhance-prompt keybinding is active. When enabled, pressing
-	 * `enhanceKey` on a non-empty, idle editor rewrites the typed text in place
-	 * for clarity (revert with the same key or Escape). Default true.
+	 * `enhanceKey` on a non-empty editor rewrites the typed text in place even
+	 * while the agent is active (revert with the same key or Escape). Default true.
 	 */
 	enhanceEnabled?: boolean;
 	/**
@@ -1654,16 +1654,14 @@ export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
 }
 
 /**
- * Enhance-key press on a non-empty, idle editor. Toggles between the cached
- * enhanced text and the original when the box still holds one of them;
- * otherwise starts a fresh rewrite of the current text. Ignored while a rewrite
- * is already in flight.
+ * Enhance-key press on a non-empty editor. Toggles between the cached enhanced
+ * text and the original when the box still holds one of them; otherwise starts
+ * a fresh rewrite of the current text. Ignored while a rewrite is in flight.
  */
 export function handleEnhanceKey(
 	state: SuggestionState,
 	enhance: EnhanceController,
 ): void {
-	if (!state.isIdleGetter()) return;
 	const rt = enhance.runtime;
 	if (rt.pending) return;
 	const text = state.getEditorText();
@@ -2508,7 +2506,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const enhance = ref.enhance;
 		if (!enhance.enabled) return;
 		const text = rawText;
-		if (text.trim().length === 0 || !ctx.isIdle()) return;
+		if (text.trim().length === 0) return;
 
 		ref.enhanceInflight?.abort();
 		const ac = new AbortController();

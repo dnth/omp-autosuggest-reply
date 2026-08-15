@@ -89,8 +89,8 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Press Esc while enhanced → original restored, hint cleared.
 - [ ] Edit the box after enhancing → the revert hint clears and Ctrl+Up starts a
   fresh rewrite of the edited text.
-- [ ] Ctrl+Up on an empty editor or while the agent is running does nothing (no
-  model call).
+- [ ] Ctrl+Up on an empty editor does nothing; with non-empty editor text, it
+  rewrites even while the agent is running.
 - [ ] Submit the enhanced prompt → it sends normally; an in-flight rewrite is
   aborted by submit/new turn/agent start with no stale replacement.
 - [ ] Only the typed line is sent (verify no transcript in the request); a

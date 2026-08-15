@@ -4694,14 +4694,20 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(fake.calls.complete).toHaveLength(0);
 	});
 
-	test("EN13: not idle → key consumed but no model call", async () => {
-		const { fake } = await setup({});
+	test("EN13: active agent does not block enhancement", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Do the thing." }],
+				stopReason: "stop",
+			},
+		});
 		fake.setIdle(false);
 		fake.setEditorText("do the thing");
 		const result = fake.inputHandler!(ENHANCE_KEY);
 		expect(result).toEqual({ consume: true });
-		await sleep(20);
-		expect(fake.calls.complete).toHaveLength(0);
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.editorText).toBe("Do the thing.");
 	});
 
 	test("EN14: disabled → key not consumed, no model call", async () => {
