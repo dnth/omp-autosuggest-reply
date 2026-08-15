@@ -5,9 +5,21 @@ with a **batch suggestion carousel**: after a turn settles, one model call retur
 distinct next-prompts. Left/right (or **Alt+<** / **Alt+>**) wrap that turn's list; **Enter**
 fills the box without sending.
 
-![After a turn settles, arrows or Alt+< / Alt+> wrap through up to three next-prompt suggestions; Enter fills the box](demo.gif)
+**Suggestion carousel — Oh My Pi (OMP)**
 
-![Enhance: press Ctrl+Up to rewrite the typed prompt in place for clarity — without changing intent or meaning; Ctrl+Up or Esc reverts](enhance.gif)
+![Oh My Pi: after a turn settles, arrows or Alt+< / Alt+> cycle through up to three next-prompt suggestions and Enter fills the editor without sending](demo.gif)
+
+**Suggestion carousel — Pi**
+
+![Pi 0.84.1: after a turn settles, arrows cycle through three next-prompt suggestions and Enter fills the editor without sending](pi-demo.gif)
+
+**Enhance prompt — Oh My Pi (OMP)**
+
+![Oh My Pi: Ctrl+Up rewrites the typed prompt for clarity without changing its intent; Ctrl+Up or Esc restores the original](enhance.gif)
+
+**Enhance prompt — Pi**
+
+![Pi 0.84.1: Ctrl+Up rewrites the typed prompt for clarity without changing its intent and toggles between the original and enhanced text](pi-enhance.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
 coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
