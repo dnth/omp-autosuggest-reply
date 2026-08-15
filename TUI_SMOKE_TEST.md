@@ -44,7 +44,7 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] pending completion → type → delete-to-empty → resolve old completion →
   nothing renders;
 - [ ] pending completion → session switch/shutdown → resolve → nothing
-  renders (no consent persisted, no model call);
+  renders and no model call occurs;
 - [ ] delete-to-empty after dismissing with Escape does NOT re-arm.
 
 ### Autocomplete / conflicting keys
@@ -73,10 +73,9 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Model error, abort, `NONE`, length stop, slow completion, and provider
   switch behave: no stale suggestion renders, no spurious error notify on
   abort.
-- [ ] First cross-destination request requires a clear consent dialog naming
-  the destination and transcript size; denial results in **no** request and no
-  re-prompt for the session; grant persists across sessions and a route change
-  re-prompts.
+- [ ] With `allowCrossProvider: true`, a cross-destination request uses the
+  configured model without a dialog; provider, endpoint, and model-route changes
+  do not prompt. With `false`, it silently uses the active model.
 - [ ] Run print/JSON/RPC modes and confirm no hidden suggestion request
   occurs.
 
@@ -95,8 +94,8 @@ Run each sequence in `widget`, `ghost`, and `both`:
 - [ ] Submit the enhanced prompt → it sends normally; an in-flight rewrite is
   aborted by submit/new turn/agent start with no stale replacement.
 - [ ] Only the typed line is sent (verify no transcript in the request); a
-  cross-destination enhance model triggers the same consent dialog as
-  suggestions.
+  cross-destination enhance model follows `allowCrossProvider` without a
+  separate dialog.
 - [ ] `"enhanceEnabled": false` disables the key (falls through to the editor);
   `"enhanceKey": "enter"`/`"tab"` is rejected with a warning.
 
@@ -123,9 +122,9 @@ checks.
 - [ ] Input submit, new agent start, session reload, and shutdown prevent any
   stale widget output from an in-flight request.
 - [ ] Headless / print / RPC modes create no completion request.
-- [ ] Cross-destination consent: first request prompts once; decline blocks the
-  destination for the session with no request; grant persists across sessions;
-  a route change re-prompts.
+- [ ] With `allowCrossProvider: true`, cross-destination suggestions and prompt
+  enhancement use the configured model without a dialog; with `false`, they
+  silently use the active model.
 - [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
 - [ ] Enhance prompt: type a prompt, press Ctrl+Up → box replaced by a clearer
   rewrite (one `completeSimple` call, only the typed text sent); Ctrl+Up or Esc

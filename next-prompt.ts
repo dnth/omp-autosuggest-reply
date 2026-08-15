@@ -33,12 +33,9 @@
  *   Pi project: <cwd>/.pi/next-prompt.json          OMP project: <cwd>/.omp/next-prompt.json
  *
  * Cross-destination disclosure (configured suggestion model on a different
- * provider/endpoint/model-route than the active model) is opt-in: it requires
- * `allowCrossProvider: true` (default false) AND explicit per-project consent,
- * persisted outside the repository in the host agent dir as
- * `next-prompt-consent.json`. Destination identity is provider + endpoint
- * origin + resolved model id, so a route/model change behind one gateway never
- * inherits consent (F-02/F-10).
+ * provider, endpoint, or model route than the active model) is controlled by
+ * `allowCrossProvider`. It defaults to false. Setting it to true is explicit
+ * global consent: the configured model is used without another prompt.
  *
  * Host differences (see the compatibility boundary section):
  *   - interactive check: Pi `ctx.mode === "tui"` vs OMP `ctx.hasUI === true`;
@@ -136,24 +133,12 @@ export interface NextPromptConfig {
 	 */
 	maxRecentTurns?: number;
 	/**
-	 * Whether a configured suggestion model on a *different destination*
-	 * (provider + endpoint origin + model route) than the active model may
-	 * receive the transcript. Defaults to FALSE. When false, fall back to the
-	 * active model (or, when already on the active destination, use the
-	 * configured model). Cross-destination use additionally requires
-	 * per-project, per-destination consent (see consent flow in the
-	 * controller).
+	 * Whether a configured suggestion model on a different destination
+	 * (provider + endpoint origin + model route) may receive text. Defaults to
+	 * false. When true, this is global consent and no per-project prompt is
+	 * shown. When false, suggestions fall back to the active model.
 	 */
 	allowCrossProvider?: boolean;
-	/**
-	 * Directional provider pairs that skip the cross-provider consent dialog:
-	 * `[from, to]` = [active model provider, suggestion model provider]. Set
-	 * via the dialog's "Always allow" option (saved to the global config) or
-	 * edited by hand. The reverse pair is NOT implied. Only provider labels
-	 * are compared (case-insensitive); endpoint/model changes do not
-	 * invalidate a pair grant.
-	 */
-	allowCrossProviderPairs?: Array<[string, string]>;
 	/** Delay (ms) before re-arming the last suggestion after the user deletes back to empty. Default 2000. */
 	rearmDelayMs?: number;
 	/**
@@ -191,16 +176,6 @@ export interface DestinationIdentity {
 	model: string;
 }
 
-/** Consent record persisted outside the repository, keyed by project + destination. */
-export interface ConsentRecord {
-	/** Absolute project cwd. */
-	project: string;
-	destination: DestinationIdentity;
-	/** ISO timestamp of the grant. */
-	grantedAt: string;
-	/** Model/provider label shown at grant time. */
-	modelLabel: string;
-}
 
 export const DEFAULT_ALLOW_CROSS_PROVIDER = false;
 
@@ -484,19 +459,6 @@ function parseConfig(text: string): {
 				if (typeof value !== "boolean") failPrivacy("must be a boolean");
 				else cfg.allowCrossProvider = value;
 				break;
-			case "allowCrossProviderPairs": {
-				const isValidPair = (p: unknown): p is [string, string] =>
-					Array.isArray(p) &&
-					p.length === 2 &&
-					typeof p[0] === "string" &&
-					p[0].length > 0 &&
-					typeof p[1] === "string" &&
-					p[1].length > 0;
-				if (!Array.isArray(value) || !value.every(isValidPair))
-					failPrivacy("must be an array of [from, to] provider pairs");
-				else cfg.allowCrossProviderPairs = value as Array<[string, string]>;
-				break;
-			}
 			case "maxTranscriptChars":
 				if (
 					typeof value !== "number" ||
@@ -672,7 +634,7 @@ export function saveConfig(
 }
 
 // ---------------------------------------------------------------------------
-// Destination identity + cross-provider consent (F-02 / F-10)
+// Destination identity (F-02 / F-10)
 // ---------------------------------------------------------------------------
 
 /**
@@ -712,155 +674,6 @@ export function sameDestination(
 	);
 }
 
-/**
- * Consent key for a destination. Includes the model routing id so a route/
- * model change behind one gateway never inherits consent granted to another
- * downstream model (F-02/F-10). An empty model id (legacy record) can never
- * match a real destination key — old records force a fresh consent prompt.
- */
-export function destinationKey(d: DestinationIdentity): string {
-	const base = d.origin ? `${d.provider}@${d.origin}` : d.provider;
-	return d.model ? `${base}#${d.model}` : base;
-}
-
-export function describeDestination(d: DestinationIdentity): string {
-	const base = d.origin ? `${d.provider} (${d.origin})` : d.provider;
-	return d.model ? `${base} — ${d.model}` : base;
-}
-
-function consentsPath(): string {
-	return join(getAgentDir(), "next-prompt-consent.json");
-}
-
-/** Read persisted consent records (best effort). */
-export function loadConsents(): ConsentRecord[] {
-	const path = consentsPath();
-	if (!existsSync(path)) return [];
-	try {
-		const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
-		if (!Array.isArray(parsed)) return [];
-		return parsed.filter(
-			(r): r is ConsentRecord =>
-				!!r &&
-				typeof (r as ConsentRecord).project === "string" &&
-				typeof (r as ConsentRecord).destination?.provider === "string",
-		);
-	} catch {
-		return [];
-	}
-}
-
-export function hasConsent(
-	project: string,
-	destination: DestinationIdentity,
-): boolean {
-	return loadConsents().some(
-		(r) =>
-			r.project === project &&
-			destinationKey(r.destination) === destinationKey(destination),
-	);
-}
-
-/**
- * Whether a directional provider pair is allow-listed in the global config:
- * [from, to] = [active model provider, suggestion model provider]. Matching is
- * case-insensitive; the reverse direction is NOT implied. A pair grant skips
- * the per-destination consent dialog entirely.
- */
-export function pairAllowed(
-	pairs: Array<[string, string]> | undefined,
-	from: string | undefined,
-	to: string | undefined,
-): boolean {
-	if (!pairs || pairs.length === 0 || !from || !to) return false;
-	const f = from.toLowerCase();
-	const t = to.toLowerCase();
-	return pairs.some(([a, b]) => a.toLowerCase() === f && b.toLowerCase() === t);
-}
-
-/**
- * Normalize the value returned by the real select dialog. Core pi returns the
- * option label, but adapters/themes may add whitespace or ANSI styling; older
- * test callers also used the symbolic values directly.
- */
-export function consentChoiceFromLabel(
-	selected: unknown,
-): "once" | "always" | "decline" | undefined {
-	if (typeof selected !== "string") return undefined;
-	const normalized = stripAnsi(selected).trim().toLowerCase();
-	if (normalized === "once" || normalized.includes("allow once")) return "once";
-	if (
-		normalized === "always" ||
-		normalized.includes("always allow for this provider pair")
-	)
-		return "always";
-	if (normalized === "decline" || normalized.includes("decline")) return "decline";
-	return undefined;
-}
-
-/** Persist a consent grant atomically (best effort; never throws). */
-export function grantConsent(
-	project: string,
-	destination: DestinationIdentity,
-	modelLabel: string,
-): void {
-	const path = consentsPath();
-	const records = loadConsents().filter(
-		(r) =>
-			!(
-				r.project === project &&
-				destinationKey(r.destination) === destinationKey(destination)
-			),
-	);
-	records.push({
-		project,
-		destination,
-		grantedAt: new Date().toISOString(),
-		modelLabel,
-	});
-	try {
-		const dir = dirname(path);
-		mkdirSync(dir, { recursive: true });
-		const tmp = join(
-			dir,
-			`.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`,
-		);
-		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, {
-			mode: 0o600,
-		});
-		renameSync(tmp, path);
-	} catch (err) {
-		console.warn(`next-prompt: failed to persist consent: ${err}`);
-	}
-}
-
-export function revokeConsent(
-	project: string,
-	destination: DestinationIdentity,
-): void {
-	const path = consentsPath();
-	const records = loadConsents().filter(
-		(r) =>
-			!(
-				r.project === project &&
-				destinationKey(r.destination) === destinationKey(destination)
-			),
-	);
-	try {
-		const dir = dirname(path);
-		mkdirSync(dir, { recursive: true });
-		const tmp = join(
-			dir,
-			`.next-prompt-consent.json.${process.pid}.${Date.now()}.tmp`,
-		);
-		writeFileSync(tmp, `${JSON.stringify(records, null, 2)}\n`, {
-			mode: 0o600,
-		});
-		renameSync(tmp, path);
-	} catch (err) {
-		console.warn(`next-prompt: failed to revoke consent: ${err}`);
-	}
-}
 
 /** Format a model for the config-command picker: "provider/model — name". */
 export function formatModelOption(model: {
@@ -896,10 +709,8 @@ export const THINKING_OPTIONS = [
 // ---------------------------------------------------------------------------
 
 /**
- * Result of model resolution. `crossDestination` is true only when the
- * configured model is on a different destination than the active model and
- * cross-destination use is permitted by config — the controller must then ask
- * for (or confirm persisted) consent before calling `complete()`.
+ * Result of model resolution. `crossDestination` identifies when the selected
+ * configured model differs from the active destination.
  */
 export interface ResolvedModel {
 	model: Model<Api> | undefined;
@@ -907,18 +718,13 @@ export interface ResolvedModel {
 }
 
 /**
- * Resolve the suggestion model against the active model by *destination*
- * identity (provider + endpoint origin + model route), not label. Fail-closed
- * rules:
- *  - configured model on the same destination as active  → use it
- *  - configured model on a different destination and `allowCrossProvider`
- *    is false (the default)                             → active model, silent
- *  - configured model on a different destination and `allowCrossProvider`
- *    is true                                            → mark crossDestination;
- *    controller decides via consent
- *  - configured model missing from registry             → warn once, active
- *  - no active model and a different destination is requested
- *    (allowCrossProvider false)                         → no model (fail closed)
+ * Resolve the suggestion model against the active model by destination
+ * identity (provider + endpoint origin + model route), not label:
+ *  - configured model on the same destination as active → use it
+ *  - different destination and `allowCrossProvider` false → active model
+ *  - different destination and `allowCrossProvider` true → configured model
+ *  - configured model missing from registry → warn once, use active model
+ *  - no active model and cross-provider use disabled → no model
  */
 export function resolveSuggestionModel(
 	ctx: SuggestionCtx,
@@ -1905,18 +1711,6 @@ export function revertEnhance(
 	enhance.showHint(undefined);
 }
 
-function isConsentDialogKey(data: string): boolean {
-	// Select/confirm dialogs use Enter, Escape, and CSI/SS3 navigation keys.
-	// Leave printable input untouched so an unrelated interaction still
-	// invalidates a pending consent request (F-08).
-	return (
-		data === "\r" ||
-		data === "\n" ||
-		data === "\x1b" ||
-		data.startsWith("\x1b[") ||
-		data.startsWith("\x1bO")
-	);
-}
 
 /**
  * Raw terminal-input handler. Accept key fills the editor; left/right (or
@@ -1928,17 +1722,12 @@ function isConsentDialogKey(data: string): boolean {
  */
 function makeInputHandler(
 	state: SuggestionState,
-	isInputSuppressed: () => boolean = () => false,
 	enhance?: EnhanceController,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
 		// Kitty protocol sends press then release. Release is not a real edit.
 		if (isKittyKeyRelease(data)) return undefined;
 
-		// Modal UI dialogs (such as the consent selector) own their navigation
-		// and confirmation keys. Do not treat those keys as editor input or
-		// invalidate the in-flight consent request.
-		if (isInputSuppressed() && isConsentDialogKey(data)) return undefined;
 
 		// Enhance: rewrite the current (non-empty) editor text in place. Placed
 		// before the empty-editor accept/carousel branches so it is never
@@ -2171,9 +1960,8 @@ export function isInteractiveContext(ctx: HostContextLike): boolean {
 /**
  * Whether the project is trusted for project-config loading. Pi exposes
  * `isProjectTrusted()`; OMP has no project-trust API, so it follows the
- * configuration loader's current default (trusted). OMP still enforces the
- * global privacy floors and cross-destination consent — there is simply no
- * host project-trust signal to consult.
+ * global privacy floors; there is simply no host project-trust signal to
+ * consult.
  */
 export function projectTrustedForHost(ctx: HostContextLike): boolean {
 	return typeof ctx.isProjectTrusted === "function"
@@ -2316,10 +2104,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	};
 	let effective: EffectiveConfig | undefined;
 	const notifiedFallback = { value: false };
-	// Session-scoped denial set: a declined consent never re-prompts (nor
-	// sends) for the remainder of the session.
-	const deniedConsents = new Set<string>();
-	let consentDialogOpen = false;
 	let editorInstalled = false;
 	// Tracks a custom-editor install that OMP must reset itself (it has no
 	// host-side extension-UI teardown like Pi's resetExtensionUI).
@@ -2361,7 +2145,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput = undefined;
 		notifiedFallback.value = false;
 		editorInstalled = false;
-		deniedConsents.clear();
 
 		// F-03: no interactive UI => no invisible suggestion work in headless
 		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
@@ -2431,9 +2214,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		};
 		ref.state = state;
 
-		// Enhance-prompt controller: shares the below-editor widget and the
-		// suggestion-model resolution/consent path. Disabled when the privacy
-		// config failed closed.
+		// Enhance-prompt controller: shares suggestion-model resolution. Disabled
+		// when the privacy config failed closed.
 		const enhanceKeyValue = effective.enhanceKey ?? DEFAULT_ENHANCE_KEY;
 		const showEnhanceHint = (kind: EnhanceHintKind | undefined) => {
 			if (kind === undefined) {
@@ -2533,9 +2315,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
-		ref.unsubInput = ctx.ui.onTerminalInput(
-			makeInputHandler(state, () => consentDialogOpen, enhance),
-		);
+		ref.unsubInput = ctx.ui.onTerminalInput(makeInputHandler(state, enhance));
 	});
 
 	// Completion lifecycle by host:
@@ -2626,96 +2406,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		effective = undefined;
 	});
 
-	/**
-	 * Cross-destination disclosure gate shared by suggestion compute and enhance.
-	 * Returns true when the resolved model may receive text: same destination,
-	 * an allow-listed provider pair, existing per-project consent, or a fresh
-	 * grant. Returns false on decline, a dismissed dialog, a missing dialog UI,
-	 * or when an interaction/reset invalidated the request mid-dialog.
-	 */
-	async function ensureCrossDestinationConsent(
-		ctx: HostCtx,
-		resolved: ResolvedModel,
-		ac: AbortController,
-		generation: number,
-		state: SuggestionState,
-		disclosure: { title: string; noun: string; chars: () => number },
-	): Promise<boolean> {
-		if (!resolved.crossDestination || !resolved.model) return true;
-		const model = resolved.model;
-		const dest = destinationOf(model);
-		const key = dest ? destinationKey(dest) : "";
-		if (!dest || deniedConsents.has(key)) return false;
-		const fromProvider = ctx.model?.provider ?? "";
-		const toProvider = model.provider ?? "";
-		if (
-			pairAllowed(effective!.allowCrossProviderPairs, fromProvider, toProvider) ||
-			hasConsent(ctx.cwd, dest)
-		) {
-			return true;
-		}
-		const { select, confirm } = ctx.ui;
-		if (!select && !confirm) return false;
-		const detail = `Suggestion model ${model.provider}/${model.id} is on a different destination (${describeDestination(dest)}) than the active model. This sends up to ${disclosure.chars()} chars of ${disclosure.noun} there.`;
-		const allowOnceLabel = "Allow once (this project)";
-		const alwaysAllowLabel = "Always allow for this provider pair";
-		const declineLabel = "Decline";
-		let choice: "once" | "always" | "decline" | undefined;
-		consentDialogOpen = true;
-		try {
-			if (select) {
-				const selected = await select(disclosure.title, [
-					allowOnceLabel,
-					alwaysAllowLabel,
-					declineLabel,
-				]);
-				choice = consentChoiceFromLabel(selected);
-			} else if (confirm) {
-				const granted = await confirm(
-					disclosure.title,
-					`${detail} Allow for this project?`,
-				);
-				choice = granted ? "once" : "decline";
-			}
-		} finally {
-			consentDialogOpen = false;
-		}
-		if (
-			ac.signal.aborted ||
-			ref.state !== state ||
-			generation !== state.inputGeneration
-		) {
-			return false;
-		}
-		if (choice === "always") {
-			const updated = saveConfig({
-				allowCrossProviderPairs: [
-					...(effective!.allowCrossProviderPairs ?? []),
-					[fromProvider, toProvider],
-				],
-			});
-			grantConsent(ctx.cwd, dest, `${model.provider}/${model.id}`);
-			if (updated.saved) {
-				ctx.ui.notify(
-					`next-prompt: always allow ${fromProvider} → ${toProvider} saved to global config`,
-					"info",
-				);
-			} else {
-				ctx.ui.notify(
-					"next-prompt: failed to save provider pair in global config (consent kept for this project)",
-					"warning",
-				);
-			}
-			return true;
-		}
-		if (choice === "once") {
-			grantConsent(ctx.cwd, dest, `${model.provider}/${model.id}`);
-			return true;
-		}
-		deniedConsents.add(key);
-		ctx.ui.notify("next-prompt: cross-provider suggestion declined", "warning");
-		return false;
-	}
 
 	async function maybeCompute(ctx: HostCtx): Promise<void> {
 		if (!ref.state || !effective) return;
@@ -2741,22 +2431,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
 		if (!resolved.model) return;
 
-		// F-02 / F-10: cross-destination disclosure requires explicit, persisted
-		// per-project consent. Fail closed on decline; never re-prompt in-session.
-		// A directional provider pair in the global config (set via the dialog's
-		// "Always allow" option) skips the dialog for that active→suggestion
-		// provider direction.
-		if (
-			!(await ensureCrossDestinationConsent(ctx, resolved, ac, generation, state, {
-				title: "next-prompt: send transcript to another provider?",
-				noun: "conversation text",
-				chars: () =>
-					buildTranscript(ctx.sessionManager.getBranch(), effective!).length,
-			}))
-		) {
-			if (ref.inflight === ac) ref.inflight = undefined;
-			return;
-		}
 
 		const transcript = buildTranscript(
 			ctx.sessionManager.getBranch(),
@@ -2824,8 +2498,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * Rewrite the current editor text for clarity and replace it in place. Sends
-	 * ONLY the typed text (redacted), never the transcript. Reuses the suggestion
-	 * model resolution and cross-destination consent gate. Staleness is guarded
+	 * only the typed text (redacted), never the transcript. Staleness is guarded
 	 * by the input generation and by requiring the editor to still hold exactly
 	 * what was sent before the result is applied.
 	 */
@@ -2854,20 +2527,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		enhance.showHint("enhancing");
 
 		const redacted = redactSecrets(text);
-		const consented = await ensureCrossDestinationConsent(
-			ctx,
-			resolved,
-			ac,
-			generation,
-			state,
-			{
-				title: "next-prompt: send your prompt to another provider?",
-				noun: "prompt text",
-				chars: () => redacted.length,
-			},
-		);
 		if (
-			!consented ||
 			ac.signal.aborted ||
 			ref.state !== state ||
 			generation !== state.inputGeneration
@@ -3146,7 +2806,7 @@ export async function configureInteractively(
 	// 9. allowCrossProvider (confirm)
 	const cross = await ctx.ui.confirm(
 		`next-prompt: allow cross-provider suggestion (sends transcript to a different provider)? [${current.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER}]`,
-		"Yes = use the configured model even if it's on a different provider (requires per-project consent). No = fall back to the current model.",
+		"Yes = always use the configured model, including a different provider, endpoint, or model route. No = fall back to the current model.",
 	);
 	update.allowCrossProvider = cross;
 

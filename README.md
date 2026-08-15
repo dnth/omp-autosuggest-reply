@@ -60,8 +60,8 @@ current text and drops the revert.
 - Only the text you typed is sent — never the conversation transcript. Secrets
   are redacted first; since the original is always one keystroke away, redaction
   never loses your text.
-- Uses the same model resolution and cross-provider consent gate as suggestions
-  (see Security). A model on a different destination still requires consent.
+- Uses the same model resolution and `allowCrossProvider` setting as suggestions
+  (see Security). No separate prompt appears for a different destination.
 - Fires only on a non-empty, idle editor — no effect while the agent is running
   or the box is empty. Submitting, a new turn, or agent start aborts an in-flight
   rewrite.
@@ -192,8 +192,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `240` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
-| `allowCrossProvider` | `false` | When `true`, a configured suggestion model on a **different destination** (provider + endpoint + model route) than the active model may be used — but only after explicit per-project consent (see Security). When `false`, fall back to the active model silently. Project config can never loosen a global `false`. |
-| `allowCrossProviderPairs` | `[]` | Directional provider pairs that skip the consent dialog: `[["activeProvider", "suggestionProvider"]]` (e.g. `[["opencode-go", "openai"]]`). Set via the dialog's "Always allow for this provider pair" option (saved to the global config) or by hand. Case-insensitive; the reverse direction is NOT implied. Invalid entries fail closed — suggestions are disabled. |
+| `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires only on a non-empty, idle editor; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
 | `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
@@ -225,34 +224,21 @@ destinations. If you configure a suggestion model on a **different** destination
 the transcript is sent to that second destination, which may have different
 data-handling terms.
 
-Cross-destination disclosure is **opt-in and fail-closed**:
+Cross-destination disclosure is explicit and fail-closed:
 
 - `allowCrossProvider` defaults to `false`. With `false`, a configured model on a
-different destination is never used; the extension silently falls back to the
-active model (and, when there is no active model, computes nothing).
-- With `true`, the first time a different destination would receive the transcript,
-the host shows a dialog naming the destination and the transcript size, with three
-choices: **Allow once (this project)**, **Always allow for this provider pair**, and
-**Decline**. "Allow once" persists consent per project + destination (provider +
-endpoint + model route) in `<agent dir>/next-prompt-consent.json` (a 0600 file
-outside the repository; `~/.pi/agent` on Pi, `~/.omp/agent` on OMP); declining
-blocks that destination for the rest of the session without re-prompting. "Always
-allow" additionally saves the directional provider pair (`[active provider,
-suggestion provider]`) to the global config (via the same atomic 0600 write), so
-that exact direction never prompts again in any project — the per-destination
-consent record is kept too, so the dialog also stays silent when the config write
-is refused.
-- Consent is keyed by the full destination identity: changing the endpoint **or**
-the model route invalidates a stored grant and prompts again. Records written by
-older versions (without a model route) never match and also re-prompt — fail closed.
+  different destination is never used; the extension silently falls back to the
+  active model (and, when there is no active model, computes nothing).
+- Setting `allowCrossProvider` to `true` is global consent for the configured
+  suggestion model to receive text across providers, endpoints, and model routes.
+  The extension does not ask again per project or destination.
 - Project config (`<cwd>/.pi/next-prompt.json` on Pi, `<cwd>/.omp/next-prompt.json`
   on OMP) is only honored for **trusted** projects, and can never loosen a global
   `allowCrossProvider: false` or increase a global `maxTranscriptChars` cap —
   repository content cannot silently redirect your transcript. Pi gates project
   config on its `isProjectTrusted()` API. **OMP exposes no project-trust API**, so
   OMP follows the configuration loader's default (trusted) and enforces the same
-  global privacy floors and consent flow; there is simply no host project-trust
-  signal to consult. An existing-but-unreadable or syntactically invalid
+  global privacy floors. An existing-but-unreadable or syntactically invalid
   global/project config disables suggestions entirely rather than falling back to
   defaults (both hosts).
 
@@ -262,8 +248,8 @@ Mitigations:
   `sk-…`/`sk-proj-…`/`sk-ant-…`, GitHub `ghp_…`/`github_pat_…`, GitLab `glpat-…`,
   Google `AIza…`, Slack `xoxb-…`, JWTs, PEM private key blocks, and `key=value`
   assignment forms) from both user and assistant text before sending. This is
-  defense-in-depth, **not** comprehensive secret detection — destination consent
-  and least disclosure are the primary controls.
+  defense-in-depth, **not** comprehensive secret detection — explicit
+  `allowCrossProvider` configuration and least disclosure are the primary controls.
 - `maxRecentTurns` minimizes what is sent by limiting the transcript to the last
   N turns.
 - Suggestion output is sanitized before rendering: terminal control sequences
@@ -374,7 +360,7 @@ hosts. OMP-specific behavior:
   the captured prior owner) and another custom-editor extension installed first
   in the same session is not detected.
 - Trust: OMP has no project-trust API; project config follows the loader default
-  (global privacy floors and consent are unchanged).
+  and global privacy floors remain enforced.
 
 CI adds an OMP job that typechecks against the pinned `@oh-my-pi/*` 17.2.12
 surface (`bun run typecheck:omp`), runs the full unit suite, packs/inspects the

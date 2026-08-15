@@ -1,7 +1,7 @@
 /**
  * Unit tests for next-prompt.ts covering every pure helper, the terminal
  * sanitizer, overlayGhost rendering, config validation/trust, destination
- * consent, and the controller wiring (with a fake ExtensionAPI firing
+ * opt-in, and the controller wiring (with a fake ExtensionAPI firing
  * lifecycle events and terminal input).
  */
 
@@ -32,10 +32,8 @@ import {
 	buildMessages,
 	buildTranscript,
 	configureInteractively,
-	consentChoiceFromLabel,
 	DEFAULT_ACCEPT_KEY,
 	DEFAULT_ENHANCE_KEY,
-	destinationKey,
 	destinationOf,
 	detectHost,
 	formatModelOption,
@@ -271,8 +269,7 @@ describe("loadConfig", () => {
 	});
 });
 
-// ---------------------------------------------------------------------------
-// destinationOf / sameDestination / consent
+// destinationOf / sameDestination
 // ---------------------------------------------------------------------------
 
 describe("destination identity", () => {
@@ -337,50 +334,6 @@ describe("destination identity", () => {
 	});
 	test("D4: undefined model → undefined destination", () => {
 		expect(destinationOf(undefined)).toBeUndefined();
-	});
-	test("D5: destinationKey includes model; legacy (no model) key can never match (F-02)", () => {
-		const d = destinationOf({
-			provider: "openai",
-			id: "gpt-4o",
-			baseUrl: "https://gateway.example.com/v1",
-		});
-		expect(destinationKey(d!)).toBe(
-			"openai@https://gateway.example.com#gpt-4o",
-		);
-		// Legacy consent record without a model id → its key never equals a real one.
-		expect(destinationKey({ provider: "openai", origin: "", model: "" })).toBe(
-			"openai",
-		);
-		expect(
-			destinationKey({ provider: "openai", origin: "", model: "" }),
-		).not.toBe(destinationKey(d!));
-	});
-
-	test("P1: pairAllowed matches directionally, case-insensitively, and never the reverse", () => {
-		const { pairAllowed } =
-			require("./next-prompt.ts") as typeof import("./next-prompt.ts");
-		const pairs: Array<[string, string]> = [["openai", "anthropic"]];
-		expect(pairAllowed(pairs, "openai", "anthropic")).toBe(true);
-		// Case-insensitive on both sides.
-		expect(pairAllowed(pairs, "OpenAI", "ANTHROPIC")).toBe(true);
-		// Directional: the reverse pair is NOT implied.
-		expect(pairAllowed(pairs, "anthropic", "openai")).toBe(false);
-		// Missing inputs never match.
-		expect(pairAllowed(pairs, undefined, "anthropic")).toBe(false);
-		expect(pairAllowed(pairs, "openai", undefined)).toBe(false);
-		// Empty/missing pair list never matches.
-		expect(pairAllowed(undefined, "openai", "anthropic")).toBe(false);
-		expect(pairAllowed([], "openai", "anthropic")).toBe(false);
-	});
-
-	test("P2: consent labels tolerate whitespace/ANSI and symbolic values", () => {
-		expect(consentChoiceFromLabel("once")).toBe("once");
-		expect(consentChoiceFromLabel("  Allow once (this project)  ")).toBe("once");
-		expect(
-			consentChoiceFromLabel("\x1b[36mAlways allow for this provider pair\x1b[0m"),
-		).toBe("always");
-		expect(consentChoiceFromLabel(" Decline ")).toBe("decline");
-		expect(consentChoiceFromLabel(undefined)).toBeUndefined();
 	});
 });
 
@@ -604,7 +557,7 @@ describe("resolveSuggestionModel", () => {
 			model: active,
 			crossDestination: false,
 		});
-		// Consent path: cross-destination use enabled → flags crossDestination.
+		// Opt-in path: cross-destination use enabled → flags crossDestination.
 		const allow: NextPromptConfig = {
 			model: { provider: "openai", model: "claude" },
 			allowCrossProvider: true,
@@ -1888,11 +1841,11 @@ function makeFake(opts: {
 		| Promise<boolean>
 		| (() => boolean | Promise<boolean>);
 	confirmCall?: () => void;
-	/** Result for ctx.ui.select (consent chooser). Defaults to "once". */
+	/** Result for ctx.ui.select. Defaults to the first option. */
 	selectResult?: string | Promise<string> | (() => string | Promise<string>);
-	/** Hook invoked while the consent selector is open. */
+	/** Hook invoked while a selector is open. */
 	selectCall?: () => void;
-	/** Omit ctx.ui.select entirely (fallback-to-confirm path). */
+	/** Omit ctx.ui.select entirely. */
 	selectUnavailable?: boolean;
 }): {
 	pi: import("@earendil-works/pi-coding-agent").ExtensionAPI;
@@ -2191,7 +2144,7 @@ function makeOmpFake(opts: {
 		| Promise<boolean>
 		| (() => boolean | Promise<boolean>);
 	selectResult?: string | Promise<string> | (() => string | Promise<string>);
-	/** Hook invoked while the consent selector is open. */
+	/** Hook invoked while a selector is open. */
 	selectCall?: () => void;
 	selectUnavailable?: boolean;
 	/** The constructed GhostEditor's tui.requestRender throws (ghost render pipeline fails). */
@@ -3336,403 +3289,58 @@ describe("non-TUI mode", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cross-destination consent (F-02 / F-10)
+// Cross-destination opt-in (F-02 / F-10)
 // ---------------------------------------------------------------------------
 
-describe("cross-destination consent", () => {
-	async function setupCross(
-		opts: {
-			confirmResult?:
-				| boolean
-				| Promise<boolean>
-				| (() => boolean | Promise<boolean>);
-			selectResult?:
-				| string
-				| Promise<string>
-				| (() => string | Promise<string>);
-			selectCall?: () => void;
-			selectUnavailable?: boolean;
-			baseUrl?: string;
-		} = {},
-	) {
+describe("cross-destination opt-in", () => {
+	async function setupCross(allowCrossProvider: boolean) {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
-			model: {
-				provider: "openai",
-				id: "gpt",
-				baseUrl: opts.baseUrl,
-			},
-			findModel: (p, m) =>
-				p === "anthropic" && m === "haiku"
-					? { provider: "anthropic", id: "haiku", baseUrl: opts.baseUrl }
+			model: { provider: "openai", id: "gpt" },
+			findModel: (provider, model) =>
+				provider === "anthropic" && model === "haiku"
+					? { provider: "anthropic", id: "haiku" }
 					: undefined,
-			...opts,
 		});
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
 				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
+				allowCrossProvider,
 			}),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
-		return { fake };
+		return fake;
 	}
 
-	function consentsOnDisk(): unknown[] {
-		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`;
-		try {
-			return JSON.parse(readFileSync(path, "utf-8")) as unknown[];
-		} catch {
-			return [];
-		}
-	}
-
-	function globalConfigOnDisk(): Record<string, unknown> {
-		const path = `${process.env.PI_CODING_AGENT_DIR}/next-prompt.json`;
-		try {
-			return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
-		} catch {
-			return {};
-		}
-	}
-
-	test("C1: first cross-destination use prompts (select); allow-once → complete on configured model", async () => {
-		const { fake } = await setupCross();
+	test("C1: true uses the configured destination without prompting", async () => {
+		const fake = await setupCross(true);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
-		// The dialog offers the three choices, always-allow second.
-		expect(fake.calls.selects[0]![1].join("|")).toContain(
-			"Always allow for this provider pair",
-		);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.confirms).toHaveLength(0);
+		expect(fake.calls.complete).toHaveLength(1);
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "anthropic",
 			id: "haiku",
 		});
-		expect(consentsOnDisk()).toHaveLength(1);
+		expect(
+			existsSync(
+				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
+			),
+		).toBe(false);
 	});
 
-	test("C2: decline → zero complete calls + warning, no re-prompt on second settle", async () => {
-		const { fake } = await setupCross({ selectResult: "decline" });
+	test("C2: false falls back to the active destination without prompting", async () => {
+		const fake = await setupCross(false);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete).toHaveLength(0);
-		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(
-			true,
-		);
-		// Session denial: settling again must not re-prompt nor send.
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
-		expect(fake.calls.complete).toHaveLength(0);
-	});
-
-	test("C3: granted consent persists → second settle does not re-prompt (F-02)", async () => {
-		const { fake } = await setupCross();
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.confirms).toHaveLength(0);
 		expect(fake.calls.complete).toHaveLength(1);
-		expect(consentsOnDisk()).toHaveLength(1);
-		// New session: consent persisted per project+destination.
-		const { fake: fake2 } = await setupCross();
-		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-		expect(fake2.calls.selects).toHaveLength(0);
-		expect(fake2.calls.complete).toHaveLength(1);
-	});
-
-	test("C4: same origin + DIFFERENT model route re-prompts (F-02/F-10)", async () => {
-		// Active gateway/openai, configured gateway/claude — same endpoint.
-		const baseUrl = "https://gateway.example.com/v1";
-		const { fake } = await setup({
-			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt", baseUrl },
-			findModel: (p, m) =>
-				p === "openai" && m === "claude"
-					? { provider: "openai", id: "claude", baseUrl }
-					: undefined,
-		});
-		writeFile(
-			process.env.PI_CODING_AGENT_DIR!,
-			"next-prompt.json",
-			JSON.stringify({
-				model: { provider: "openai", model: "claude" },
-				allowCrossProvider: true,
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1); // consent for gateway/claude
 		expect(fake.calls.complete[0]!.model).toEqual({
 			provider: "openai",
-			id: "claude",
-			baseUrl,
+			id: "gpt",
 		});
-		// Grant consent for gateway/claude, then the config switches to
-		// gateway/gpt-4o: different route → consent must be asked again.
-		const { fake: fake2 } = await setup({
-			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt", baseUrl },
-			findModel: (p, m) =>
-				p === "openai" && m === "gpt-4o"
-					? { provider: "openai", id: "gpt-4o", baseUrl }
-					: undefined,
-		});
-		writeFile(
-			process.env.PI_CODING_AGENT_DIR!,
-			"next-prompt.json",
-			JSON.stringify({
-				model: { provider: "openai", model: "gpt-4o" },
-				allowCrossProvider: true,
-			}),
-		);
-		await fake2.handlers.get("session_start")!({}, fake2.ctx);
-		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-		expect(fake2.calls.selects).toHaveLength(1);
-	});
-
-	test("C5: legacy consent record WITHOUT model route never matches → re-prompt (F-02/F-10)", async () => {
-		// Persist a legacy record (no model field) for this project+provider.
-		const dir = process.env.PI_CODING_AGENT_DIR!;
-		writeFileSync(
-			`${dir}/next-prompt-consent.json`,
-			JSON.stringify([
-				{
-					project: "/tmp",
-					destination: { provider: "anthropic", origin: "" },
-					grantedAt: new Date().toISOString(),
-					modelLabel: "anthropic/haiku",
-				},
-			]),
-		);
-		const { fake } = await setupCross();
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Fail closed: the legacy record does not authorize the current route.
-		expect(fake.calls.selects).toHaveLength(1);
-	});
-
-	test("C6: provider pair in global config skips the dialog entirely (directional)", async () => {
-		// Pair allows openai→anthropic; prompt once, then never again.
-		const dir = process.env.PI_CODING_AGENT_DIR!;
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: [["openai", "anthropic"]],
-			}),
-		);
-		const { fake } = await setupCross();
-		// setupCross overwrites next-prompt.json without pairs → restore them.
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: [["openai", "anthropic"]],
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(0);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(fake.calls.complete[0]!.model).toEqual({
-			provider: "anthropic",
-			id: "haiku",
-		});
-	});
-
-	test("C7: always-allow persists the directional pair to global config; no re-prompt afterwards", async () => {
-		const { fake } = await setupCross({ selectResult: "always" });
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
-		expect(fake.calls.complete).toHaveLength(1);
-		// Pair persisted in the global config file, merged with the rest.
-		const cfg = globalConfigOnDisk();
-		const pairs = cfg.allowCrossProviderPairs as Array<[string, string]>;
-		expect(pairs).toContainEqual(["openai", "anthropic"]);
-		// Info notification confirms the save.
-		expect(
-			fake.calls.notifies.some(
-				([m, t]) => t === "info" && m.includes("saved to global config"),
-			),
-		).toBe(true);
-		// Per-destination consent also persisted (belt and suspenders).
-		expect(consentsOnDisk()).toHaveLength(1);
-		// New session: pair grant → no dialog, still completes.
-		const { fake: fake2 } = await setupCross();
-		await fake2.handlers.get("agent_settled")!({}, fake2.ctx);
-		expect(fake2.calls.selects).toHaveLength(0);
-		expect(fake2.calls.complete).toHaveLength(1);
-	});
-	test("C7b: real select label for always-allow persists and completes", async () => {
-		const { fake } = await setupCross({
-			selectResult: "Always allow for this provider pair",
-		});
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
-			["openai", "anthropic"],
-		]);
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
-		expect(fake.calls.complete).toHaveLength(2);
-	});
-
-	test("C7c: styled/trimmed always-allow label persists the provider pair", async () => {
-		const { fake } = await setupCross({
-			selectResult: "  \x1b[36mAlways allow for this provider pair\x1b[0m  ",
-		});
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
-			["openai", "anthropic"],
-		]);
-	});
-
-	test("C7d: selector input does not invalidate consent persistence", async () => {
-		let deliverInput: ((data: string) => void) | undefined;
-		const { fake } = await setupCross({
-			selectResult: "always",
-			selectCall: () => deliverInput?.("\r"),
-		});
-		deliverInput = fake.deliverInput;
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(globalConfigOnDisk().allowCrossProviderPairs).toEqual([
-			["openai", "anthropic"],
-		]);
-	});
-
-	test("C8: pair grant is directional — reverse pair does not skip the dialog", async () => {
-		const dir = process.env.PI_CODING_AGENT_DIR!;
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: [["anthropic", "openai"]],
-			}),
-		);
-		const { fake } = await setupCross();
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: [["anthropic", "openai"]],
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// openai→anthropic is NOT allowed; the dialog still appears.
-		expect(fake.calls.selects).toHaveLength(1);
-	});
-
-	test("C9: no select API → falls back to confirm dialog; grant → complete", async () => {
-		const { fake } = await setupCross({
-			selectUnavailable: true,
-			confirmResult: true,
-		});
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(0);
-		expect(fake.calls.confirms).toHaveLength(1);
-		expect(fake.calls.complete).toHaveLength(1);
-		expect(consentsOnDisk()).toHaveLength(1);
-	});
-
-	test("C10: malformed allowCrossProviderPairs fails closed (no compute)", async () => {
-		const dir = process.env.PI_CODING_AGENT_DIR!;
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: ["openai", "anthropic"], // not a pair
-			}),
-		);
-		const { fake } = await setupCross();
-		// setupCross rewrote config; restore the invalid one.
-		writeFileSync(
-			`${dir}/next-prompt.json`,
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-				allowCrossProviderPairs: ["openai", "anthropic"],
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		await fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Fail closed: no dialog, no compute.
-		expect(fake.calls.selects).toHaveLength(0);
-		expect(fake.calls.complete).toHaveLength(0);
-	});
-
-	test("F08a: consent resolved AFTER ordinary typing → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
-		});
-		const { fake } = await setupCross({ selectResult: pending });
-		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Ordinary typing while the dialog is pending bumps the input generation.
-		fake.deliverInput("x");
-		resolveConfirm("once"); // late approval
-		await settle;
-		expect(fake.calls.complete).toHaveLength(0);
-		expect(consentsOnDisk()).toHaveLength(0); // consent never persisted
-	});
-
-	test("F08b: consent resolved AFTER session restart → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
-		});
-		const { fake } = await setupCross({ selectResult: pending });
-		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Session restart invalidates state and aborts in-flight work.
-		await fake.handlers.get("session_start")!(
-			{ type: "session_start", reason: "reload" },
-			fake.ctx,
-		);
-		resolveConfirm("once");
-		await settle;
-		expect(fake.calls.complete).toHaveLength(0);
-		expect(consentsOnDisk()).toHaveLength(0);
-	});
-
-	test("F08c: consent resolved AFTER shutdown → no grant, no complete (F-08)", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
-		});
-		const { fake } = await setupCross({ selectResult: pending });
-		const settle = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		resolveConfirm("once");
-		await settle;
-		expect(fake.calls.complete).toHaveLength(0);
-		expect(consentsOnDisk()).toHaveLength(0);
-	});
-
-	test("F08d: consent resolved AFTER a second settle aborts the first → no late disclose (F-08)", async () => {
-		const resolvers: Array<(v: string) => void> = [];
-		const { fake } = await setupCross({
-			// Each select call gets its own deferred promise.
-			selectResult: () =>
-				new Promise<string>((r) => {
-					resolvers.push(r);
-				}),
-		});
-		const first = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// Second settle while the first dialog is pending aborts the first.
-		const second = fake.handlers.get("agent_settled")!({}, fake.ctx);
-		// User approves the SECOND dialog only; the first never resolves.
-		resolvers[resolvers.length - 1]!("once");
-		await second;
-		resolvers[0]!("once"); // late approval on the aborted first dialog
-		await first;
-		// The stale first settle must never disclose; only the second may
-		// complete (its own fresh request).
-		expect(fake.calls.complete.length).toBeLessThanOrEqual(1);
 	});
 });
 
@@ -4550,7 +4158,7 @@ describe("OMP completion transport (completeSimple)", () => {
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		const c = fake.calls.ompComplete[0]!;
-		expect(c.model).toBe(configured); // resolved after all consent checks
+		expect(c.model).toBe(configured);
 		// OMP's Context.systemPrompt is an array of system-prompt lines.
 		expect(c.systemPrompt).toEqual([SYSTEM_PROMPT]);
 		expect(c.messages).toHaveLength(1);
@@ -4859,40 +4467,15 @@ describe("OMP acceptance / privacy", () => {
 		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
 	});
 
-	test("O3: OMP cross-destination decline → zero completeSimple calls, no re-prompt in session", async () => {
-		const { fake } = await setupOmp({
-			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt" },
-			findModel: (p, m) =>
-				p === "anthropic" && m === "haiku"
-					? { provider: "anthropic", id: "haiku" }
-					: undefined,
-			selectResult: "decline",
-		});
-		writeFile(
-			process.env.PI_CODING_AGENT_DIR!,
-			"next-prompt.json",
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.calls.ompComplete).toHaveLength(0);
-		expect(fake.calls.notifies.some(([m]) => m.includes("declined"))).toBe(true);
-		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1); // session denial: no re-prompt
-		expect(fake.calls.ompComplete).toHaveLength(0);
-	});
-
-	test("O3b: OMP cross-destination allow-once → completeSimple on the configured model, consent persisted", async () => {
+	test("O3: true uses a cross-destination model without prompting", async () => {
 		const configured = { provider: "anthropic", id: "haiku" };
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
 			model: { provider: "openai", id: "gpt" },
-			findModel: (p, m) =>
-				p === "anthropic" && m === "haiku" ? configured : undefined,
+			findModel: (provider, model) =>
+				provider === "anthropic" && model === "haiku"
+					? configured
+					: undefined,
 		});
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
@@ -4904,82 +4487,10 @@ describe("OMP acceptance / privacy", () => {
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
-		expect(fake.calls.selects).toHaveLength(1);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.confirms).toHaveLength(0);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		expect(fake.calls.ompComplete[0]!.model).toBe(configured);
-		const consents = JSON.parse(
-			readFileSync(
-				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
-				"utf-8",
-			),
-		) as Array<{ project: string }>;
-		expect(consents).toHaveLength(1);
-		expect(consents[0]!.project).toBe("/tmp");
-	});
-
-	test("O4: OMP consent resolved AFTER input → zero completeSimple calls, consent not persisted", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
-		});
-		const { fake } = await setupOmp({
-			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt" },
-			findModel: (p, m) =>
-				p === "anthropic" && m === "haiku"
-					? { provider: "anthropic", id: "haiku" }
-					: undefined,
-			selectResult: pending,
-		});
-		writeFile(
-			process.env.PI_CODING_AGENT_DIR!,
-			"next-prompt.json",
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const settle = fake.handlers.get("agent_end")!({}, fake.ctx);
-		fake.deliverInput("x"); // ordinary typing invalidates the request
-		resolveConfirm("once"); // late approval
-		await settle;
-		expect(fake.calls.ompComplete).toHaveLength(0);
-		expect(
-			existsSync(
-				`${process.env.PI_CODING_AGENT_DIR}/next-prompt-consent.json`,
-			),
-		).toBe(false);
-	});
-
-	test("O4b: OMP consent resolved AFTER shutdown → zero completeSimple calls", async () => {
-		let resolveConfirm!: (v: string) => void;
-		const pending = new Promise<string>((r) => {
-			resolveConfirm = r;
-		});
-		const { fake } = await setupOmp({
-			branch: [assistantEntry("a")],
-			model: { provider: "openai", id: "gpt" },
-			findModel: (p, m) =>
-				p === "anthropic" && m === "haiku"
-					? { provider: "anthropic", id: "haiku" }
-					: undefined,
-			selectResult: pending,
-		});
-		writeFile(
-			process.env.PI_CODING_AGENT_DIR!,
-			"next-prompt.json",
-			JSON.stringify({
-				model: { provider: "anthropic", model: "haiku" },
-				allowCrossProvider: true,
-			}),
-		);
-		await fake.handlers.get("session_start")!({}, fake.ctx);
-		const settle = fake.handlers.get("agent_end")!({}, fake.ctx);
-		fake.handlers.get("session_shutdown")!({}, fake.ctx);
-		resolveConfirm("once");
-		await settle;
-		expect(fake.calls.ompComplete).toHaveLength(0);
 	});
 
 	test("O5: OMP headless (hasUI:false) creates no completion request", async () => {
@@ -5109,6 +4620,36 @@ describe("enhance key handling (onTerminalInput)", () => {
 		const call = fake.calls.complete[0]!;
 		expect(String(call.systemPrompt)).toContain("rewrite a single instruction");
 		expect(JSON.stringify(call.messages)).toContain("fix teh parser bug");
+	});
+
+	test("EN9b: cross-destination opt-in enhances without prompting", async () => {
+		const configured = { provider: "anthropic", id: "haiku" };
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({
+				model: { provider: "anthropic", model: "haiku" },
+				allowCrossProvider: true,
+			}),
+		);
+		const { fake } = await setup({
+			model: { provider: "openai", id: "gpt" },
+			findModel: (provider, model) =>
+				provider === "anthropic" && model === "haiku"
+					? configured
+					: undefined,
+			completeResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("fix teh parser bug");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.calls.selects).toHaveLength(0);
+		expect(fake.calls.confirms).toHaveLength(0);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete[0]!.model).toBe(configured);
 	});
 
 	test("EN10: same key toggles to original and re-applies (no new call)", async () => {
