@@ -2137,7 +2137,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	api.on("session_start", (_e, ctx) => {
+	const initializeSession = (_e: unknown, ctx: HostCtx): void => {
 		reset();
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
@@ -2314,7 +2314,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
 		ref.unsubInput = ctx.ui.onTerminalInput(makeInputHandler(state, enhance));
-	});
+	};
+	api.on("session_start", initializeSession);
+	// OMP's /new flow removes extension terminal listeners before emitting
+	// session_switch. Re-run setup so enhancement and suggestion keys remain live.
+	if (host === "omp") api.on("session_switch", initializeSession);
 
 	// Completion lifecycle by host:
 	//  - Pi: `agent_settled` is its fully-settled contract (fires once after

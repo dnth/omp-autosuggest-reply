@@ -126,10 +126,10 @@ checks.
   enhancement use the configured model without a dialog; with `false`, they
   silently use the active model.
 - [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
-- [ ] Enhance prompt: type a prompt, press Ctrl+Up → box replaced by a clearer
-  rewrite (one `completeSimple` call, only the typed text sent); Ctrl+Up or Esc
-  revert to the original with no extra call; disabled cleanly with
-  `"enhanceEnabled": false`.
+- [ ] Enhance prompt before and after `/new`: type a prompt, press Ctrl+Up →
+  box replaced by a clearer rewrite (one `completeSimple` call, only the typed
+  text sent); Ctrl+Up or Esc revert to the original with no extra call; disabled
+  cleanly with `"enhanceEnabled": false`.
 
 ## Record
 

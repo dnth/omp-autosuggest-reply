@@ -3941,6 +3941,33 @@ describe("host compatibility boundary", () => {
 		expect(fake.calls.ompComplete).toHaveLength(1);
 	});
 
+	test("B8b: OMP /new reinstalls prompt enhancement on session_switch", async () => {
+		const { fake } = await setupOmp({
+			completeSimpleResult: {
+				content: [{ type: "text", text: "Fix the parser bug." }],
+				stopReason: "stop",
+			},
+		});
+		// OMP's /new flow clears extension terminal listeners before AgentSession
+		// emits session_switch with reason "new".
+		fake.inputListeners.splice(0);
+		expect(fake.inputListeners).toHaveLength(0);
+
+		const sessionSwitch = fake.handlers.get("session_switch");
+		expect(sessionSwitch).toBeDefined();
+		await sessionSwitch!(
+			{ type: "session_switch", reason: "new" },
+			fake.ctx,
+		);
+
+		expect(fake.inputListeners).toHaveLength(1);
+		fake.setEditorText("fix teh parser bug");
+		fake.deliverInput("\x1b[1;5A");
+		await sleep(30);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.editorText).toBe("Fix the parser bug.");
+	});
+
 	test("B9: unknown context (no mode, no hasUI) follows the conservative no-compute path", async () => {
 		const { fake } = await setupOmp({
 			branch: [assistantEntry("a")],
