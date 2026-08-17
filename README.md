@@ -1,9 +1,10 @@
 # omp-autosuggest-reply
 
 Fork of [gamaraan/next-prompt-extension](https://github.com/gamaraan/next-prompt-extension)
-with a **batch suggestion carousel**: after a turn settles, one model call returns up to three
-distinct next-prompts. Left/right (or **Alt+<** / **Alt+>**) wrap that turn's list; **Enter**
-fills the box without sending.
+with a **decision-gated suggestion carousel**: after a turn settles, one model
+call classifies whether the latest agent message needs user input and, when it
+does, returns up to three likely replies. Left/right (or **Alt+<** / **Alt+>**)
+wrap that turn's list; **Enter** fills the box without sending.
 
 **Suggestion carousel — Oh My Pi (OMP)**
 
@@ -22,8 +23,11 @@ fills the box without sending.
 ![Pi 0.84.1: Ctrl+Up rewrites the typed prompt for clarity without changing its intent and toggles between the original and enhanced text](pi-enhance.gif)
 
 A [pi](https://github.com/earendil-works/pi-coding-agent) / [Oh My Pi](https://github.com/oh-my-pi) (OMP)
-coding-agent extension that, after an agent turn fully settles and the input editor is empty, computes up to three
-distinct next instructions you'd type and shows the first. Three render modes:
+coding-agent extension that, after an agent turn fully settles and the input
+editor is empty, asks the suggestion model whether the latest agent message
+needs the user to decide, confirm, clarify, provide missing information, or
+take an action. It shows up to three likely replies when the model finds one of
+those needs; a `NONE` result renders nothing. Three render modes:
 
 - **`widget`** (default) — a colored below-editor line:
   `↳ next: <suggestion>  (Enter · 1/3 ←→)`
@@ -49,11 +53,17 @@ agent starts.
 
 ## Suggestion carousel
 
-Each settled turn is one model call and one batch (up to 3 distinct one-line
-next-prompts). The first item is shown immediately.
-The built-in prompt keeps each item to one clear action and at most 12 words.
-Regardless of a custom `systemPrompt`, an item that exactly repeats a user or
-assistant transcript line is dropped.
+Each settled turn is one model call. The built-in prompt asks the model whether
+the latest agent message requires a user reply. It instructs the model to return
+`NONE` for completed work, answers, explanations, status updates, and optional
+follow-up invitations that require no input. A `NONE` result renders nothing;
+otherwise the model returns one batch of up to three distinct one-line replies
+and shows the first. This is a semantic, model-evaluated gate, so classification
+quality depends on the selected model.
+
+Each reply is one clear action or decision and at most 12 words. Regardless of
+a custom `systemPrompt`, a reply that exactly repeats a user or assistant
+transcript line is dropped.
 
 - **Right** / **Left**, or **Alt+>** / **Alt+<**, wrap through that turn's list.
   There is no extra model call and no browsing of previous turns.
@@ -203,7 +213,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
-| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply-config`). See `SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply-config`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `120` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |

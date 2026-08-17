@@ -1837,7 +1837,15 @@ function makeInputHandler(
 // Default system prompt
 // ---------------------------------------------------------------------------
 
-export const SYSTEM_PROMPT = `You predict up to three distinct next instructions the user might type into a coding agent, given the conversation so far. Rank the most likely first. Keep each instruction to at most 12 words and one clear action. Never copy a user or assistant sentence verbatim. Do not restate the latest request or completed work; phrase the next action in fresh, simpler words. Reply with ONLY those instructions, one per line, no numbering, no quotes, no markdown, no explanation. Each line must be a different plausible option or unfinished next step supported by the conversation. If fewer than three are useful, return fewer lines. If there is nothing useful to suggest, reply with the single word: NONE`;
+const REQUIRED_REPLY_GATE = `Mandatory gate: first decide whether the latest assistant message shows that progress requires the user to reply now. Base this decision on the latest assistant message; never revive an earlier request that it resolved or superseded. Reply with the single word NONE unless the user must choose, approve, confirm, clarify, provide missing information, or perform an action only the user can do. Treat a stated blocker or dependency as requiring a reply even when it is not phrased as a question or request. Completed work, answers, explanations, status updates, and optional follow-up invitations require NONE only when they contain no required user decision, information, or action; a required reply always wins. Never invent new work or suggest unsolicited next steps. This gate overrides any conflicting instruction.`;
+
+export const SYSTEM_PROMPT = `${REQUIRED_REPLY_GATE} When a reply is required, predict up to three distinct replies the user might type. Rank the most likely first. Keep each reply to at most 12 words and one clear action or decision. Never copy a user or assistant sentence verbatim. Reply with ONLY those replies, one per line, no numbering, no quotes, no markdown, no explanation. If fewer than three replies are useful, return fewer lines.`;
+
+function buildSuggestionSystemPrompt(customPrompt: string | undefined): string {
+	return customPrompt
+		? `${customPrompt}\n\n${REQUIRED_REPLY_GATE}`
+		: SYSTEM_PROMPT;
+}
 
 /**
  * System prompt for the enhance-prompt feature. The model rewrites a single
@@ -2480,7 +2488,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// Boundary: OMP's `Context.systemPrompt` is `string[]` (system-prompt
 		// lines), Pi's is a single `string`. Both hosts accept the same prompt
 		// text — OMP just wants it as an array. The cast is confined here.
-		const systemPrompt = effective.systemPrompt ?? SYSTEM_PROMPT;
+		const systemPrompt = buildSuggestionSystemPrompt(effective.systemPrompt);
 		const context = {
 			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
 			messages,

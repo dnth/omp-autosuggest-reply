@@ -2521,6 +2521,31 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
 	});
 
+	test("T74c2: custom prompt cannot remove the required-reply gate", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ systemPrompt: "Always suggest another task." }),
+		);
+		await fake.handlers.get("session_start")!({}, fake.ctx);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(
+			fake.calls.complete[0]!.systemPrompt?.startsWith(
+				"Always suggest another task.",
+			),
+		).toBe(true);
+		expect(fake.calls.complete[0]!.systemPrompt).toContain(
+			"Mandatory gate: first decide whether the latest assistant message",
+		);
+		expect(fake.calls.complete[0]!.systemPrompt).toContain(
+			"This gate overrides any conflicting instruction",
+		);
+	});
+
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -3065,13 +3090,18 @@ describe("re-arm after delete-to-empty", () => {
 	});
 });
 
-// sanity: SYSTEM_PROMPT is non-empty
-test("SYSTEM_PROMPT requires a concise, non-repetitive batch", () => {
+// sanity: the default prompt fails closed unless the user must reply
+test("SYSTEM_PROMPT requires a decision-gated, concise reply batch", () => {
 	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
-	expect(SYSTEM_PROMPT).toContain("three distinct");
+	expect(SYSTEM_PROMPT).toContain("latest assistant message");
+	expect(SYSTEM_PROMPT).toContain("never revive an earlier request");
+	expect(SYSTEM_PROMPT).toContain("NONE unless");
+	expect(SYSTEM_PROMPT).toContain("stated blocker or dependency");
+	expect(SYSTEM_PROMPT).toContain("a required reply always wins");
+	expect(SYSTEM_PROMPT).toContain("Never invent new work");
+	expect(SYSTEM_PROMPT).toContain("up to three distinct replies");
 	expect(SYSTEM_PROMPT).toContain("one per line");
 	expect(SYSTEM_PROMPT).toContain("at most 12 words");
-	expect(SYSTEM_PROMPT).toContain("Never copy");
 });
 
 // ---------------------------------------------------------------------------
