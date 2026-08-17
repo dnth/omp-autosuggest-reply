@@ -1402,6 +1402,15 @@ export interface SuggestionState {
 	fallbackToWidget: (() => void) | undefined;
 	/** Abort + clear any in-flight suggestion request (F-08: user input cancels work). */
 	abortInflight: () => void;
+	/**
+	 * Set by the global terminal-input listener for the current dispatch.
+	 * Custom editors consume this marker so they do not process the same key
+	 * twice, while still providing a fallback when OMP bypasses the global
+	 * listener during editor dispatch. The generation avoids a stale marker
+	 * suppressing a later identical key if another listener consumed the input.
+	 */
+	globalInputData?: string;
+	globalInputGeneration?: number;
 }
 
 /** Accept-key + carousel hint, e.g. `(Enter · ←→)` or `(Enter · 2/3 ←→)`. */
@@ -1652,7 +1661,6 @@ export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
 	rt.showing = "none";
 	rt.pending = false;
 }
-
 /**
  * Enhance-key press on a non-empty editor. Toggles between the cached enhanced
  * text and the original when the box still holds one of them; otherwise starts
@@ -1709,23 +1717,30 @@ export function revertEnhance(
 	enhance.showHint(undefined);
 }
 
-
 /**
  * Raw terminal-input handler. Accept key fills the editor; left/right (or
  * Alt+< / Alt+>) wrap this turn's batch while a suggestion is showing on an
  * empty editor; any other
  * key dismisses immediately (F-04), invalidates in-flight work (F-08), and
  * schedules a re-arm only for a genuine delete-to-empty transition (F-09).
- * Editor-independent via ctx.ui.onTerminalInput.
+ * Editor-independent via ctx.ui.onTerminalInput. The same policy is also used
+ * by GhostEditor as an editor-local fallback because OMP versions can dispatch
+ * custom-editor input without invoking the extension's global listener.
  */
 function makeInputHandler(
 	state: SuggestionState,
 	enhance?: EnhanceController,
+	recordGlobalInput = true,
 ): (data: string) => { consume?: boolean } | undefined {
 	return (data: string) => {
+		const markGlobalInput = () => {
+			if (!recordGlobalInput) return;
+			state.globalInputData = data;
+			state.globalInputGeneration = state.inputGeneration;
+		};
+
 		// Kitty protocol sends press then release. Release is not a real edit.
 		if (isKittyKeyRelease(data)) return undefined;
-
 
 		// Enhance: rewrite the current (non-empty) editor text in place. Placed
 		// before the empty-editor accept/carousel branches so it is never
@@ -1806,6 +1821,7 @@ function makeInputHandler(
 			data === "\x7f" || data === "\x08" || data === "\x1b[3~";
 		if (state.suggestion || !isDeleteKey) dismissSuggestion(state);
 		state.inputGeneration += 1;
+		markGlobalInput();
 		state.abortInflight();
 		scheduleRearmCheck(state, editorTextBefore);
 		return undefined;
@@ -1830,18 +1846,20 @@ export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a codi
 // ---------------------------------------------------------------------------
 // A render-only CustomEditor that overlays the current suggestion
 // (state.suggestion) as greyed inline text after the caret via overlayGhost().
-// Acceptance/dismissal is handled by the global onTerminalInput handler, so
-// this class never decides policy. Installed once per session; pi's
+// Acceptance/dismissal is normally handled by the global onTerminalInput
+// handler; GhostEditor repeats that policy only when OMP bypasses the listener.
 // resetExtensionUI on reload/switch is followed by a fresh session_start that
 // re-installs it (no per-settle re-installation — F-05).
 
 class GhostEditor extends CustomEditor {
 	private suggestionState: SuggestionState;
+	private enhance: EnhanceController | undefined;
 	constructor(
 		tui: TUI,
 		theme: EditorTheme,
 		keybindings: KeybindingsManager,
 		state: SuggestionState,
+		enhance?: EnhanceController,
 	) {
 		super(tui, theme, keybindings);
 		// Capture the host TUI directly. Pi's CustomEditor sets `this.tui` in
@@ -1851,6 +1869,7 @@ class GhostEditor extends CustomEditor {
 		// repaints after a re-arm.
 		this.tui = tui;
 		this.suggestionState = state;
+		this.enhance = enhance;
 	}
 
 	/** Public so the controller can trigger a re-render when the ghost value changes. */
@@ -1903,8 +1922,22 @@ class GhostEditor extends CustomEditor {
 	}
 
 	handleInput(data: string): void {
-		// The global handler already dismissed/accepted; delegate everything to the
-		// base editor (autocomplete, history, paste, app keybindings) untouched.
+		// OMP normally runs the global listener before the focused editor. If
+		// that listener was bypassed, apply the same accept/dismiss policy here.
+		// A per-dispatch marker prevents duplicate handling when both paths run.
+		const globallyHandled =
+			this.suggestionState.globalInputData === data &&
+			this.suggestionState.globalInputGeneration === this.suggestionState.inputGeneration;
+		this.suggestionState.globalInputData = undefined;
+		this.suggestionState.globalInputGeneration = undefined;
+		if (!globallyHandled) {
+			const result = makeInputHandler(
+				this.suggestionState,
+				this.enhance,
+				false,
+			)?.(data);
+			if (result?.consume) return;
+		}
 		super.handleInput(data);
 		this.tui?.requestRender();
 	}
@@ -2286,7 +2319,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			state.fallbackToWidget = fallbackToWidget;
 			try {
 				ctx.ui.setEditorComponent?.((tui, theme, kb) => {
-					const ed = new GhostEditor(tui, theme, kb, state);
+					const ed = new GhostEditor(tui, theme, kb, state, enhance);
 					state.renderGhost = () => {
 						try {
 							ed.requestGhostRender();
