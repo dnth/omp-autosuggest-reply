@@ -202,7 +202,7 @@ export interface SuggestionCtx {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_TRANSCRIPT = 12000;
-const DEFAULT_MAX_SUGGESTION = 240;
+const DEFAULT_MAX_SUGGESTION = 120;
 export const DEFAULT_ACCEPT_KEY = "enter";
 export const DEFAULT_REARM_MS = 2000;
 /** Distinct next-prompts requested and cached per settled turn. */
@@ -1133,11 +1133,13 @@ const LIST_ITEM_PREFIX = /^(?:(?:\d+[\.\)\:]|[-*•])\s+)/;
 /**
  * Parse a settle-time model reply into up to SUGGESTION_BATCH_SIZE distinct
  * one-line next-prompts. Numbered/bulleted lines, blank lines, duplicates,
- * and NONE are dropped. A single-line reply still yields a one-item batch.
+ * verbatim transcript echoes, and NONE are dropped. A single-line reply still
+ * yields a one-item batch.
  */
 export function parseSuggestionBatch(
 	raw: string,
 	config: NextPromptConfig = {},
+	transcript = "",
 ): string[] {
 	// Keep newlines so we can split the batch, but still strip terminal
 	// controls on the whole reply first (a control string may contain \n).
@@ -1146,6 +1148,9 @@ export function parseSuggestionBatch(
 	const fenceMatch = s.match(fence);
 	if (fenceMatch) s = fenceMatch[1]!.trim();
 
+	const transcriptLines = transcript.split("\n").map((line) =>
+		suggestionKey(line.replace(/^(?:User|Assistant):\s*/i, "")),
+	);
 	const out: string[] = [];
 	for (const line of s.split("\n")) {
 		let t = line.trim();
@@ -1153,9 +1158,9 @@ export function parseSuggestionBatch(
 		t = t.replace(LIST_ITEM_PREFIX, "");
 		const clean = sanitizeSuggestion(t, config);
 		if (!clean) continue;
-		if (out.some((item) => suggestionKey(item) === suggestionKey(clean))) {
-			continue;
-		}
+		const key = suggestionKey(clean);
+		if (transcriptLines.includes(key)) continue;
+		if (out.some((item) => suggestionKey(item) === key)) continue;
 		out.push(clean);
 		if (out.length >= SUGGESTION_BATCH_SIZE) break;
 	}
@@ -1832,7 +1837,7 @@ function makeInputHandler(
 // Default system prompt
 // ---------------------------------------------------------------------------
 
-export const SYSTEM_PROMPT = `You predict up to three distinct next instructions the user might type into a coding agent, given the conversation so far. Rank the most likely first. Reply with ONLY those instructions, one per line, no numbering, no quotes, no markdown, no explanation. Each line must be a different plausible take (another option, unfinished task, or next step already present in the conversation). If fewer than three are useful, return fewer lines. If there is nothing useful to suggest, reply with the single word: NONE`;
+export const SYSTEM_PROMPT = `You predict up to three distinct next instructions the user might type into a coding agent, given the conversation so far. Rank the most likely first. Keep each instruction to at most 12 words and one clear action. Never copy a user or assistant sentence verbatim. Do not restate the latest request or completed work; phrase the next action in fresh, simpler words. Reply with ONLY those instructions, one per line, no numbering, no quotes, no markdown, no explanation. Each line must be a different plausible option or unfinished next step supported by the conversation. If fewer than three are useful, return fewer lines. If there is nothing useful to suggest, reply with the single word: NONE`;
 
 /**
  * System prompt for the enhance-prompt feature. The model rewrites a single
@@ -2517,7 +2522,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
-		const batch = parseSuggestionBatch(raw, effective);
+		const batch = parseSuggestionBatch(raw, effective, transcript);
 		if (batch.length > 0 && ref.state === state) {
 			showSuggestionBatch(state, batch, generation, host === "pi");
 		}

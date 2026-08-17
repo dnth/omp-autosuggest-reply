@@ -1160,7 +1160,7 @@ describe("sanitizeSuggestion", () => {
 	});
 	test("T43: default cap applied when config omits field", () => {
 		const long = "a".repeat(500);
-		expect(sanitizeSuggestion(long, {}).length).toBe(240);
+		expect(sanitizeSuggestion(long, {}).length).toBe(120);
 	});
 	test("T44: emoji / wide-char truncation does not split a grapheme", () => {
 		// 👨‍👩‍👧 is a multi-codepoint grapheme; truncateToWidth is grapheme-aware.
@@ -1182,7 +1182,7 @@ describe("sanitizeSuggestion", () => {
 	});
 	test("T44d: default cap also bounds a huge zero-width payload (F-01)", () => {
 		const out = sanitizeSuggestion("\u200d".repeat(50_000), {});
-		expect(out.length).toBeLessThanOrEqual(suggestionCodePointCap(240));
+		expect(out.length).toBeLessThanOrEqual(suggestionCodePointCap(120));
 	});
 	test("T44e: emoji, CJK, combining, RTL text stay usable under the caps (F-01)", () => {
 		const text = "👨‍👩‍👧 café 日本語 مرحبا e\u0301";
@@ -1227,6 +1227,17 @@ describe("parseSuggestionBatch", () => {
 			"write tests",
 			"update the README",
 		]);
+	});
+	test("drops verbatim transcript echoes but keeps a concise rephrase", () => {
+		const transcript =
+			"User: Stage and commit the remaining merge files\nAssistant: The merge is ready";
+		expect(
+			parseSuggestionBatch(
+				"Stage and commit the remaining merge files\nCommit the merge\nThe merge is ready",
+				{},
+				transcript,
+			),
+		).toEqual(["Commit the merge"]);
 	});
 });
 
@@ -3055,10 +3066,12 @@ describe("re-arm after delete-to-empty", () => {
 });
 
 // sanity: SYSTEM_PROMPT is non-empty
-test("SYSTEM_PROMPT asks for a numbered-free batch", () => {
+test("SYSTEM_PROMPT requires a concise, non-repetitive batch", () => {
 	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
 	expect(SYSTEM_PROMPT).toContain("three distinct");
 	expect(SYSTEM_PROMPT).toContain("one per line");
+	expect(SYSTEM_PROMPT).toContain("at most 12 words");
+	expect(SYSTEM_PROMPT).toContain("Never copy");
 });
 
 // ---------------------------------------------------------------------------
