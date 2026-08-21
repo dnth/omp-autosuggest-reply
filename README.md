@@ -51,6 +51,15 @@ call). No suggestion while streaming; the suggestion is cleared and any
 in-flight model call aborted the instant you submit, start a turn, or the
 agent starts.
 
+> **Opt-in — off by default, per session.** The extension makes no background
+> model calls and installs no terminal-input listener or custom editor until it
+> is turned on; the settle subscription remains registered but gated to a no-op.
+> Toggle it live for the current session at any turn with `/autosuggest-reply on`
+> (and `off`) — the same way `/advisor` works, with no file editing and no reload.
+> The config `enabled` field sets the per-session **default** (see Configure).
+> Useful when you run many sessions and only want suggestions in the ones you type in.
+> Headless/background sessions, including subagents, never compute regardless.
+
 ## Suggestion carousel
 
 Each settled turn is one model call. The built-in prompt asks the model whether
@@ -168,16 +177,22 @@ Restart `pi` (or start a new session) after installing.
 
 ## Configure
 
-### Interactive: `/autosuggest-reply-config`
+### Command: `/autosuggest-reply <on|off|status|configure>`
 
-Run the `/autosuggest-reply-config` slash command for a guided walkthrough of
-**every configurable option except `systemPrompt` and `enhanceSystemPrompt`**
-(those two are config-file-only) — a model picker (lists all available models),
-render mode, thinking level, accept key, re-arm delay,
-transcript/recent-turn/suggestion caps, cross-provider disclosure, and the
-enhance-prompt toggle + key. Changes are saved to the host agent dir
-(`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP)
-and the host reloads so they take effect immediately.
+Mirrors `/advisor`. Control the extension per session, at any turn:
+
+- **`on`** / **`off`** — enable or disable suggestions (and enhance) for the
+  current session immediately. This is the primary control; it overrides the
+  configured default without editing files or reloading.
+- **`status`** — show whether this session is on/off, the configured default, and
+  the resolved model, render mode, thinking level, accept key, and enhance key.
+- **`configure`** — a guided walkthrough of **every option except `systemPrompt`
+  and `enhanceSystemPrompt`** (config-file only): the per-session default, a model
+  picker, render mode, thinking level, accept key, re-arm delay,
+  transcript/recent-turn/suggestion caps, cross-provider disclosure, and the
+  enhance-prompt toggle + key. Saved to the host agent dir
+  (`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP);
+  the host reloads so changes take effect immediately.
 
 ### Config file
 
@@ -192,6 +207,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 
 ```json
 {
+  "enabled": true,
   "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
   "thinking": "low",
   "acceptKey": "enter",
@@ -208,19 +224,20 @@ comes from the host's `CONFIG_DIR_NAME`:
 
 | Field | Default | Notes |
 | --- | --- | --- |
+| `enabled` | `false` | **Per-session default (opt-in).** Whether a session *starts* with the extension on. A `false` default installs no terminal-input listener or custom editor and makes no background model call until you run `/autosuggest-reply on`; the registered settle handler remains gated to a no-op. The live command overrides this per session. Project config overrides global. Headless/background sessions (including subagents) never compute regardless. |
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
-| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply-config`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply configure`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
 | `maxRecentTurns` | all | Disclosure minimization: only the last N user/assistant turns are sent (tool results are never sent regardless). Invalid values fail closed — suggestions are disabled. |
 | `maxSuggestionChars` | `120` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply-config`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply configure`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
 
@@ -286,18 +303,21 @@ Mitigations:
 ## How it works
 
 1. On `session_start` (interactive mode only — Pi TUI `ctx.mode === "tui"`, OMP
-`ctx.hasUI === true`; headless/RPC/JSON sessions never compute), a global
-`ctx.ui.onTerminalInput` listener is registered to detect the accept key
-**editor-independently**. `ghost`/`both` install a render-only `GhostEditor` via
-`setEditorComponent` — never re-installed on settle. If another extension owns
+`ctx.hasUI === true`; headless/RPC/JSON sessions never compute), the configured
+`enabled` value seeds the session state. When it is on—or after
+`/autosuggest-reply on`—a global `ctx.ui.onTerminalInput` listener is registered
+to detect the accept key **editor-independently**. `ghost`/`both` install a
+render-only `GhostEditor` via `setEditorComponent` — never re-installed on
+settle. `/autosuggest-reply off` removes that listener and editor immediately.
+If another extension owns
 the editor on Pi, the ghost is **still attempted** (with a warning); only if the
 ghost install or its render pass actually fails does the extension restore the
 prior owner and fall back to widget mode. On OMP there is no editor-owner getter,
 so a failed ghost restores the **default** editor instead; OMP also has no
 host-side extension-editor teardown, so next-prompt resets its editor to default
 at the next `session_start`. The host clears extension listeners when the UI is
-reset; each fresh `session_start` (reload/new/resume/fork) re-registers exactly
-one listener and re-installs the editor once.
+reset; each fresh `session_start` (reload/new/resume/fork) resets the live toggle
+to the configured default, then installs at most one listener and editor.
 2. On completion:
    - **Pi:** `agent_settled` (its fully-settled contract) — if the editor is
      empty, the controller calls

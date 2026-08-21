@@ -101,6 +101,33 @@ function writeFile(dir: string, path: string, content: string): void {
 	writeFileSync(full, content);
 }
 
+// Default-off (opt-in): the extension is inert unless `enabled` is set. The
+// controller fixtures below all exercise the ACTIVE extension, so ensure the
+// on-disk global config enables it — merging into any test-provided config, but
+// leaving malformed / explicitly-disabled configs untouched so fail-closed and
+// disabled-gate tests still exercise their own paths.
+function ensureTestEnabled(): void {
+	const dir = process.env.PI_CODING_AGENT_DIR!;
+	const path = join(dir, "next-prompt.json");
+	if (!existsSync(path)) {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(path, JSON.stringify({ enabled: true }));
+		return;
+	}
+	let obj: Record<string, unknown>;
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf-8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+		obj = parsed as Record<string, unknown>;
+	} catch {
+		return; // malformed JSON: leave for fail-closed tests
+	}
+	if (!("enabled" in obj)) {
+		obj.enabled = true;
+		writeFileSync(path, JSON.stringify(obj));
+	}
+}
+
 function readFileSyncSafe(path: string): string {
 	try {
 		return readFileSync(path, "utf-8");
@@ -1849,6 +1876,7 @@ describe("real pi-tui editor integration", () => {
 // Identity-stable "previous editor owner" so restore calls (which pass the
 // captured prior factory back) are distinguishable from fresh installs.
 const PRIOR_EDITOR_FACTORY = (() => {}) as never;
+const NEWER_EDITOR_FACTORY = (() => ({})) as never;
 function makeFake(opts: {
 	branch?: BranchEntry[];
 	idle?: boolean;
@@ -1911,11 +1939,22 @@ function makeFake(opts: {
 		selects: Array<[string, string[]]>;
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
+	commands: Map<
+		string,
+		{
+			handler: (args: string, ctx: unknown) => unknown;
+			getArgumentCompletions?: (
+				prefix: string,
+			) => Array<{ value: string; label: string; description?: string }> | null;
+		}
+	>;
 	setIdle: (v: boolean) => void;
 	editorComponentInstalled: boolean;
 	editorComponentCalls: number;
-	/** Count of restore calls: setEditorComponent(undefined) — the fallback path. */
+	/** Count of editor restore calls. */
 	editorComponentRestores: number;
+	editorComponentRestoredToPrior: boolean;
+	editorComponentOwner: unknown;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
 } {
@@ -1944,11 +1983,24 @@ function makeFake(opts: {
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
+	let editorComponentRestoredToPrior = false;
+	let editorComponentOwner: unknown = opts.hasPriorEditor
+		? PRIOR_EDITOR_FACTORY
+		: undefined;
 	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
 	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
+	const commands = new Map<
+		string,
+		{
+			handler: (args: string, ctx: unknown) => unknown;
+			getArgumentCompletions?: (
+				prefix: string,
+			) => Array<{ value: string; label: string; description?: string }> | null;
+		}
+	>();
 	const ctx = {
 		cwd: "/tmp",
 		mode: opts.mode ?? "tui",
@@ -2028,8 +2080,7 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
-			getEditorComponent: () =>
-				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
+			getEditorComponent: () => editorComponentOwner,
 			setEditorComponent: (
 				factory:
 					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
@@ -2040,18 +2091,22 @@ function makeFake(opts: {
 					// Restore path (fallbackToWidget): the previous owner is back.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
+					editorComponentRestoredToPrior = true;
+					editorComponentOwner = factory;
 					return;
 				}
 				if (factory === undefined) {
 					// Explicit reset to the default editor.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
+					editorComponentOwner = undefined;
 					return;
 				}
 				if (opts.setEditorComponentThrows) {
 					throw new Error("editor owner rejected replacement");
 				}
 				editorComponentInstalled = true;
+				editorComponentOwner = factory;
 				// Call the factory so a real GhostEditor is constructed (lightweight ctor).
 				lastEditorComponent = factory(
 					{
@@ -2072,8 +2127,16 @@ function makeFake(opts: {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
 			handlers.set(event, handler);
 		},
-		registerCommand: (_name: string, _options: unknown) => {
-			// No-op stub for tests; the config command is exercised via configureInteractively.
+		registerCommand: (
+			name: string,
+			options: {
+				handler: (args: string, ctx: unknown) => unknown;
+				getArgumentCompletions?: (
+					prefix: string,
+				) => Array<{ value: string; label: string; description?: string }> | null;
+			},
+		) => {
+			commands.set(name, options);
 		},
 	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	return {
@@ -2118,11 +2181,18 @@ function makeFake(opts: {
 		get editorComponentRestores() {
 			return editorComponentRestores;
 		},
+		get editorComponentRestoredToPrior() {
+			return editorComponentRestoredToPrior;
+		},
+		get editorComponentOwner() {
+			return editorComponentOwner;
+		},
 		get lastEditorComponent() {
 			return lastEditorComponent;
 		},
 		calls,
 		handlers,
+		commands,
 		setIdle: (v: boolean) => {
 			idle = v;
 		},
@@ -2133,6 +2203,7 @@ async function setup(opts: Parameters<typeof makeFake>[0]) {
 	const fake = makeFake(opts);
 	const factory = (await import("./next-prompt.ts")).default;
 	factory(fake.pi);
+	ensureTestEnabled();
 	// Trigger session_start so the controller installs the editor and captures it.
 	await fake.handlers.get("session_start")!({}, fake.ctx);
 	return { fake };
@@ -2210,6 +2281,15 @@ function makeOmpFake(opts: {
 		selects: Array<[string, string[]]>;
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
+	commands: Map<
+		string,
+		{
+			handler: (args: string, ctx: unknown) => unknown;
+			getArgumentCompletions?: (
+				prefix: string,
+			) => Array<{ value: string; label: string; description?: string }> | null;
+		}
+	>;
 	setIdle: (v: boolean) => void;
 	/** Number of times the OMP completion-module loader was invoked. */
 	loaderCalls: number;
@@ -2249,6 +2329,15 @@ function makeOmpFake(opts: {
 	const editor = makeStubEditor();
 	editor.focused = true;
 	const handlers = new Map<string, (e: unknown, ctx: unknown) => unknown>();
+	const commands = new Map<
+		string,
+		{
+			handler: (args: string, ctx: unknown) => unknown;
+			getArgumentCompletions?: (
+				prefix: string,
+			) => Array<{ value: string; label: string; description?: string }> | null;
+		}
+	>();
 
 	// OMP transport: completeSimple from the lazily loaded (test-seamed)
 	// completion module, invoked with the registry resolver as apiKey.
@@ -2380,8 +2469,16 @@ function makeOmpFake(opts: {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
 			handlers.set(event, handler);
 		},
-		registerCommand: (_name: string, _options: unknown) => {
-			// No-op stub for tests; the config command is exercised via configureInteractively.
+		registerCommand: (
+			name: string,
+			options: {
+				handler: (args: string, ctx: unknown) => unknown;
+				getArgumentCompletions?: (
+					prefix: string,
+				) => Array<{ value: string; label: string; description?: string }> | null;
+			},
+		) => {
+			commands.set(name, options);
 		},
 	} as unknown as import("@earendil-works/pi-coding-agent").ExtensionAPI;
 	return {
@@ -2417,6 +2514,7 @@ function makeOmpFake(opts: {
 		},
 		calls,
 		handlers,
+		commands,
 		setIdle: (v: boolean) => {
 			idle = v;
 		},
@@ -2439,6 +2537,7 @@ async function setupOmp(opts: Parameters<typeof makeOmpFake>[0]) {
 	const fake = makeOmpFake(opts);
 	const factory = (await import("./next-prompt.ts")).default;
 	factory(fake.pi);
+	ensureTestEnabled();
 	// Trigger session_start so the controller installs OMP session state.
 	await fake.handlers.get("session_start")!({}, fake.ctx);
 	return { fake };
@@ -2486,6 +2585,7 @@ describe("controller wiring (agent_settled)", () => {
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
+				enabled: true,
 				model: { provider: "anthropic", model: "haiku" },
 				allowCrossProvider: true,
 			}),
@@ -2503,7 +2603,7 @@ describe("controller wiring (agent_settled)", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ thinking: "low" }),
+			JSON.stringify({ thinking: "low", enabled: true }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -2529,7 +2629,7 @@ describe("controller wiring (agent_settled)", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ systemPrompt: "Always suggest another task." }),
+			JSON.stringify({ systemPrompt: "Always suggest another task.", enabled: true }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -2554,7 +2654,7 @@ describe("controller wiring (agent_settled)", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ acceptKey: "ctrl+space" }),
+			JSON.stringify({ acceptKey: "ctrl+space", enabled: true }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
@@ -2584,6 +2684,7 @@ describe("controller wiring (agent_settled)", () => {
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
+				enabled: true,
 				model: { provider: "anthropic", model: "haiku" },
 				allowCrossProvider: false,
 			}),
@@ -2689,8 +2790,9 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T84: loadConfig failure at session_start → computeDisabled, zero complete calls (F-07)", async () => {
-		// Malformed global config must fail closed: no suggestion model request.
+	test("T84: malformed global config → extension inert (default-off, no crash)", async () => {
+		// A corrupt global config leaves `enabled` unreadable, so the opt-in
+		// extension stays fully off: no request, no listener, and no crash.
 		writeFile(process.env.PI_CODING_AGENT_DIR!, "next-prompt.json", "{ broken");
 		const { fake } = await setup({
 			branch: [assistantEntry("a")],
@@ -2698,12 +2800,7 @@ describe("controller wiring (agent_settled)", () => {
 		});
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
-		// The TUI warning is surfaced.
-		expect(
-			fake.calls.notifies.some(
-				([m, t]) => t === "warning" && m.includes("suggestions disabled"),
-			),
-		).toBe(true);
+		expect(fake.inputListeners).toHaveLength(0);
 	});
 
 	test("T84b: malformed PROJECT config → computeDisabled, zero complete calls (F-07)", async () => {
@@ -2720,16 +2817,21 @@ describe("controller wiring (agent_settled)", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
-	test("T84c: invalid privacy field (maxTranscriptChars) → zero complete calls", async () => {
+	test("T84c: invalid privacy field + enabled → warning + zero complete calls", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ maxTranscriptChars: "unlimited" }),
+			JSON.stringify({ maxTranscriptChars: "unlimited", enabled: true }),
 		);
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(0);
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "warning" && m.includes("suggestions disabled"),
+			),
+		).toBe(true);
 	});
 
 	test("T85: input event → inflight aborted + ghost cleared", async () => {
@@ -3183,7 +3285,7 @@ describe("renderMode config", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T106c: ghost install throws → falls back to widget, restores prior owner (P1-1)", async () => {
+	test("T106c: ghost install throws → falls back to widget, keeps prior owner (P1-1)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -3199,7 +3301,8 @@ describe("renderMode config", () => {
 			},
 		});
 		expect(fake.editorComponentInstalled).toBe(false); // install failed
-		expect(fake.editorComponentRestores).toBe(1); // prior owner restored
+		expect(fake.editorComponentRestores).toBe(0);
+		expect(fake.editorComponentOwner).toBe(PRIOR_EDITOR_FACTORY);
 		expect(
 			fake.calls.notifies.some(
 				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
@@ -3243,6 +3346,32 @@ describe("renderMode config", () => {
 				m.includes("fell back to widget mode"),
 			),
 		).toHaveLength(1);
+	});
+
+	test("T106e: ghost render fallback preserves a newer Pi editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			requestRenderThrows: true,
+			completeResult: {
+				content: [{ type: "text", text: "fallback suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		(
+			fake.ctx as {
+				ui: { setEditorComponent: (factory: unknown) => void };
+			}
+		).ui.setEditorComponent(NEWER_EDITOR_FACTORY);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.editorComponentOwner).toBe(NEWER_EDITOR_FACTORY);
+		expect(fake.editorComponentRestoredToPrior).toBe(false);
+		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
@@ -3372,6 +3501,7 @@ describe("cross-destination opt-in", () => {
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
+				enabled: true,
 				model: { provider: "anthropic", model: "haiku" },
 				allowCrossProvider,
 			}),
@@ -3788,6 +3918,7 @@ describe("configureInteractively", () => {
 				{ provider: "anthropic", id: "claude-haiku", name: "Claude Haiku" },
 			],
 			answers: {
+				enabled: true,
 				model: "anthropic/claude-haiku — Claude Haiku",
 				renderMode: "ghost — inline greyed text in the input box",
 				thinking: "low",
@@ -3803,6 +3934,7 @@ describe("configureInteractively", () => {
 		});
 		const out = await configureInteractively(ctx, {});
 		expect(out).toEqual({
+			enabled: true,
 			model: { provider: "anthropic", model: "claude-haiku" },
 			renderMode: "ghost",
 			thinking: "low",
@@ -3818,7 +3950,7 @@ describe("configureInteractively", () => {
 	});
 
 	test("T120: cancel at model picker → undefined", async () => {
-		const ctx = makeConfigCtx({ answers: { model: undefined } });
+		const ctx = makeConfigCtx({ answers: { enabled: true, model: undefined } });
 		const out = await configureInteractively(ctx, {});
 		expect(out).toBeUndefined();
 	});
@@ -3826,7 +3958,7 @@ describe("configureInteractively", () => {
 	test("T121: model '(use current model)' → model undefined", async () => {
 		const ctx = makeConfigCtx({
 			models: [{ provider: "openai", id: "gpt" }],
-			answers: { model: "(use current model)" },
+			answers: { enabled: true, model: "(use current model)" },
 		});
 		const out = await configureInteractively(ctx, {});
 		expect(out?.model).toBeUndefined();
@@ -3835,6 +3967,7 @@ describe("configureInteractively", () => {
 	test("T122: thinking '(unset)' → thinking undefined", async () => {
 		const ctx = makeConfigCtx({
 			answers: {
+				enabled: true,
 				model: "(use current model)",
 				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
@@ -3854,6 +3987,7 @@ describe("configureInteractively", () => {
 	test("T123: invalid numeric input → field not set", async () => {
 		const ctx = makeConfigCtx({
 			answers: {
+				enabled: true,
 				model: "(use current model)",
 				renderMode: "widget — colored line below the input box",
 				thinking: "(unset — model default)",
@@ -3901,6 +4035,272 @@ test("T124: renderMode picker lists ghost first with descriptions", async () => 
 	expect(seenRenderOptions[0]).toContain("ghost");
 	expect(seenRenderOptions.some((o) => o.startsWith("widget"))).toBe(true);
 	expect(seenRenderOptions.some((o) => o.startsWith("both"))).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// enabled master switch (opt-in; default off)
+// ---------------------------------------------------------------------------
+
+describe("enabled master switch (opt-in, default off)", () => {
+	test("EO1: loadConfig reads enabled true/false; invalid ignored", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true }),
+		);
+		expect(loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).enabled).toBe(
+			true,
+		);
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		expect(loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).enabled).toBe(
+			false,
+		);
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: "yes" }),
+		);
+		expect(
+			loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).enabled,
+		).toBeUndefined();
+	});
+
+	test("EO2: loadEffectiveConfig defaults enabled to false (opt-in)", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		expect(loadEffectiveConfig(cwd).enabled).toBe(false);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("EO3: trusted project config can enable when global is false", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", JSON.stringify({ enabled: true }));
+		expect(loadEffectiveConfig(cwd).enabled).toBe(true);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("EO4: trusted project config can disable when global is true", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", JSON.stringify({ enabled: false }));
+		expect(loadEffectiveConfig(cwd).enabled).toBe(false);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("EO5: untrusted project config cannot enable it", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		writeFile(cwd, ".pi/next-prompt.json", JSON.stringify({ enabled: true }));
+		expect(loadEffectiveConfig(cwd, { projectTrusted: false }).enabled).toBe(
+			false,
+		);
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	test("EO6: disabled → no input listener, editor, or model call on settle", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false, renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.inputListeners).toHaveLength(0);
+		expect(fake.editorComponentInstalled).toBe(false);
+	});
+
+	test("EO7: enabled → listener installed and model call on settle", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.inputListeners).toHaveLength(1);
+	});
+
+	test("EO8: disabled on OMP → no terminal agent_end model call", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// live per-session toggle command (/autosuggest-reply on|off|status|configure)
+// ---------------------------------------------------------------------------
+
+describe("live session toggle (/autosuggest-reply)", () => {
+	test("LT1: off by default → `on` enables compute + listener this session", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.inputListeners).toHaveLength(0);
+		await fake.commands.get("autosuggest-reply")!.handler("on", fake.ctx);
+		expect(fake.inputListeners).toHaveLength(1);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("LT2: `off` disables compute mid-session", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.inputListeners).toHaveLength(0);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("LT2b: `off` restores Pi's prior editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+		});
+		expect(fake.editorComponentInstalled).toBe(true);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(false);
+		expect(fake.editorComponentRestoredToPrior).toBe(true);
+	});
+
+	test("LT2c: `off` preserves a newer Pi editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+		});
+		(
+			fake.ctx as {
+				ui: { setEditorComponent: (factory: unknown) => void };
+			}
+		).ui.setEditorComponent(NEWER_EDITOR_FACTORY);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.editorComponentOwner).toBe(NEWER_EDITOR_FACTORY);
+		expect(fake.editorComponentRestoredToPrior).toBe(false);
+	});
+
+	test("LT3: `status` reports ON/OFF for the session", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.commands.get("autosuggest-reply")!.handler("status", fake.ctx);
+		const offMsg = fake.calls.notifies[fake.calls.notifies.length - 1]!;
+		expect(offMsg[0]).toContain("OFF");
+		await fake.commands.get("autosuggest-reply")!.handler("on", fake.ctx);
+		await fake.commands.get("autosuggest-reply")!.handler("status", fake.ctx);
+		const onMsg = fake.calls.notifies[fake.calls.notifies.length - 1]!;
+		expect(onMsg[0]).toContain("ON");
+	});
+
+	test("LT4: getArgumentCompletions offers the subcommands", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		const c = fake.commands.get("autosuggest-reply")!;
+		expect((c.getArgumentCompletions!("") ?? []).map((i) => i.value).sort()).toEqual(
+			["configure", "off", "on", "status"],
+		);
+		expect(
+			(c.getArgumentCompletions!("o") ?? []).map((i) => i.value).sort(),
+		).toEqual(["off", "on"]);
+	});
+
+	test("LT5: unknown subcommand notifies an error", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.commands.get("autosuggest-reply")!.handler("wat", fake.ctx);
+		const [msg, level] = fake.calls.notifies[fake.calls.notifies.length - 1]!;
+		expect(level).toBe("error");
+		expect(msg).toContain("unknown subcommand");
+	});
+
+	test("LT6 (OMP): `on` enables terminal agent_end compute", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			model: { provider: "openai", id: "gpt" },
+		});
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		await fake.commands.get("autosuggest-reply")!.handler("on", fake.ctx);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -4242,6 +4642,7 @@ describe("OMP completion transport (completeSimple)", () => {
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
+				enabled: true,
 				model: { provider: "anthropic", model: "haiku" },
 				allowCrossProvider: true,
 				thinking: "low",
@@ -4551,7 +4952,7 @@ describe("OMP acceptance / privacy", () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
-			JSON.stringify({ model: { provider: "anthropic", model: "haiku" } }),
+			JSON.stringify({ model: { provider: "anthropic", model: "haiku" }, enabled: true }),
 		);
 		await fake.handlers.get("session_start")!({}, fake.ctx);
 		await fake.handlers.get("agent_end")!({}, fake.ctx);
@@ -4574,6 +4975,7 @@ describe("OMP acceptance / privacy", () => {
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({
+				enabled: true,
 				model: { provider: "anthropic", model: "haiku" },
 				allowCrossProvider: true,
 			}),
