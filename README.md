@@ -223,7 +223,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `enabled` | `false` | **Per-session default (opt-in).** Whether a session *starts* with the extension on. A `false` default leaves the session inert (no settle listener, custom editor, or background model call) until you run `/autosuggest-reply on`; the live command overrides this per session. Project config overrides global. Headless/background sessions (including subagents) never compute regardless. |
+| `enabled` | `false` | **Per-session default (opt-in).** Whether a session *starts* with the extension on. A `false` default installs no terminal-input listener or custom editor and makes no background model call until you run `/autosuggest-reply on`; the registered settle handler remains gated to a no-op. The live command overrides this per session. Project config overrides global. Headless/background sessions (including subagents) never compute regardless. |
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |

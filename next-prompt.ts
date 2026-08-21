@@ -2158,6 +2158,7 @@ interface NextPromptRef {
 	sessionEnabled: boolean;
 	/** Whether the session wiring (state/listener/editor) is currently installed. */
 	active: boolean;
+	priorEditorComponent: unknown;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -2170,6 +2171,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		enhanceInflight: undefined,
 		sessionEnabled: false,
 		active: false,
+		priorEditorComponent: undefined,
 	};
 	let effective: EffectiveConfig | undefined;
 	const notifiedFallback = { value: false };
@@ -2294,6 +2296,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			// OMP has no getEditorComponent(): `prior` stays undefined there, so a
 			// fallback restores the DEFAULT editor rather than a captured owner.
 			const prior = ctx.ui.getEditorComponent?.();
+			ref.priorEditorComponent = prior;
 			const fallbackToWidget = () => {
 				if (state.renderMode === "widget") return;
 				state.renderMode = "widget";
@@ -2305,6 +2308,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				} catch {
 					// Restoration is best-effort; widget mode still works.
 				}
+				ref.priorEditorComponent = undefined;
 				ctx.ui.notify(
 					"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
 					"warning",
@@ -2352,13 +2356,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput = undefined;
 		if (editorInstalled || editorInstalledForHost) {
 			try {
-				ctx.ui.setEditorComponent?.(undefined);
+				ctx.ui.setEditorComponent?.(
+					(host === "pi" ? ref.priorEditorComponent : undefined) as never,
+				);
 			} catch {
 				// Best effort; a stale editor only affects rendering.
 			}
 			editorInstalled = false;
 			editorInstalledForHost = false;
 		}
+		ref.priorEditorComponent = undefined;
 		ref.state = undefined;
 		ref.enhance = undefined;
 		ref.active = false;
@@ -2379,6 +2386,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
 		ref.active = false;
+		ref.priorEditorComponent = undefined;
 		notifiedFallback.value = false;
 		editorInstalled = false;
 
@@ -2438,7 +2446,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	//  - OMP: only terminal `agent_end` events (no `willContinue`) count —
 	//    continuations, automatic retries, and pending continuation turns
 	//    must never produce a suggestion. OMP has no `agent_settled`.
-	// There is exactly one computation gate: handleSettled().
+	// The settle subscription remains installed while a session is off;
+	// handleSettled() gates it to a no-op before any model call.
 	if (host === "omp") {
 		api.on("agent_end", (event, ctx) => {
 			if ((event as { willContinue?: boolean } | undefined)?.willContinue === true) {

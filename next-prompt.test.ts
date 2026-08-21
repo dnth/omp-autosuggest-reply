@@ -1950,8 +1950,9 @@ function makeFake(opts: {
 	setIdle: (v: boolean) => void;
 	editorComponentInstalled: boolean;
 	editorComponentCalls: number;
-	/** Count of restore calls: setEditorComponent(undefined) — the fallback path. */
+	/** Count of editor restore calls. */
 	editorComponentRestores: number;
+	editorComponentRestoredToPrior: boolean;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
 } {
@@ -1980,6 +1981,7 @@ function makeFake(opts: {
 	let editorComponentInstalled = false;
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
+	let editorComponentRestoredToPrior = false;
 	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
@@ -2085,6 +2087,7 @@ function makeFake(opts: {
 					// Restore path (fallbackToWidget): the previous owner is back.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
+					editorComponentRestoredToPrior = true;
 					return;
 				}
 				if (factory === undefined) {
@@ -2170,6 +2173,9 @@ function makeFake(opts: {
 		},
 		get editorComponentRestores() {
 			return editorComponentRestores;
+		},
+		get editorComponentRestoredToPrior() {
+			return editorComponentRestoredToPrior;
 		},
 		get lastEditorComponent() {
 			return lastEditorComponent;
@@ -4070,7 +4076,7 @@ describe("enabled master switch (opt-in, default off)", () => {
 		rmSync(cwd, { recursive: true, force: true });
 	});
 
-	test("EO6: disabled → no listener, no editor, no model call on settle", async () => {
+	test("EO6: disabled → no input listener, editor, or model call on settle", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -4156,6 +4162,22 @@ describe("live session toggle (/autosuggest-reply)", () => {
 		expect(fake.inputListeners).toHaveLength(0);
 		await fake.handlers.get("agent_settled")!({}, fake.ctx);
 		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("LT2b: `off` restores Pi's prior editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+		});
+		expect(fake.editorComponentInstalled).toBe(true);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.editorComponentInstalled).toBe(false);
+		expect(fake.editorComponentRestoredToPrior).toBe(true);
 	});
 
 	test("LT3: `status` reports ON/OFF for the session", async () => {
