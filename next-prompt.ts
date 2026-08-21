@@ -116,6 +116,14 @@ export type ThinkingLevel =
 	| "max";
 
 export interface NextPromptConfig {
+	/**
+	 * Master on/off switch for the whole extension. Defaults to false: the
+	 * extension is opt-in, so no suggestion/enhance listeners are installed and
+	 * no background model calls happen until this is true. Set it in the global
+	 * config to enable everywhere, or per-project in `<cwd>/.omp/next-prompt.json`
+	 * (project overrides global).
+	 */
+	enabled?: boolean;
 	model?: NextPromptModelConfig;
 	/** Reasoning/thinking level for the suggestion model ("minimal".."max"). */
 	thinking?: ThinkingLevel;
@@ -167,6 +175,8 @@ export interface EffectiveConfig extends NextPromptConfig {
 	projectTrusted: boolean;
 	/** True when invalid privacy-bearing fields caused compute to be disabled. */
 	computeDisabled: boolean;
+	/** Resolved master switch (never undefined); false means the extension is inert. */
+	enabled: boolean;
 }
 
 export interface DestinationIdentity {
@@ -212,6 +222,8 @@ export const SUGGESTION_BATCH_SIZE = 3;
 export const DEFAULT_ENHANCE_KEY = "ctrl+up";
 /** Whether the enhance-prompt keybinding is active when unset in config. */
 export const DEFAULT_ENHANCE_ENABLED = true;
+/** Whether the whole extension is active when unset in config (opt-in, default off). */
+export const DEFAULT_ENABLED = false;
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
 const ENHANCE_MAX_CHARS = 4000;
 
@@ -527,6 +539,11 @@ function parseConfig(text: string): {
 					console.warn(`next-prompt: invalid enhanceEnabled in config; ignoring`);
 				else cfg.enhanceEnabled = value;
 				break;
+			case "enabled":
+				if (typeof value !== "boolean")
+					console.warn(`next-prompt: invalid enabled in config; ignoring`);
+				else cfg.enabled = value;
+				break;
 			case "enhanceKey":
 				if (typeof value !== "string" || value.trim().length === 0)
 					console.warn(`next-prompt: invalid enhanceKey in config; ignoring`);
@@ -565,6 +582,7 @@ export function loadEffectiveConfig(
 	return {
 		...cfg,
 		allowCrossProvider: cfg.allowCrossProvider ?? DEFAULT_ALLOW_CROSS_PROVIDER,
+		enabled: cfg.enabled ?? DEFAULT_ENABLED,
 		projectTrusted,
 		computeDisabled,
 	};
@@ -2035,6 +2053,7 @@ export interface HostCtx extends HostContextLike {
 	};
 	ui: {
 		notify(message: string, type?: "info" | "warning" | "error"): void;
+		setStatus?: (key: string, text: string | undefined) => void;
 		setWidget(
 			key: string,
 			content: string[] | undefined,
@@ -2135,6 +2154,10 @@ interface NextPromptRef {
 	unsubInput: (() => void) | undefined;
 	enhance: EnhanceController | undefined;
 	enhanceInflight: AbortController | undefined;
+	/** Live per-session on/off, seeded from config `enabled` and flipped by `/autosuggest-reply on|off`. */
+	sessionEnabled: boolean;
+	/** Whether the session wiring (state/listener/editor) is currently installed. */
+	active: boolean;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -2145,6 +2168,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		unsubInput: undefined,
 		enhance: undefined,
 		enhanceInflight: undefined,
+		sessionEnabled: false,
+		active: false,
 	};
 	let effective: EffectiveConfig | undefined;
 	const notifiedFallback = { value: false };
@@ -2166,7 +2191,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			name: string,
 			options: {
 				description?: string;
-				handler: (args: unknown, ctx: HostCtx) => unknown;
+				getArgumentCompletions?: (
+					argumentPrefix: string,
+				) =>
+					| Array<{ value: string; label: string; description?: string }>
+					| null;
+				handler: (args: string, ctx: HostCtx) => unknown;
 			},
 		): void;
 	};
@@ -2183,55 +2213,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	const initializeSession = (_e: unknown, ctx: HostCtx): void => {
-		reset();
-		ref.unsubInput?.();
-		ref.unsubInput = undefined;
-		notifiedFallback.value = false;
-		editorInstalled = false;
-
-		// F-03: no interactive UI => no invisible suggestion work in headless
-		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
-		if (!isInteractiveContext(ctx)) {
-			ref.state = undefined;
-			effective = undefined;
-			return;
-		}
-
-		// OMP has no host-side extension-editor reset on session teardown (Pi
-		// clears extension UI on reset), so a GhostEditor we installed in a
-		// previous session would outlive it with a dead suggestion state.
-		// Restore the default editor before the new session's setup.
-		if (host === "omp" && editorInstalledForHost) {
-			try {
-				ctx.ui.setEditorComponent?.(undefined);
-			} catch {
-				// Best effort; a stale editor only affects rendering.
-			}
-			editorInstalledForHost = false;
-		}
-
-		// F-02: trust-gated, validated config with policy floors applied. OMP
-		// has no project-trust API, so projectTrustedForHost falls back to the
-		// loader default there.
-		effective = loadEffectiveConfig(ctx.cwd, {
-			projectTrusted: projectTrustedForHost(ctx),
-		});
-		if (effective.computeDisabled) {
-			ctx.ui.notify(
-				"next-prompt: invalid privacy-sensitive config; suggestions disabled",
-				"warning",
-			);
-		}
+	// Build the session's suggestion state, enhance controller, ghost editor
+	// (ghost/both render modes), and terminal-input listener. Callable from
+	// `session_start` and the live `/autosuggest-reply on` command; a no-op when
+	// already active.
+	function activate(ctx: HostCtx): void {
+		if (!effective || ref.active) return;
 
 		const publishWidget = (content: string[] | undefined) => {
 			ctx.ui.setWidget("next-prompt", content, { placement: "belowEditor" });
 		};
-		// F-05: install the ghost editor exactly once per session. If another
-		// extension already owns the editor, still try ghost mode on top of it
-		// (P1-1): only when the ghost actually fails to render do we restore the
-		// prior owner and switch to widget mode. The prior factory is captured
-		// before installation so the fallback can restore it.
 		const renderMode: RenderMode = effective.renderMode ?? "widget";
 
 		const state: SuggestionState = {
@@ -2300,24 +2291,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			(renderMode === "ghost" || renderMode === "both") &&
 			!effective.computeDisabled;
 		if (wantGhost && !editorInstalled) {
-			// OMP has no getEditorComponent(): `prior` stays undefined there,
-			// so a fallback restores the DEFAULT editor (setEditorComponent
-			// with no factory) rather than a captured prior owner.
+			// OMP has no getEditorComponent(): `prior` stays undefined there, so a
+			// fallback restores the DEFAULT editor rather than a captured owner.
 			const prior = ctx.ui.getEditorComponent?.();
-			// P1-1: permanent, guarded fallback. First call wins; once we are in
-			// widget mode there is nothing left to fall back to, so later calls
-			// (e.g. from a stale GhostEditor instance) are no-ops.
 			const fallbackToWidget = () => {
 				if (state.renderMode === "widget") return;
 				state.renderMode = "widget";
 				state.renderGhost = undefined;
 				editorInstalled = false;
 				editorInstalledForHost = false;
-				// Restore the previous owner (or the default editor) so the other
-				// extension's surface is not left half-replaced. `prior` is an
-				// opaque factory captured at the boundary and handed back
-				// verbatim; on OMP it is undefined and the default editor is
-				// restored.
 				try {
 					ctx.ui.setEditorComponent?.(prior as never);
 				} catch {
@@ -2352,14 +2334,98 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				}
 			} catch {
 				// Installation threw (e.g. the owner rejected replacement): keep
-				// widget mode, restore the prior owner, and let the suggestion
-				// surface via the widget.
+				// widget mode, restore the prior owner, and surface via the widget.
 				fallbackToWidget();
 			}
 		}
 
 		// Global terminal-input listener: accept/dismiss is editor-independent.
 		ref.unsubInput = ctx.ui.onTerminalInput(makeInputHandler(state, enhance));
+		ref.active = true;
+	}
+
+	// Tear down the current session's wiring — the live `/autosuggest-reply off`
+	// path, and any session disabled after having been active.
+	function deactivate(ctx: HostCtx): void {
+		reset();
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+		if (editorInstalled || editorInstalledForHost) {
+			try {
+				ctx.ui.setEditorComponent?.(undefined);
+			} catch {
+				// Best effort; a stale editor only affects rendering.
+			}
+			editorInstalled = false;
+			editorInstalledForHost = false;
+		}
+		ref.state = undefined;
+		ref.enhance = undefined;
+		ref.active = false;
+	}
+
+	// Status-line badge; best-effort (absent on hosts without setStatus).
+	function updateStatusBadge(ctx: HostCtx): void {
+		const on = ref.sessionEnabled && ref.active;
+		try {
+			ctx.ui.setStatus?.("next-prompt", on ? "↳ suggest" : undefined);
+		} catch {
+			// The status bar is decorative; ignore failures.
+		}
+	}
+
+	const initializeSession = (_e: unknown, ctx: HostCtx): void => {
+		reset();
+		ref.unsubInput?.();
+		ref.unsubInput = undefined;
+		ref.active = false;
+		notifiedFallback.value = false;
+		editorInstalled = false;
+
+		// F-03: no interactive UI => no invisible suggestion work in headless
+		// modes (Pi `mode !== "tui"`, OMP `hasUI !== true`).
+		if (!isInteractiveContext(ctx)) {
+			ref.state = undefined;
+			ref.enhance = undefined;
+			ref.sessionEnabled = false;
+			effective = undefined;
+			return;
+		}
+
+		// OMP has no host-side extension-editor reset on session teardown (Pi
+		// clears extension UI on reset), so a GhostEditor we installed in a
+		// previous session would outlive it with a dead suggestion state.
+		if (host === "omp" && editorInstalledForHost) {
+			try {
+				ctx.ui.setEditorComponent?.(undefined);
+			} catch {
+				// Best effort; a stale editor only affects rendering.
+			}
+			editorInstalledForHost = false;
+		}
+
+		// F-02: trust-gated, validated config with policy floors applied.
+		effective = loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		// Config `enabled` is the per-session DEFAULT; `/autosuggest-reply on|off`
+		// overrides it live for this session (the `/advisor` pattern). Sessions
+		// start inert unless the default is on.
+		ref.sessionEnabled = effective.enabled;
+		if (!ref.sessionEnabled) {
+			ref.state = undefined;
+			ref.enhance = undefined;
+			updateStatusBadge(ctx);
+			return;
+		}
+		if (effective.computeDisabled) {
+			ctx.ui.notify(
+				"next-prompt: invalid privacy-sensitive config; suggestions disabled",
+				"warning",
+			);
+		}
+		activate(ctx);
+		updateStatusBadge(ctx);
 	};
 	api.on("session_start", initializeSession);
 	// OMP's /new flow removes extension terminal listeners before emitting
@@ -2426,6 +2492,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				projectTrusted: projectTrustedForHost(ctx),
 			});
 			if (effective.computeDisabled) return;
+			if (!ref.sessionEnabled) return;
 			if (host === "pi" && !ctx.isIdle()) return;
 			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx);
@@ -2693,37 +2760,117 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	// Interactive config command: `/autosuggest-reply-config`. Walks the user through
-	// every configurable option EXCEPT systemPrompt (config-file only, F-15) with
-	// model-picker + dialogs, saves to the host agent dir (`~/.pi/agent` on Pi,
-	// `~/.omp/agent` on OMP), and reloads so changes take effect immediately.
-	api.registerCommand("autosuggest-reply-config", {
-		description: "Configure the omp-autosuggest-reply suggestion extension",
-		handler: async (_args, ctx) => {
+	// Live per-session control command: `/autosuggest-reply <on|off|status|configure>`
+	// (mirrors `/advisor`). `on`/`off` flip suggestions for the current session at
+	// any turn; `status` reports state; `configure` opens the settings wizard.
+	function enableForSession(ctx: HostCtx): void {
+		effective = loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		ref.sessionEnabled = true;
+		if (effective.computeDisabled) {
+			ctx.ui.notify(
+				"next-prompt: enabled, but the current config is privacy-invalid — suggestions stay disabled until you fix it",
+				"warning",
+			);
+		}
+		if (!ref.active) activate(ctx);
+		updateStatusBadge(ctx);
+		ctx.ui.notify("next-prompt: suggestions ON for this session", "info");
+	}
+
+	function disableForSession(ctx: HostCtx): void {
+		ref.sessionEnabled = false;
+		if (ref.active) deactivate(ctx);
+		updateStatusBadge(ctx);
+		ctx.ui.notify("next-prompt: suggestions OFF for this session", "info");
+	}
+
+	function showStatus(ctx: HostCtx): void {
+		const cfg = loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		const on = ref.sessionEnabled && ref.active;
+		const model = cfg.model
+			? `${cfg.model.provider}/${cfg.model.model}`
+			: "(active model)";
+		const enhanceOn = (cfg.enhanceEnabled ?? DEFAULT_ENHANCE_ENABLED)
+			? cfg.enhanceKey ?? DEFAULT_ENHANCE_KEY
+			: "off";
+		const lines = [
+			`next-prompt: this session ${on ? "ON" : "OFF"} (default ${cfg.enabled ? "on" : "off"}) — /autosuggest-reply ${on ? "off" : "on"} to toggle`,
+			`  model ${model} · render ${cfg.renderMode ?? "widget"} · thinking ${cfg.thinking ?? "model default"}`,
+			`  accept ${cfg.acceptKey ?? DEFAULT_ACCEPT_KEY} · enhance ${enhanceOn}`,
+		];
+		if (cfg.computeDisabled)
+			lines.push(
+				"  ⚠ privacy-invalid config: suggestions disabled until fixed",
+			);
+		ctx.ui.notify(lines.join("\n"), "info");
+	}
+
+	async function runConfigure(ctx: HostCtx): Promise<void> {
+		// Boundary: the command context is interactive, so the optional
+		// dialog/model-list fields are present on both hosts.
+		const next = await configureInteractively(
+			ctx as unknown as Parameters<typeof configureInteractively>[0],
+			loadConfig(ctx.cwd),
+		);
+		if (!next) return;
+		const saved = saveConfig(next);
+		if (!saved.saved) {
+			ctx.ui.notify(
+				"next-prompt: failed to save config; changes not applied",
+				"error",
+			);
+			return;
+		}
+		ctx.ui.notify("next-prompt: config saved — reloading", "info");
+		await ctx.reload?.();
+	}
+
+	const SUBCOMMANDS = [
+		{ value: "on", label: "on", description: "Enable suggestions for this session" },
+		{ value: "off", label: "off", description: "Disable suggestions for this session" },
+		{ value: "status", label: "status", description: "Show current status" },
+		{ value: "configure", label: "configure", description: "Open the settings wizard" },
+	];
+	api.registerCommand("autosuggest-reply", {
+		description:
+			"Control omp-autosuggest-reply (on | off | status | configure)",
+		getArgumentCompletions: (prefix: string) => {
+			const p = prefix.trim().toLowerCase();
+			return SUBCOMMANDS.filter((s) => s.value.startsWith(p));
+		},
+		handler: async (args, ctx) => {
 			if (!isInteractiveContext(ctx)) {
 				ctx.ui.notify(
-					"next-prompt: /autosuggest-reply-config requires interactive mode",
+					"next-prompt: /autosuggest-reply requires interactive mode",
 					"error",
 				);
 				return;
 			}
-			// Boundary: the command context is interactive, so the optional
-			// dialog/model-list fields are present on both hosts.
-			const next = await configureInteractively(
-				ctx as unknown as Parameters<typeof configureInteractively>[0],
-				loadConfig(ctx.cwd),
-			);
-			if (next) {
-				const saved = saveConfig(next);
-				if (!saved.saved) {
+			const sub = String(args ?? "").trim().toLowerCase().split(/\s+/)[0] ?? "";
+			switch (sub) {
+				case "on":
+					enableForSession(ctx);
+					return;
+				case "off":
+					disableForSession(ctx);
+					return;
+				case "config":
+				case "configure":
+					await runConfigure(ctx);
+					return;
+				case "":
+				case "status":
+					showStatus(ctx);
+					return;
+				default:
 					ctx.ui.notify(
-						"next-prompt: failed to save config; changes not applied",
+						`next-prompt: unknown subcommand "${sub}" — use on | off | status | configure`,
 						"error",
 					);
-					return;
-				}
-				ctx.ui.notify("next-prompt: config saved — reloading", "info");
-				await ctx.reload?.();
 			}
 		},
 	});
@@ -2751,6 +2898,14 @@ export async function configureInteractively(
 	current: NextPromptConfig,
 ): Promise<Partial<NextPromptConfig> | undefined> {
 	const update: Partial<NextPromptConfig> = {};
+
+	// Per-session DEFAULT (opt-in). The live `/autosuggest-reply on|off` command
+	// overrides this for a given session at any turn.
+	const enabledOn = await ctx.ui.confirm(
+		`next-prompt: start new sessions with suggestions ON by default? [${current.enabled ?? DEFAULT_ENABLED}]`,
+		"Yes = sessions begin with suggestions on. No = sessions begin off; turn on per session with /autosuggest-reply on.",
+	);
+	update.enabled = enabledOn;
 
 	// 1. Suggestion model (picker over all available models, or "use current").
 	const models = ctx.modelRegistry
