@@ -117,11 +117,10 @@ export type ThinkingLevel =
 
 export interface NextPromptConfig {
 	/**
-	 * Master on/off switch for the whole extension. Defaults to false: the
-	 * extension is opt-in, so no suggestion/enhance listeners are installed and
-	 * no background model calls happen until this is true. Set it in the global
-	 * config to enable everywhere, or per-project in `<cwd>/.omp/next-prompt.json`
-	 * (project overrides global).
+	 * Per-session starting state. Defaults to false: the extension is opt-in, so
+	 * no suggestion/enhance input listeners are installed and no background model
+	 * calls happen until the session is enabled here or with
+	 * `/autosuggest-reply on`. Project config overrides global.
 	 */
 	enabled?: boolean;
 	model?: NextPromptModelConfig;
@@ -152,7 +151,8 @@ export interface NextPromptConfig {
 	/**
 	 * Whether the enhance-prompt keybinding is active. When enabled, pressing
 	 * `enhanceKey` on a non-empty editor rewrites the typed text in place even
-	 * while the agent is active (revert with the same key or Escape). Default true.
+	 * while the agent is active (revert with the same key or Escape). Applies
+	 * while the extension is on for the session. Default true.
 	 */
 	enhanceEnabled?: boolean;
 	/**
@@ -175,7 +175,7 @@ export interface EffectiveConfig extends NextPromptConfig {
 	projectTrusted: boolean;
 	/** True when invalid privacy-bearing fields caused compute to be disabled. */
 	computeDisabled: boolean;
-	/** Resolved master switch (never undefined); false means the extension is inert. */
+	/** Resolved starting state for each session (never undefined). */
 	enabled: boolean;
 }
 
@@ -222,7 +222,7 @@ export const SUGGESTION_BATCH_SIZE = 3;
 export const DEFAULT_ENHANCE_KEY = "ctrl+up";
 /** Whether the enhance-prompt keybinding is active when unset in config. */
 export const DEFAULT_ENHANCE_ENABLED = true;
-/** Whether the whole extension is active when unset in config (opt-in, default off). */
+/** Starting state when `enabled` is unset (opt-in, default off). */
 export const DEFAULT_ENABLED = false;
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
 const ENHANCE_MAX_CHARS = 4000;

@@ -303,18 +303,21 @@ Mitigations:
 ## How it works
 
 1. On `session_start` (interactive mode only — Pi TUI `ctx.mode === "tui"`, OMP
-`ctx.hasUI === true`; headless/RPC/JSON sessions never compute), a global
-`ctx.ui.onTerminalInput` listener is registered to detect the accept key
-**editor-independently**. `ghost`/`both` install a render-only `GhostEditor` via
-`setEditorComponent` — never re-installed on settle. If another extension owns
+`ctx.hasUI === true`; headless/RPC/JSON sessions never compute), the configured
+`enabled` value seeds the session state. When it is on—or after
+`/autosuggest-reply on`—a global `ctx.ui.onTerminalInput` listener is registered
+to detect the accept key **editor-independently**. `ghost`/`both` install a
+render-only `GhostEditor` via `setEditorComponent` — never re-installed on
+settle. `/autosuggest-reply off` removes that listener and editor immediately.
+If another extension owns
 the editor on Pi, the ghost is **still attempted** (with a warning); only if the
 ghost install or its render pass actually fails does the extension restore the
 prior owner and fall back to widget mode. On OMP there is no editor-owner getter,
 so a failed ghost restores the **default** editor instead; OMP also has no
 host-side extension-editor teardown, so next-prompt resets its editor to default
 at the next `session_start`. The host clears extension listeners when the UI is
-reset; each fresh `session_start` (reload/new/resume/fork) re-registers exactly
-one listener and re-installs the editor once.
+reset; each fresh `session_start` (reload/new/resume/fork) resets the live toggle
+to the configured default, then installs at most one listener and editor.
 2. On completion:
    - **Pi:** `agent_settled` (its fully-settled contract) — if the editor is
      empty, the controller calls

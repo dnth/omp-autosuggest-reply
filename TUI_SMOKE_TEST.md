@@ -14,6 +14,30 @@ Record date, host + version, terminal emulators, configured render mode,
 provider/model, and any failures at the bottom. **Do not publish until every
 case passes.**
 
+The extension is off by default. Run the opt-in checks first; for every later
+interactive case, turn the current session on with `/autosuggest-reply on` (or
+deliberately set `"enabled": true`). Command usage is owned by the
+[README](./README.md#command-autosuggest-reply-onoffstatusconfigure).
+
+## Opt-in and live session control (both hosts)
+
+- [ ] With no `enabled` config, start a session and let a turn settle: no
+  suggestion model call, input listener, custom editor, or status badge appears.
+- [ ] `/autosuggest-reply status` reports this session OFF and the configured
+  default off; command argument completion offers `on`, `off`, `status`, and
+  `configure`.
+- [ ] `/autosuggest-reply on` immediately enables suggestions plus prompt
+  enhancement without a reload; `status` reports ON, and a status badge appears
+  when the host supports extension status entries.
+- [ ] `/autosuggest-reply off` immediately clears suggestion UI and the badge,
+  aborts in-flight suggestion/enhancement work, restores the prior/default
+  editor, and prevents later model calls; `status` reports OFF.
+- [ ] After overriding the live state, run `/reload` and `/new`: each new
+  session resets to the configured `enabled` default rather than retaining the
+  previous session's toggle.
+- [ ] `/autosuggest-reply configure` opens the existing settings walkthrough,
+  including the new-session default, saves successfully, and reloads the host.
+
 ## Pi smoke cases
 
 ### Render modes
@@ -105,7 +129,8 @@ Setup: install the fork with `omp plugin install github:dnth/omp-autosuggest-rep
 then run `omp plugin doctor` (expect zero plugin errors) before the interactive
 checks.
 
-- [ ] `omp plugin doctor` passes with the package installed and enabled.
+- [ ] `omp plugin doctor` passes with the package installed; then enable this
+  session with `/autosuggest-reply on` for the interactive cases below.
 - [ ] Interactive session reaches a below-editor widget suggestion after the
   **final** `agent_end` (editor empty, agent idle).
 - [ ] Tool-loop / automatic-retry continuation shows **no** intermediate
