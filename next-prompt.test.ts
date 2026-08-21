@@ -1876,6 +1876,7 @@ describe("real pi-tui editor integration", () => {
 // Identity-stable "previous editor owner" so restore calls (which pass the
 // captured prior factory back) are distinguishable from fresh installs.
 const PRIOR_EDITOR_FACTORY = (() => {}) as never;
+const NEWER_EDITOR_FACTORY = (() => ({})) as never;
 function makeFake(opts: {
 	branch?: BranchEntry[];
 	idle?: boolean;
@@ -1953,6 +1954,7 @@ function makeFake(opts: {
 	/** Count of editor restore calls. */
 	editorComponentRestores: number;
 	editorComponentRestoredToPrior: boolean;
+	editorComponentOwner: unknown;
 	/** Last editor instance produced by the installed factory (GhostEditor), if any. */
 	lastEditorComponent: unknown;
 } {
@@ -1982,6 +1984,9 @@ function makeFake(opts: {
 	let editorComponentCalls = 0;
 	let editorComponentRestores = 0;
 	let editorComponentRestoredToPrior = false;
+	let editorComponentOwner: unknown = opts.hasPriorEditor
+		? PRIOR_EDITOR_FACTORY
+		: undefined;
 	let lastEditorComponent: unknown;
 	// Real pi-tui Editor as the focused component (F-13: real editor input).
 	const editor = makeStubEditor();
@@ -2075,8 +2080,7 @@ function makeFake(opts: {
 			) => {
 				widgetContent = content;
 			},
-			getEditorComponent: () =>
-				opts.hasPriorEditor ? PRIOR_EDITOR_FACTORY : undefined,
+			getEditorComponent: () => editorComponentOwner,
 			setEditorComponent: (
 				factory:
 					| ((tui: unknown, theme: unknown, kb: unknown) => unknown)
@@ -2088,18 +2092,21 @@ function makeFake(opts: {
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
 					editorComponentRestoredToPrior = true;
+					editorComponentOwner = factory;
 					return;
 				}
 				if (factory === undefined) {
 					// Explicit reset to the default editor.
 					editorComponentInstalled = false;
 					editorComponentRestores += 1;
+					editorComponentOwner = undefined;
 					return;
 				}
 				if (opts.setEditorComponentThrows) {
 					throw new Error("editor owner rejected replacement");
 				}
 				editorComponentInstalled = true;
+				editorComponentOwner = factory;
 				// Call the factory so a real GhostEditor is constructed (lightweight ctor).
 				lastEditorComponent = factory(
 					{
@@ -2176,6 +2183,9 @@ function makeFake(opts: {
 		},
 		get editorComponentRestoredToPrior() {
 			return editorComponentRestoredToPrior;
+		},
+		get editorComponentOwner() {
+			return editorComponentOwner;
 		},
 		get lastEditorComponent() {
 			return lastEditorComponent;
@@ -3275,7 +3285,7 @@ describe("renderMode config", () => {
 		expect(fake.widgetContent).toBeUndefined();
 	});
 
-	test("T106c: ghost install throws → falls back to widget, restores prior owner (P1-1)", async () => {
+	test("T106c: ghost install throws → falls back to widget, keeps prior owner (P1-1)", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -3291,7 +3301,8 @@ describe("renderMode config", () => {
 			},
 		});
 		expect(fake.editorComponentInstalled).toBe(false); // install failed
-		expect(fake.editorComponentRestores).toBe(1); // prior owner restored
+		expect(fake.editorComponentRestores).toBe(0);
+		expect(fake.editorComponentOwner).toBe(PRIOR_EDITOR_FACTORY);
 		expect(
 			fake.calls.notifies.some(
 				([m, t]) => t === "warning" && m.includes("fell back to widget mode"),
@@ -3335,6 +3346,32 @@ describe("renderMode config", () => {
 				m.includes("fell back to widget mode"),
 			),
 		).toHaveLength(1);
+	});
+
+	test("T106e: ghost render fallback preserves a newer Pi editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+			requestRenderThrows: true,
+			completeResult: {
+				content: [{ type: "text", text: "fallback suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		(
+			fake.ctx as {
+				ui: { setEditorComponent: (factory: unknown) => void };
+			}
+		).ui.setEditorComponent(NEWER_EDITOR_FACTORY);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.editorComponentOwner).toBe(NEWER_EDITOR_FACTORY);
+		expect(fake.editorComponentRestoredToPrior).toBe(false);
+		expect(fake.widgetContent?.[0] ?? "").toContain("fallback suggestion");
 	});
 
 	test("T107: renderMode=ghost does NOT use setWidget (no below-editor line)", async () => {
@@ -4178,6 +4215,26 @@ describe("live session toggle (/autosuggest-reply)", () => {
 		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
 		expect(fake.editorComponentInstalled).toBe(false);
 		expect(fake.editorComponentRestoredToPrior).toBe(true);
+	});
+
+	test("LT2c: `off` preserves a newer Pi editor owner", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, renderMode: "ghost" }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			hasPriorEditor: true,
+		});
+		(
+			fake.ctx as {
+				ui: { setEditorComponent: (factory: unknown) => void };
+			}
+		).ui.setEditorComponent(NEWER_EDITOR_FACTORY);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.editorComponentOwner).toBe(NEWER_EDITOR_FACTORY);
+		expect(fake.editorComponentRestoredToPrior).toBe(false);
 	});
 
 	test("LT3: `status` reports ON/OFF for the session", async () => {

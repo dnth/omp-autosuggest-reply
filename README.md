@@ -52,11 +52,12 @@ in-flight model call aborted the instant you submit, start a turn, or the
 agent starts.
 
 > **Opt-in — off by default, per session.** The extension makes no background
-> model calls and installs no listeners until it is turned on. Toggle it live for
-> the current session at any turn with `/autosuggest-reply on` (and `off`) — the
-> same way `/advisor` works, with no file editing and no reload. The config
-> `enabled` field sets the per-session **default** (see Configure). Useful when you
-> run many sessions and only want suggestions in the ones you type in.
+> model calls and installs no terminal-input listener or custom editor until it
+> is turned on; the settle subscription remains registered but gated to a no-op.
+> Toggle it live for the current session at any turn with `/autosuggest-reply on`
+> (and `off`) — the same way `/advisor` works, with no file editing and no reload.
+> The config `enabled` field sets the per-session **default** (see Configure).
+> Useful when you run many sessions and only want suggestions in the ones you type in.
 > Headless/background sessions, including subagents, never compute regardless.
 
 ## Suggestion carousel

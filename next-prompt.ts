@@ -2159,6 +2159,7 @@ interface NextPromptRef {
 	/** Whether the session wiring (state/listener/editor) is currently installed. */
 	active: boolean;
 	priorEditorComponent: unknown;
+	installedEditorComponent: unknown;
 }
 
 export default function nextPromptExtension(pi: ExtensionAPI): void {
@@ -2172,6 +2173,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		sessionEnabled: false,
 		active: false,
 		priorEditorComponent: undefined,
+		installedEditorComponent: undefined,
 	};
 	let effective: EffectiveConfig | undefined;
 	const notifiedFallback = { value: false };
@@ -2213,6 +2215,25 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			resetEnhanceRuntime(ref.enhance.runtime);
 			ref.enhance.showHint(undefined);
 		}
+	}
+
+	function restoreEditor(ctx: HostCtx): void {
+		try {
+			if (host === "omp") {
+				ctx.ui.setEditorComponent?.(undefined);
+			} else if (
+				ref.installedEditorComponent !== undefined &&
+				ctx.ui.getEditorComponent?.() === ref.installedEditorComponent
+			) {
+				ctx.ui.setEditorComponent?.(ref.priorEditorComponent as never);
+			}
+		} catch {
+			// Best effort; a stale editor only affects rendering.
+		}
+		ref.priorEditorComponent = undefined;
+		ref.installedEditorComponent = undefined;
+		editorInstalled = false;
+		editorInstalledForHost = false;
 	}
 
 	// Build the session's suggestion state, enhance controller, ghost editor
@@ -2301,14 +2322,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				if (state.renderMode === "widget") return;
 				state.renderMode = "widget";
 				state.renderGhost = undefined;
-				editorInstalled = false;
-				editorInstalledForHost = false;
-				try {
-					ctx.ui.setEditorComponent?.(prior as never);
-				} catch {
-					// Restoration is best-effort; widget mode still works.
-				}
-				ref.priorEditorComponent = undefined;
+				restoreEditor(ctx);
 				ctx.ui.notify(
 					"next-prompt: ghost rendering failed (another extension owns the editor); fell back to widget mode",
 					"warning",
@@ -2316,20 +2330,28 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				renderSuggestion(state);
 			};
 			state.fallbackToWidget = fallbackToWidget;
+			const ghostFactory = (
+				tui: TUI,
+				theme: EditorTheme,
+				kb: KeybindingsManager,
+			) => {
+				const ed = new GhostEditor(tui, theme, kb, state, enhance);
+				state.renderGhost = () => {
+					try {
+						ed.requestGhostRender();
+					} catch {
+						fallbackToWidget();
+					}
+				};
+				return ed;
+			};
+			ref.installedEditorComponent = ghostFactory;
 			try {
-				ctx.ui.setEditorComponent?.((tui, theme, kb) => {
-					const ed = new GhostEditor(tui, theme, kb, state, enhance);
-					state.renderGhost = () => {
-						try {
-							ed.requestGhostRender();
-						} catch {
-							fallbackToWidget();
-						}
-					};
-					return ed;
-				});
-				editorInstalled = true;
-				editorInstalledForHost = true;
+				ctx.ui.setEditorComponent?.(ghostFactory);
+				if (state.renderMode !== "widget") {
+					editorInstalled = true;
+					editorInstalledForHost = true;
+				}
 				if (prior) {
 					ctx.ui.notify(
 						"next-prompt: another extension owns the editor; using ghost mode, falling back to widget only if ghost rendering fails",
@@ -2338,7 +2360,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				}
 			} catch {
 				// Installation threw (e.g. the owner rejected replacement): keep
-				// widget mode, restore the prior owner, and surface via the widget.
+				// widget mode and surface via the widget.
 				fallbackToWidget();
 			}
 		}
@@ -2355,17 +2377,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput?.();
 		ref.unsubInput = undefined;
 		if (editorInstalled || editorInstalledForHost) {
-			try {
-				ctx.ui.setEditorComponent?.(
-					(host === "pi" ? ref.priorEditorComponent : undefined) as never,
-				);
-			} catch {
-				// Best effort; a stale editor only affects rendering.
-			}
-			editorInstalled = false;
-			editorInstalledForHost = false;
+			restoreEditor(ctx);
 		}
 		ref.priorEditorComponent = undefined;
+		ref.installedEditorComponent = undefined;
 		ref.state = undefined;
 		ref.enhance = undefined;
 		ref.active = false;
@@ -2387,6 +2402,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.unsubInput = undefined;
 		ref.active = false;
 		ref.priorEditorComponent = undefined;
+		ref.installedEditorComponent = undefined;
 		notifiedFallback.value = false;
 		editorInstalled = false;
 
