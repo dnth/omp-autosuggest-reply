@@ -62,6 +62,12 @@ agent starts.
 
 ## Suggestion carousel
 
+> **Manual mode (saves quota).** Set `"autoSuggest": false` and nothing
+> computes on settle — press **Ctrl+Down** (configurable `suggestKey`) on an
+> empty editor or run `/autosuggest-reply suggest` to compute one batch on
+> demand. While it runs, the widget shows `↳ suggesting…` (mirroring the
+> enhance `↳ enhancing prompt…` hint). No background model calls otherwise.
+
 Each settled turn is one model call. The built-in prompt asks the model whether
 the latest agent message requires a user reply. It instructs the model to return
 `NONE` for completed work, answers, explanations, status updates, and optional
@@ -177,20 +183,23 @@ Restart `pi` (or start a new session) after installing.
 
 ## Configure
 
-### Command: `/autosuggest-reply <on|off|status|configure>`
+### Command: `/autosuggest-reply <on|off|suggest|status|configure>`
 
 Mirrors `/advisor`. Control the extension per session, at any turn:
 
 - **`on`** / **`off`** — enable or disable suggestions (and enhance) for the
   current session immediately. This is the primary control; it overrides the
   configured default without editing files or reloading.
+- **`suggest`** — compute one suggestion batch now, on demand. Works in both
+  auto and manual (`autoSuggest: false`) modes; needs an empty editor while
+  idle.
 - **`status`** — show whether this session is on/off, the configured default, and
-  the resolved model, render mode, thinking level, accept key, and enhance key.
+  the resolved model, render mode, trigger mode, thinking level, accept key, and enhance key.
 - **`configure`** — a guided walkthrough of **every option except `systemPrompt`
   and `enhanceSystemPrompt`** (config-file only): the per-session default, a model
   picker, render mode, thinking level, accept key, re-arm delay,
-  transcript/recent-turn/suggestion caps, cross-provider disclosure, and the
-  enhance-prompt toggle + key. Saved to the host agent dir
+  transcript/recent-turn/suggestion caps, cross-provider disclosure, the
+  enhance-prompt toggle + key, and the auto/manual trigger + suggest key. Saved to the host agent dir
   (`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP);
   the host reloads so changes take effect immediately.
 
@@ -211,6 +220,8 @@ comes from the host's `CONFIG_DIR_NAME`:
   "model": { "provider": "ollama", "model": "deepseek-v4-flash:0731-cloud" },
   "thinking": "low",
   "acceptKey": "enter",
+  "autoSuggest": false,
+  "suggestKey": "ctrl+down",
   "renderMode": "both",
   "rearmDelayMs": 2000,
   "maxTranscriptChars": 12000,
@@ -228,6 +239,8 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `model` | current model (`ctx.model`) | `{ provider, model }`. If the configured model isn't found, pi notifies once (`warning`) and falls back to the current model. |
 | `thinking` | unset | Reasoning level for the suggestion model: `"minimal"`/`"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"`. Set `"low"` for faster suggestions. Passed as `reasoning` to the model call. |
 | `acceptKey` | `"enter"` | Any pi-tui `KeyId` (e.g. `"enter"`, `"alt+/"`, `"ctrl+space"`). Intercepted **before** the base editor. Accept only fires when a suggestion is showing and the editor is empty, so the first Enter fills the box and a second Enter submits. |
+| `autoSuggest` | `true` | Settled turns auto-compute suggestions. Set `false` for manual-only mode: no model call on settle, only via `suggestKey` or `/autosuggest-reply suggest`. Zero background quota otherwise. |
+| `suggestKey` | `"ctrl+down"` | Any pi-tui `KeyId` that computes one batch on demand. Fires only while idle with an empty editor. `"enter"`/`"tab"` are rejected (submit/autocomplete conflicts). Prefer a non-shift key (see `enhanceKey` note). |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply configure`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |

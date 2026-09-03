@@ -33,6 +33,8 @@ import {
 	buildTranscript,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
+	DEFAULT_AUTO_SUGGEST,
+	DEFAULT_SUGGEST_KEY,
 	DEFAULT_ENHANCE_KEY,
 	destinationOf,
 	detectHost,
@@ -875,6 +877,7 @@ describe("arrow keys + suggestionKey + hint", () => {
 			alternatives: ["one"],
 			altIndex: 0,
 			acceptKey: "enter",
+			suggestKey: "ctrl+down",
 			renderMode: "widget" as const,
 			rearmDelayMs: 2000,
 			rearmTimer: undefined,
@@ -1607,6 +1610,7 @@ describe("real pi-tui editor integration", () => {
 			alternatives: [],
 			altIndex: 0,
 			acceptKey: "enter",
+			suggestKey: "ctrl+down",
 			renderMode: "ghost",
 			rearmDelayMs: 2000,
 			rearmTimer: undefined,
@@ -4265,7 +4269,7 @@ describe("live session toggle (/autosuggest-reply)", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		const c = fake.commands.get("autosuggest-reply")!;
 		expect((c.getArgumentCompletions!("") ?? []).map((i) => i.value).sort()).toEqual(
-			["configure", "off", "on", "status"],
+			["configure", "off", "on", "status", "suggest"],
 		);
 		expect(
 			(c.getArgumentCompletions!("o") ?? []).map((i) => i.value).sort(),
@@ -5355,5 +5359,239 @@ describe("enhance key encoding under enhanced keyboard protocols", () => {
 	test("DEFAULT_ENHANCE_KEY is a non-shift key", () => {
 		expect(DEFAULT_ENHANCE_KEY).toBe("ctrl+up");
 		expect(DEFAULT_ENHANCE_KEY.includes("shift")).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Manual trigger (suggestKey + autoSuggest:false) — quota-saving mode
+// ---------------------------------------------------------------------------
+
+describe("manual trigger (suggestKey + autoSuggest)", () => {
+	const CTRL_DOWN = "\x1b[1;5B"; // ctrl+down, xterm modified-arrow form
+
+	test("defaults: auto on, suggest key ctrl+down", () => {
+		expect(DEFAULT_AUTO_SUGGEST).toBe(true);
+		expect(DEFAULT_SUGGEST_KEY).toBe("ctrl+down");
+		expect(DEFAULT_SUGGEST_KEY.includes("shift")).toBe(false);
+	});
+
+	test("ctrl+down matches the suggest key; plain down does not", () => {
+		expect(
+			matchesKey(CTRL_DOWN, "ctrl+down") ||
+				matchesAcceptKeyRaw(CTRL_DOWN, "ctrl+down"),
+		).toBe(true);
+		expect(matchesKey("\x1b[B", "ctrl+down")).toBe(false);
+	});
+
+	test("config parsing: autoSuggest + suggestKey round-trip", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ autoSuggest: false, suggestKey: "alt+/" }),
+		);
+		const cfg = loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-")));
+		expect(cfg.autoSuggest).toBe(false);
+		expect(cfg.suggestKey).toBe("alt+/");
+	});
+
+	test("config parsing: invalid autoSuggest/suggestKey ignored", () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ autoSuggest: "yes", suggestKey: "enter" }),
+		);
+		const cfg = loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-")));
+		expect(cfg.autoSuggest).toBeUndefined();
+		expect(cfg.suggestKey).toBeUndefined();
+	});
+
+	test("autoSuggest:false → agent_settled spends no quota", async () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("needs input?")] });
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("autoSuggest:false → ctrl+down computes one batch", async () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("needs input?")] });
+		fake.deliverInput(CTRL_DOWN);
+		// The model request issues synchronously inside the key dispatch;
+		// only rendering continues async. Assert the quota spend itself.
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("autoSuggest:false → /autosuggest-reply suggest computes", async () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("needs input?")] });
+		await fake.commands.get("autosuggest-reply")!.handler("suggest", fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.widgetContent?.join("\n")).toContain("suggestion");
+	});
+
+	test("suggest key on a non-empty editor → no compute", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		fake.setEditorText("already typing");
+		fake.deliverInput(CTRL_DOWN);
+		expect(fake.calls.complete).toHaveLength(0);
+	});
+
+	test("manual suggest while busy notifies instead of spending quota", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		fake.setIdle(false);
+		await fake.commands.get("autosuggest-reply")!.handler("suggest", fake.ctx);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.calls.notifies.at(-1)![0]).toContain("busy");
+	});
+
+	test("ctrl+down shows a progress hint while in flight, replaced by the suggestion", async () => {
+		let resolveComplete!: (v: {
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}) => void;
+		const gate = new Promise<{
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}>((r) => {
+			resolveComplete = r;
+		});
+		const { fake } = await setup({
+			branch: [assistantEntry("needs input?")],
+			completeResult: gate as unknown as {
+				content: Array<{ type: "text"; text: string }>;
+				stopReason: string;
+			},
+		});
+		fake.deliverInput(CTRL_DOWN);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("suggesting");
+		resolveComplete({
+			content: [{ type: "text", text: "ship the release notes" }],
+			stopReason: "stop",
+		});
+		await sleep(30);
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("ship the release notes");
+	});
+
+	test("typing while a manual suggest is pending clears the hint; stale result never renders", async () => {
+		let resolveComplete!: (v: {
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}) => void;
+		const gate = new Promise<{
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}>((r) => {
+			resolveComplete = r;
+		});
+		const { fake } = await setup({
+			branch: [assistantEntry("needs input?")],
+			completeResult: gate as unknown as {
+				content: Array<{ type: "text"; text: string }>;
+				stopReason: string;
+			},
+		});
+		fake.deliverInput(CTRL_DOWN);
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("suggesting");
+		fake.deliverInput("x");
+		expect(fake.widgetContent).toBeUndefined();
+		resolveComplete({
+			content: [{ type: "text", text: "stale suggestion" }],
+			stopReason: "stop",
+		});
+		await sleep(30);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.some(
+				([m, t]) => t === "error" && m.includes("failed"),
+			),
+		).toBe(false);
+	});
+
+	test("failed manual suggest clears the hint with one error notify", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("needs input?")],
+			completeError: new Error("boom"),
+		});
+		fake.deliverInput(CTRL_DOWN);
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("suggesting");
+		await sleep(30);
+		expect(fake.widgetContent).toBeUndefined();
+		expect(
+			fake.calls.notifies.filter(
+				([m, t]) => t === "error" && m.includes("failed"),
+			),
+		).toHaveLength(1);
+	});
+
+	test("manual suggest with NONE reply clears the hint", async () => {
+		const { fake } = await setup({
+			branch: [assistantEntry("needs input?")],
+			completeResult: {
+				content: [{ type: "text", text: "NONE" }],
+				stopReason: "stop",
+			},
+		});
+		fake.deliverInput(CTRL_DOWN);
+		expect(fake.calls.complete).toHaveLength(1);
+		await sleep(30);
+		expect(fake.widgetContent).toBeUndefined();
+	});
+
+	test("OMP suggest command shows a progress hint while in flight", async () => {
+		let resolveComplete!: (v: {
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}) => void;
+		const gate = new Promise<{
+			content: Array<{ type: "text"; text: string }>;
+			stopReason: string;
+		}>((r) => {
+			resolveComplete = r;
+		});
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("needs input?")],
+			completeSimpleResult: gate as unknown as {
+				content: Array<{ type: "text"; text: string }>;
+				stopReason: string;
+			},
+		});
+		const p = fake.commands.get("autosuggest-reply")!.handler(
+			"suggest",
+			fake.ctx,
+		) as unknown as Promise<void>;
+		// OMP awaits the completion-module loader before the request issues.
+		await sleep(10);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("suggesting");
+		resolveComplete({
+			content: [{ type: "text", text: "ship the release notes" }],
+			stopReason: "stop",
+		});
+		await p;
+		expect(fake.widgetContent?.join("\n") ?? "").toContain("ship the release notes");
+	});
+
+	test("status reports manual trigger mode", async () => {
+		writeFile(
+			tmpHome,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, autoSuggest: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.commands.get("autosuggest-reply")!.handler("status", fake.ctx);
+		expect(fake.calls.notifies.at(-1)![0]).toContain("manual");
 	});
 });

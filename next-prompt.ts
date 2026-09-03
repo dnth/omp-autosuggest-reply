@@ -3,7 +3,10 @@
  *
  * Interactive-only (see F-03): when the input editor is empty after an agent
  * turn has fully settled, computes up to three distinct next instructions
- * the user might type and shows the first. Three render modes (config
+ * the user might type and shows the first (config `autoSuggest`, default
+ * true). With `autoSuggest: false` nothing computes on settle — press the
+ * suggest key (default `ctrl+down`) or run `/autosuggest-reply suggest` to
+ * compute one batch on demand. Three render modes (config
  * `renderMode`, default "widget"):
  *   - "widget": a colored below-editor line `↳ next: <suggestion>  (Enter · 1/3 ←→)`.
  *   - "ghost":  inline greyed ghost text in the input box after the caret.
@@ -160,6 +163,20 @@ export interface NextPromptConfig {
 	 * to "ctrl+up". Must differ from `acceptKey`; "enter"/"tab" are rejected.
 	 */
 	enhanceKey?: string;
+	/**
+	 * Whether a settled turn automatically computes suggestions. Defaults to
+	 * true (current behavior). Set to false for manual-only mode: no model
+	 * call happens on settle — suggestions compute only when you press
+	 * `suggestKey` or run `/autosuggest-reply suggest`. Applies while the
+	 * extension is on for the session.
+	 */
+	autoSuggest?: boolean;
+	/**
+	 * Key id (any pi-tui KeyId) that manually triggers suggestion compute on
+	 * an empty editor. Defaults to "ctrl+down". Fires only while idle with an
+	 * empty editor; "enter"/"tab" are rejected (submit/autocomplete conflicts).
+	 */
+	suggestKey?: string;
 	/** System-prompt override for the enhance model (config-file only). */
 	enhanceSystemPrompt?: string;
 }
@@ -224,6 +241,10 @@ export const DEFAULT_ENHANCE_KEY = "ctrl+up";
 export const DEFAULT_ENHANCE_ENABLED = true;
 /** Starting state when `enabled` is unset (opt-in, default off). */
 export const DEFAULT_ENABLED = false;
+/** Whether settled turns auto-compute suggestions when unset in config. */
+export const DEFAULT_AUTO_SUGGEST = true;
+/** Default keybinding that manually triggers suggestion compute. */
+export const DEFAULT_SUGGEST_KEY = "ctrl+down";
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
 const ENHANCE_MAX_CHARS = 4000;
 
@@ -556,6 +577,24 @@ function parseConfig(text: string): {
 						`next-prompt: enhanceKey "enter" conflicts with submit/accept; ignoring`,
 					);
 				else cfg.enhanceKey = value;
+				break;
+			case "autoSuggest":
+				if (typeof value !== "boolean")
+					console.warn(`next-prompt: invalid autoSuggest in config; ignoring`);
+				else cfg.autoSuggest = value;
+				break;
+			case "suggestKey":
+				if (typeof value !== "string" || value.trim().length === 0)
+					console.warn(`next-prompt: invalid suggestKey in config; ignoring`);
+				else if (value.trim().toLowerCase() === "tab")
+					console.warn(
+						`next-prompt: suggestKey "tab" conflicts with autocomplete; ignoring`,
+					);
+				else if (value.trim().toLowerCase() === "enter")
+					console.warn(
+						`next-prompt: suggestKey "enter" conflicts with submit/accept; ignoring`,
+					);
+				else cfg.suggestKey = value;
 				break;
 			case "enhanceSystemPrompt":
 				if (typeof value !== "string")
@@ -1402,6 +1441,20 @@ export interface SuggestionState {
 	/** Index into `alternatives` currently shown. */
 	altIndex: number;
 	acceptKey: string;
+	/** Key id that manually triggers suggestion compute on an empty editor. */
+	suggestKey: string;
+	/**
+	 * Controller-owned manual compute entry point. Set by activate(); the
+	 * input handler (and GhostEditor fallback) invokes it when the suggest
+	 * key fires. Undefined in unit-constructed states that never activated.
+	 */
+	requestSuggest?: () => void;
+	/**
+	 * True while a manual (suggest-key / suggest-command) request is in flight
+	 * with its progress hint on the widget. Cleared when the batch renders,
+	 * fails, or is aborted. Auto settle computes never set this (background).
+	 */
+	suggesting?: boolean;
 	renderMode: RenderMode;
 	rearmDelayMs: number;
 	rearmTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1459,6 +1512,25 @@ function renderWidget(state: SuggestionState): void {
 	} else {
 		state.publishWidget(undefined);
 	}
+}
+
+/** Below-editor progress line while a manual suggest request is in flight. */
+const SUGGESTING_LINE = `${DIM}↳ suggesting…${RESET}`;
+
+/** Publish the manual-suggest progress hint (mirrors the enhance "enhancing" hint). */
+function showSuggesting(state: SuggestionState): void {
+	state.suggesting = true;
+	state.publishWidget([SUGGESTING_LINE]);
+}
+
+/**
+ * Drop a stale manual-suggest progress hint. Clears the widget only when no
+ * suggestion took its place; idempotent.
+ */
+function clearSuggesting(state: SuggestionState): void {
+	if (!state.suggesting) return;
+	state.suggesting = false;
+	if (!state.suggestion) state.publishWidget(undefined);
 }
 
 function renderSuggestion(state: SuggestionState): void {
@@ -1552,6 +1624,7 @@ function cycleNext(state: SuggestionState): void {
 function dismissSuggestion(state: SuggestionState): void {
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
+	clearSuggesting(state);
 	if (state.suggestion) {
 		state.suggestion = "";
 		renderSuggestion(state);
@@ -1567,6 +1640,7 @@ function clearSuggestion(state: SuggestionState | undefined): void {
 	if (!state) return;
 	clearRearmTimer(state);
 	clearRearmCheckTimer(state);
+	clearSuggesting(state);
 	state.inputGeneration += 1;
 	state.alternatives = [];
 	state.altIndex = 0;
@@ -1820,6 +1894,22 @@ function makeInputHandler(
 		) {
 			if (isLeftArrow(data)) cyclePrevious(state);
 			else cycleNext(state);
+			return { consume: true };
+		}
+		// Manual trigger: suggest key on an empty idle editor computes a fresh
+		// batch on demand (manual-only mode when autoSuggest is false). After
+		// accept/carousel so a shared key still accepts first while a
+		// suggestion is showing; a distinct key recomputes over it.
+		if (
+			(matchesKey(data, state.suggestKey as KeyId) ||
+				matchesAcceptKeyRaw(data, state.suggestKey)) &&
+			state.isIdleGetter() &&
+			editorTextBefore.length === 0
+		) {
+			// Mark first: GhostEditor's fallback must see this dispatch as
+			// handled or it would fire the same key a second time.
+			markGlobalInput();
+			state.requestSuggest?.();
 			return { consume: true };
 		}
 
@@ -2254,6 +2344,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			alternatives: [],
 			altIndex: 0,
 			acceptKey: effective.acceptKey ?? DEFAULT_ACCEPT_KEY,
+			suggestKey: effective.suggestKey ?? DEFAULT_SUGGEST_KEY,
+			requestSuggest: () => {
+				void manualSuggest(ctx);
+			},
 			renderMode,
 			rearmDelayMs: effective.rearmDelayMs ?? DEFAULT_REARM_MS,
 			rearmTimer: undefined,
@@ -2518,6 +2612,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			});
 			if (effective.computeDisabled) return;
 			if (!ref.sessionEnabled) return;
+			// Manual-only mode: settled turns never compute on their own; the
+			// user triggers via suggestKey or `/autosuggest-reply suggest`.
+			if ((effective.autoSuggest ?? DEFAULT_AUTO_SUGGEST) === false) return;
 			if (host === "pi" && !ctx.isIdle()) return;
 			if (ctx.ui.getEditorText().length > 0) return;
 			await maybeCompute(ctx);
@@ -2547,7 +2644,42 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	});
 
 
-	async function maybeCompute(ctx: HostCtx): Promise<void> {
+	/**
+	 * Explicit user-triggered compute (suggestKey or `/autosuggest-reply
+	 * suggest`). Same guards as the settle path, minus the last-message settle
+	 * gate (kept inside maybeCompute via `{ manual: true }`): the user asked,
+	 * so any transcript context goes. Idle + empty-editor still gate so a
+	 * mid-turn or pre-filled invocation never spends quota blindly. Notifies
+	 * instead of silently skipping so a dead-feeling keypress is diagnosable.
+	 */
+	async function manualSuggest(ctx: HostCtx): Promise<void> {
+		try {
+			if (!isInteractiveContext(ctx)) return;
+			if (!ref.state || !effective) return;
+			// Re-read config so a mid-session edit takes effect immediately.
+			effective = loadEffectiveConfig(ctx.cwd, {
+				projectTrusted: projectTrustedForHost(ctx),
+			});
+			if (effective.computeDisabled) return;
+			if (!ref.sessionEnabled) {
+				ctx.ui.notify(
+					"next-prompt: suggestions OFF for this session — /autosuggest-reply on to enable",
+					"info",
+				);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				ctx.ui.notify("next-prompt: agent busy — try again when idle", "info");
+				return;
+			}
+			if (ctx.ui.getEditorText().length > 0) return;
+			await maybeCompute(ctx, { manual: true });
+		} catch (err) {
+			console.warn("next-prompt: manual suggest failed", err);
+		}
+	}
+
+	async function maybeCompute(ctx: HostCtx, opts?: { manual?: boolean }): Promise<void> {
 		if (!ref.state || !effective) return;
 		const state = ref.state;
 		ref.inflight?.abort();
@@ -2555,18 +2687,23 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.inflight = ac;
 		const generation = state.inputGeneration;
 
-		if (
-			shouldTrigger(
-				ctx.sessionManager.getBranch(),
-				// Pi: agent_settled is the fully-idle contract. OMP: the
-				// terminal agent_end fires before the session unwinds, so the
-				// host event (already filtered for willContinue) is the settle
-				// signal — the idle check would always fail there.
-				host === "omp" ? true : ctx.isIdle(),
-				ctx.ui.getEditorText(),
-			) !== "compute"
-		) {
-			return;
+		// Manual triggers are explicit user requests: skip the last-message
+		// settle gate (assistant-stop) but keep the idle + empty-editor gates
+		// so a mid-turn or pre-filled invocation never spends quota blindly.
+		if (!opts?.manual) {
+			if (
+				shouldTrigger(
+					ctx.sessionManager.getBranch(),
+					// Pi: agent_settled is the fully-idle contract. OMP: the
+					// terminal agent_end fires before the session unwinds, so the
+					// host event (already filtered for willContinue) is the settle
+					// signal — the idle check would always fail there.
+					host === "omp" ? true : ctx.isIdle(),
+					ctx.ui.getEditorText(),
+				) !== "compute"
+			) {
+				return;
+			}
 		}
 		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
 		if (!resolved.model) return;
@@ -2585,6 +2722,20 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
 			messages,
 		} as unknown as Context;
+		const isManual = opts?.manual === true;
+		// Drop a stale manual progress hint only while this request still owns
+		// the widget (current generation + current flight): a superseded or
+		// already-dismissed request must never clobber its successor.
+		const clearManualHint = () => {
+			if (
+				isManual &&
+				ref.inflight === ac &&
+				generation === state.inputGeneration
+			) {
+				clearSuggesting(state);
+			}
+		};
+		if (isManual) showSuggesting(state);
 
 		let resp: AssistantMessage | undefined;
 		const SUGGESTION_TIMEOUT_MS = 20_000;
@@ -2604,17 +2755,26 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			} else if (timedOut && generation === state.inputGeneration) {
 				ctx.ui.notify("next-prompt: suggestion timed out", "warning");
 			}
+			clearManualHint();
 			return;
 		} finally {
 			clearTimeout(timeout);
 		}
-		if (ac.signal.aborted || generation !== state.inputGeneration) return;
-		if (resp === undefined) return; // transport unavailable; diagnostic already shown
+		if (ac.signal.aborted || generation !== state.inputGeneration) {
+			clearManualHint();
+			return;
+		}
+		if (resp === undefined) {
+			// transport unavailable; diagnostic already shown
+			clearManualHint();
+			return;
+		}
 
 		if (resp.stopReason !== "stop") {
 			if (resp.stopReason === "error") {
 				ctx.ui.notify("next-prompt: suggestion model error", "warning");
 			}
+			clearManualHint();
 			return;
 		}
 
@@ -2623,8 +2783,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const batch = parseSuggestionBatch(raw, effective, transcript);
+		if (isManual) state.suggesting = false;
 		if (batch.length > 0 && ref.state === state) {
 			showSuggestionBatch(state, batch, generation, host === "pi");
+		}
+		if (isManual && !state.suggestion && ref.state === state) {
+			// Empty batch (e.g. NONE) or a stale render gate held: drop the hint.
+			// A bumped generation means newer input already owns the widget.
+			if (generation === state.inputGeneration) state.publishWidget(undefined);
 		}
 		if (ref.inflight === ac) ref.inflight = undefined;
 	}
@@ -2785,9 +2951,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	// Live per-session control command: `/autosuggest-reply <on|off|status|configure>`
+	// Live per-session control command: `/autosuggest-reply <on|off|suggest|status|configure>`
 	// (mirrors `/advisor`). `on`/`off` flip suggestions for the current session at
-	// any turn; `status` reports state; `configure` opens the settings wizard.
+	// any turn; `suggest` computes one batch on demand; `status` reports state;
+	// `configure` opens the settings wizard.
 	function enableForSession(ctx: HostCtx): void {
 		effective = loadEffectiveConfig(ctx.cwd, {
 			projectTrusted: projectTrustedForHost(ctx),
@@ -2822,10 +2989,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const enhanceOn = (cfg.enhanceEnabled ?? DEFAULT_ENHANCE_ENABLED)
 			? cfg.enhanceKey ?? DEFAULT_ENHANCE_KEY
 			: "off";
+		const auto =
+			(cfg.autoSuggest ?? DEFAULT_AUTO_SUGGEST)
+				? "auto"
+				: `manual (${cfg.suggestKey ?? DEFAULT_SUGGEST_KEY})`;
 		const lines = [
 			`next-prompt: this session ${on ? "ON" : "OFF"} (default ${cfg.enabled ? "on" : "off"}) — /autosuggest-reply ${on ? "off" : "on"} to toggle`,
 			`  model ${model} · render ${cfg.renderMode ?? "widget"} · thinking ${cfg.thinking ?? "model default"}`,
-			`  accept ${cfg.acceptKey ?? DEFAULT_ACCEPT_KEY} · enhance ${enhanceOn}`,
+			`  trigger ${auto} · accept ${cfg.acceptKey ?? DEFAULT_ACCEPT_KEY} · enhance ${enhanceOn}`,
 		];
 		if (cfg.computeDisabled)
 			lines.push(
@@ -2857,12 +3028,13 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const SUBCOMMANDS = [
 		{ value: "on", label: "on", description: "Enable suggestions for this session" },
 		{ value: "off", label: "off", description: "Disable suggestions for this session" },
+		{ value: "suggest", label: "suggest", description: "Compute suggestions now (manual trigger)" },
 		{ value: "status", label: "status", description: "Show current status" },
 		{ value: "configure", label: "configure", description: "Open the settings wizard" },
 	];
 	api.registerCommand("autosuggest-reply", {
 		description:
-			"Control omp-autosuggest-reply (on | off | status | configure)",
+			"Control omp-autosuggest-reply (on | off | suggest | status | configure)",
 		getArgumentCompletions: (prefix: string) => {
 			const p = prefix.trim().toLowerCase();
 			return SUBCOMMANDS.filter((s) => s.value.startsWith(p));
@@ -2883,6 +3055,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				case "off":
 					disableForSession(ctx);
 					return;
+				case "suggest":
+				case "trigger":
+					await manualSuggest(ctx);
+					return;
 				case "config":
 				case "configure":
 					await runConfigure(ctx);
@@ -2893,7 +3069,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 					return;
 				default:
 					ctx.ui.notify(
-						`next-prompt: unknown subcommand "${sub}" — use on | off | status | configure`,
+						`next-prompt: unknown subcommand "${sub}" — use on | off | suggest | status | configure`,
 						"error",
 					);
 			}
@@ -3051,6 +3227,21 @@ export async function configureInteractively(
 		current.enhanceKey ?? DEFAULT_ENHANCE_KEY,
 	);
 	if (enhanceKeyPick) update.enhanceKey = enhanceKeyPick.trim();
+
+	// 12. autoSuggest (confirm) — manual-only mode saves quota: no model call
+	// on settle, suggestions compute only via suggestKey or `/autosuggest-reply suggest`.
+	const autoOn = await ctx.ui.confirm(
+		`next-prompt: auto-suggest after every settled turn? [${current.autoSuggest ?? DEFAULT_AUTO_SUGGEST}]`,
+		"Yes = compute after each settled turn (spends quota per turn). No = manual only via the suggest key or /autosuggest-reply suggest.",
+	);
+	update.autoSuggest = autoOn;
+
+	// 13. suggestKey (free text)
+	const suggestKeyPick = await ctx.ui.input(
+		`next-prompt: suggest key [${current.suggestKey ?? DEFAULT_SUGGEST_KEY}]`,
+		current.suggestKey ?? DEFAULT_SUGGEST_KEY,
+	);
+	if (suggestKeyPick) update.suggestKey = suggestKeyPick.trim();
 
 	return update;
 }
