@@ -194,12 +194,14 @@ Mirrors `/advisor`. Control the extension per session, at any turn:
   auto and manual (`autoSuggest: false`) modes; needs an empty editor while
   idle.
 - **`status`** — show whether this session is on/off, the configured default, and
-  the resolved model, render mode, trigger mode, thinking level, accept key, and enhance key.
+  the resolved model, render mode, trigger mode, thinking level, accept key,
+  enhance key, and status-line badge state.
 - **`configure`** — a guided walkthrough of **every option except `systemPrompt`
   and `enhanceSystemPrompt`** (config-file only): the per-session default, a model
   picker, render mode, thinking level, accept key, re-arm delay,
   transcript/recent-turn/suggestion caps, cross-provider disclosure, the
-  enhance-prompt toggle + key, and the auto/manual trigger + suggest key. Saved to the host agent dir
+  enhance-prompt toggle + key, the auto/manual trigger + suggest key, and the
+  status-line badge toggle. Saved to the host agent dir
   (`~/.pi/agent/next-prompt.json` on Pi, `~/.omp/agent/next-prompt.json` on OMP);
   the host reloads so changes take effect immediately.
 
@@ -223,6 +225,7 @@ comes from the host's `CONFIG_DIR_NAME`:
   "autoSuggest": false,
   "suggestKey": "ctrl+down",
   "renderMode": "both",
+  "statusBadge": true,
   "rearmDelayMs": 2000,
   "maxTranscriptChars": 12000,
   "maxRecentTurns": 10,
@@ -242,6 +245,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `autoSuggest` | `true` | Settled turns auto-compute suggestions. Set `false` for manual-only mode: no model call on settle, only via `suggestKey` or `/autosuggest-reply suggest`. Zero background quota otherwise. |
 | `suggestKey` | `"ctrl+down"` | Any pi-tui `KeyId` that computes one batch on demand. Fires only while idle with an empty editor. `"enter"`/`"tab"` are rejected (submit/autocomplete conflicts). Prefer a non-shift key (see `enhanceKey` note). |
 | `renderMode` | `"widget"` | `"widget"` (below-editor line), `"ghost"` (inline greyed text in the box), or `"both"` (inline ghost + below-editor widget). On OMP, `ghost`/`both` work too (see the editor-coexistence note above). |
+| `statusBadge` | `true` | Whether the `↳ suggest` status-line badge is registered via `ctx.ui.setStatus` while suggestions are on for the session. Set `false` to keep the host's status line and footer clear — computing, rendering, and accept behavior are unchanged; only the badge is suppressed. |
 | `rearmDelayMs` | `2000` | Delay (ms) before re-arming the last suggestion after the user deletes back to empty. No new model call. |
 | `systemPrompt` | built-in extractor | Config-file only (not prompted by `/autosuggest-reply configure`). Custom instructions replace the reply-format portion, but the required-reply gate is always appended and overrides conflicts. See `SYSTEM_PROMPT` in `next-prompt.ts`. |
 | `maxTranscriptChars` | `12000` | Tail-truncation of the conversation transcript sent to the model. |
@@ -330,7 +334,9 @@ so a failed ghost restores the **default** editor instead; OMP also has no
 host-side extension-editor teardown, so next-prompt resets its editor to default
 at the next `session_start`. The host clears extension listeners when the UI is
 reset; each fresh `session_start` (reload/new/resume/fork) resets the live toggle
-to the configured default, then installs at most one listener and editor.
+to the configured default, then installs at most one listener and editor. The
+`↳ suggest` status badge (where the host renders extension statuses) mirrors that
+live on/off state, and is suppressed entirely when `statusBadge` is `false`.
 2. On completion:
    - **Pi:** `agent_settled` (its fully-settled contract) — if the editor is
      empty, the controller calls

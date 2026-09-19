@@ -34,6 +34,7 @@ import {
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
 	DEFAULT_AUTO_SUGGEST,
+	DEFAULT_STATUS_BADGE,
 	DEFAULT_SUGGEST_KEY,
 	DEFAULT_ENHANCE_KEY,
 	destinationOf,
@@ -46,6 +47,7 @@ import {
 	isLeftArrow,
 	isRightArrow,
 	loadConfig,
+	loadConfigDetailed,
 	loadEffectiveConfig,
 	isKittyKeyRelease,
 	matchesAcceptKeyRaw,
@@ -1941,6 +1943,8 @@ function makeFake(opts: {
 		notifies: Array<[string, string]>;
 		confirms: string[];
 		selects: Array<[string, string[]]>;
+		/** Extension status entries registered through ctx.ui.setStatus. */
+		statuses: Array<[string, string | undefined]>;
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
 	commands: Map<
@@ -1974,6 +1978,7 @@ function makeFake(opts: {
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
 		selects: [] as Array<[string, string[]]>,
+		statuses: [] as Array<[string, string | undefined]>,
 	};
 	let editorText = "";
 	let inputHandler:
@@ -2083,6 +2088,9 @@ function makeFake(opts: {
 				_options?: { placement?: string },
 			) => {
 				widgetContent = content;
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				calls.statuses.push([key, text]);
 			},
 			getEditorComponent: () => editorComponentOwner,
 			setEditorComponent: (
@@ -2283,6 +2291,8 @@ function makeOmpFake(opts: {
 		notifies: Array<[string, string]>;
 		confirms: string[];
 		selects: Array<[string, string[]]>;
+		/** Extension status entries registered through ctx.ui.setStatus. */
+		statuses: Array<[string, string | undefined]>;
 	};
 	handlers: Map<string, (e: unknown, ctx: unknown) => unknown>;
 	commands: Map<
@@ -2320,6 +2330,7 @@ function makeOmpFake(opts: {
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
 		selects: [] as Array<[string, string[]]>,
+		statuses: [] as Array<[string, string | undefined]>,
 	};
 	let editorText = "";
 	let inputHandler:
@@ -2435,6 +2446,9 @@ function makeOmpFake(opts: {
 				_options?: { placement?: string },
 			) => {
 				widgetContent = content;
+			},
+			setStatus: (key: string, text: string | undefined) => {
+				calls.statuses.push([key, text]);
 			},
 			// OMP shape: setEditorComponent exists, getEditorComponent does not.
 			setEditorComponent: (
@@ -5593,5 +5607,169 @@ describe("manual trigger (suggestKey + autoSuggest)", () => {
 		const { fake } = await setup({ branch: [assistantEntry("a")] });
 		await fake.commands.get("autosuggest-reply")!.handler("status", fake.ctx);
 		expect(fake.calls.notifies.at(-1)![0]).toContain("manual");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Status-line badge (statusBadge)
+// ---------------------------------------------------------------------------
+
+const BADGE = "↳ suggest";
+
+/** Badge entries actually published as extension statuses (undefined = cleared). */
+function badgeSets(fake: {
+	calls: { statuses: Array<[string, string | undefined]> };
+}): Array<[string, string | undefined]> {
+	return fake.calls.statuses.filter(([, text]) => text !== undefined);
+}
+
+describe("status-line badge (statusBadge)", () => {
+	test("SB1: loadConfig reads statusBadge true/false; a non-boolean is ignored and never fails closed", () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ statusBadge: true }),
+		);
+		expect(loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).statusBadge).toBe(
+			true,
+		);
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ statusBadge: false }),
+		);
+		expect(loadConfig(mkdtempSync(join(tmpdir(), "np-cwd-"))).statusBadge).toBe(
+			false,
+		);
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ statusBadge: "no" }),
+		);
+		const cwd = mkdtempSync(join(tmpdir(), "np-cwd-"));
+		expect(loadConfig(cwd).statusBadge).toBeUndefined();
+		// Chrome-only field: an invalid value warns and is ignored, unlike the
+		// privacy-bearing keys, which disable suggestions entirely.
+		expect(
+			loadConfigDetailed(cwd, { projectTrusted: true }).computeDisabled,
+		).toBe(false);
+	});
+
+	test("SB2: default → the badge is registered on session_start", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(badgeSets(fake)).toEqual([["next-prompt", BADGE]]);
+	});
+
+	test("SB3: statusBadge=false → no badge, but suggestions still compute and render", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, statusBadge: false }),
+		);
+		const { fake } = await setup({
+			branch: [assistantEntry("a")],
+			completeResult: {
+				content: [{ type: "text", text: "keep going" }],
+				stopReason: "stop",
+			},
+		});
+		expect(badgeSets(fake)).toHaveLength(0);
+		await fake.handlers.get("agent_settled")!({}, fake.ctx);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.widgetContent?.[0] ?? "").toContain("keep going");
+	});
+
+	test("SB4: `/autosuggest-reply off` clears the badge and `on` restores it", async () => {
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		expect(fake.calls.statuses.at(-1)).toEqual(["next-prompt", BADGE]);
+		await fake.commands.get("autosuggest-reply")!.handler("off", fake.ctx);
+		expect(fake.calls.statuses.at(-1)).toEqual(["next-prompt", undefined]);
+		await fake.commands.get("autosuggest-reply")!.handler("on", fake.ctx);
+		expect(fake.calls.statuses.at(-1)).toEqual(["next-prompt", BADGE]);
+	});
+
+	test("SB5: statusBadge=false survives a live `on` — the toggle cannot re-add chrome", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: false, statusBadge: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.commands.get("autosuggest-reply")!.handler("on", fake.ctx);
+		expect(badgeSets(fake)).toHaveLength(0);
+		expect(fake.inputListeners).toHaveLength(1); // suggestions are on
+	});
+
+	test("SB6: OMP default → badge registered", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		expect(badgeSets(fake)).toEqual([["next-prompt", BADGE]]);
+	});
+
+	test("SB7: OMP statusBadge=false → no badge, settle still computes and renders", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, statusBadge: false }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			completeSimpleResult: {
+				content: [{ type: "text", text: "omp suggestion" }],
+				stopReason: "stop",
+			},
+		});
+		expect(badgeSets(fake)).toHaveLength(0);
+		await fake.handlers.get("agent_end")!({}, fake.ctx);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.widgetContent?.[0] ?? "").toContain("omp suggestion");
+	});
+
+	test("SB8: headless context → no status entry is registered at all", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true }),
+		);
+		const { fake } = await setupOmp({
+			branch: [assistantEntry("a")],
+			hasUI: false,
+		});
+		expect(fake.calls.statuses).toHaveLength(0);
+	});
+
+	test("SB9: `status` reports the badge state", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enabled: true, statusBadge: false }),
+		);
+		const { fake } = await setup({ branch: [assistantEntry("a")] });
+		await fake.commands.get("autosuggest-reply")!.handler("status", fake.ctx);
+		expect(fake.calls.notifies.at(-1)![0]).toContain("badge off");
+	});
+
+	test("SB10: the configure walkthrough surfaces the default and persists statusBadge", async () => {
+		const confirmTitles: string[] = [];
+		const ctx = {
+			modelRegistry: { getAvailable: () => [] },
+			ui: {
+				select: async (title: string) => {
+					if (title.includes("suggestion model")) return "(use current model)";
+					if (title.includes("render mode"))
+						return "widget — colored line below the input box";
+					return undefined;
+				},
+				input: async () => undefined,
+				confirm: async (title: string) => {
+					confirmTitles.push(title);
+					return !title.includes("status-line badge");
+				},
+			},
+		} as unknown as Parameters<typeof configureInteractively>[0];
+		const out = await configureInteractively(ctx, {});
+		expect(out?.statusBadge).toBe(false);
+		expect(
+			confirmTitles.find((t) => t.includes("status-line badge")),
+		).toContain(`[${DEFAULT_STATUS_BADGE}]`);
 	});
 });

@@ -29,6 +29,9 @@ deliberately set `"enabled": true`). Command usage is owned by the
 - [ ] `/autosuggest-reply on` immediately enables suggestions plus prompt
   enhancement without a reload; `status` reports ON, and a status badge appears
   when the host supports extension status entries.
+- [ ] With `"statusBadge": false`, `/autosuggest-reply on` leaves the status line
+  and footer clear (no `↳ suggest`) while suggestions still compute, render, and
+  accept; `status` reports badge off.
 - [ ] `/autosuggest-reply off` immediately clears suggestion UI and the badge,
   aborts in-flight suggestion/enhancement work, restores the prior/default
   editor, and prevents later model calls; `status` reports OFF.
@@ -36,7 +39,8 @@ deliberately set `"enabled": true`). Command usage is owned by the
   session resets to the configured `enabled` default rather than retaining the
   previous session's toggle.
 - [ ] `/autosuggest-reply configure` opens the existing settings walkthrough,
-  including the new-session default, saves successfully, and reloads the host.
+  including the new-session default and the status-line badge toggle, saves
+  successfully, and reloads the host.
 
 ## Pi smoke cases
 
