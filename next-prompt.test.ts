@@ -3214,39 +3214,55 @@ describe("re-arm after delete-to-empty", () => {
 	});
 });
 
-// sanity: the default prompt fails closed unless the user must reply
-test("SYSTEM_PROMPT requires a decision-gated, concise reply batch", () => {
-	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
-	expect(SYSTEM_PROMPT).toContain("latest assistant message");
-	expect(SYSTEM_PROMPT).toContain("never revive an earlier request");
-	expect(SYSTEM_PROMPT).toContain("NONE unless");
-	expect(SYSTEM_PROMPT).toContain("stated blocker or dependency");
-	expect(SYSTEM_PROMPT).toContain("a required reply always wins");
-	expect(SYSTEM_PROMPT).toContain("Never invent new work");
-	expect(SYSTEM_PROMPT).toContain("up to three distinct replies");
-	expect(SYSTEM_PROMPT).toContain("one per line");
-	// The gate stays first and is not reworded by the reply-shaping rules.
-	expect(
-		SYSTEM_PROMPT.startsWith(
-			"Mandatory gate: first decide whether the latest assistant message",
-		),
-	).toBe(true);
-	expect(SYSTEM_PROMPT.indexOf("When a reply is required")).toBeGreaterThan(
-		SYSTEM_PROMPT.indexOf("This gate overrides any conflicting instruction."),
-	);
-	// An offered reply phrase is reused verbatim as the first line.
-	expect(SYSTEM_PROMPT).toContain("offers an exact reply phrase");
-	expect(SYSTEM_PROMPT).toContain("the first line must be that phrase exactly");
-	expect(SYSTEM_PROMPT).toContain("without the surrounding quotes");
-	// Other replies stay terse and carry only the decision.
-	expect(SYSTEM_PROMPT).toContain("shortest reply that carries the decision");
-	expect(SYSTEM_PROMPT).toContain("1 to 6 words");
-	expect(SYSTEM_PROMPT).toContain("Never add politeness");
-	expect(SYSTEM_PROMPT).not.toContain("at most 12 words");
-	expect(SYSTEM_PROMPT).not.toContain(
-		"Never copy a user or assistant sentence verbatim",
-	);
-});
+test.each(["pi", "omp"] as const)(
+	"%s completion receives the AC1 decision-gated, concise reply contract",
+	async (host) => {
+		const branch = [assistantEntry('The branch is green. Say "merge 304".')];
+		let prompt: string | undefined;
+		if (host === "pi") {
+			const { fake } = await setup({ branch });
+			await fake.handlers.get("agent_settled")!({}, fake.ctx);
+			expect(fake.calls.complete).toHaveLength(1);
+			prompt = fake.calls.complete[0]!.systemPrompt;
+		} else {
+			const { fake } = await setupOmp({ branch });
+			await fake.handlers.get("agent_end")!({}, fake.ctx);
+			expect(fake.calls.ompComplete).toHaveLength(1);
+			const emitted = fake.calls.ompComplete[0]!.systemPrompt;
+			expect(Array.isArray(emitted)).toBe(true);
+			expect(emitted).toHaveLength(1);
+			prompt = (emitted as string[])[0];
+		}
+		expect(typeof prompt).toBe("string");
+		expect(prompt!.length).toBeGreaterThan(0);
+		expect(prompt).toContain("latest assistant message");
+		expect(prompt).toContain("never revive an earlier request");
+		expect(prompt).toContain("NONE unless");
+		expect(prompt).toContain("stated blocker or dependency");
+		expect(prompt).toContain("a required reply always wins");
+		expect(prompt).toContain("Never invent new work");
+		expect(prompt).toContain("up to three distinct replies");
+		expect(prompt).toContain("one per line");
+		expect(
+			prompt!.startsWith(
+				"Mandatory gate: first decide whether the latest assistant message",
+			),
+		).toBe(true);
+		expect(prompt!.indexOf("When a reply is required")).toBeGreaterThan(
+			prompt!.indexOf("This gate overrides any conflicting instruction."),
+		);
+		expect(prompt).toContain("offers an exact reply phrase");
+		expect(prompt).toContain("the first line must be that phrase exactly");
+		expect(prompt).toContain("without the surrounding quotes");
+		expect(prompt).toContain("shortest reply that carries the decision");
+		expect(prompt).toContain("1 to 6 words");
+		expect(prompt).toContain("Never add politeness");
+		expect(prompt).not.toContain("at most 12 words");
+		expect(prompt).not.toContain(
+			"Never copy a user or assistant sentence verbatim",
+		);
+	},
+);
 
 // ---------------------------------------------------------------------------
 // renderMode config + ghost editor install
