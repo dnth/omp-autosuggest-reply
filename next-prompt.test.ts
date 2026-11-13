@@ -1269,6 +1269,17 @@ describe("parseSuggestionBatch", () => {
 			),
 		).toEqual(["Commit the merge"]);
 	});
+	test("keeps an offered reply phrase embedded in an assistant line", () => {
+		const transcript =
+			'Assistant: The branch is green. Say "merge 304".';
+		expect(
+			parseSuggestionBatch("merge 304\nhold 304", {}, transcript),
+		).toEqual(["merge 304", "hold 304"]);
+		// A whole-line echo of that same phrase is still dropped.
+		expect(
+			parseSuggestionBatch("merge 304", {}, "Assistant: merge 304"),
+		).toEqual([]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -2648,6 +2659,13 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.systemPrompt).toContain(
 			"This gate overrides any conflicting instruction",
 		);
+		// Exact shape: `${custom}\n\n${REQUIRED_REPLY_GATE}` — the default
+		// reply-shaping rules are replaced, the gate is appended.
+		const prompt = String(fake.calls.complete[0]!.systemPrompt);
+		expect(
+			prompt.startsWith("Always suggest another task.\n\nMandatory gate: first decide"),
+		).toBe(true);
+		expect(prompt).not.toContain("up to three distinct replies");
 	});
 
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
@@ -3196,19 +3214,55 @@ describe("re-arm after delete-to-empty", () => {
 	});
 });
 
-// sanity: the default prompt fails closed unless the user must reply
-test("SYSTEM_PROMPT requires a decision-gated, concise reply batch", () => {
-	expect(SYSTEM_PROMPT.length).toBeGreaterThan(0);
-	expect(SYSTEM_PROMPT).toContain("latest assistant message");
-	expect(SYSTEM_PROMPT).toContain("never revive an earlier request");
-	expect(SYSTEM_PROMPT).toContain("NONE unless");
-	expect(SYSTEM_PROMPT).toContain("stated blocker or dependency");
-	expect(SYSTEM_PROMPT).toContain("a required reply always wins");
-	expect(SYSTEM_PROMPT).toContain("Never invent new work");
-	expect(SYSTEM_PROMPT).toContain("up to three distinct replies");
-	expect(SYSTEM_PROMPT).toContain("one per line");
-	expect(SYSTEM_PROMPT).toContain("at most 12 words");
-});
+test.each(["pi", "omp"] as const)(
+	"%s completion receives the AC1 decision-gated, concise reply contract",
+	async (host) => {
+		const branch = [assistantEntry('The branch is green. Say "merge 304".')];
+		let prompt: string | undefined;
+		if (host === "pi") {
+			const { fake } = await setup({ branch });
+			await fake.handlers.get("agent_settled")!({}, fake.ctx);
+			expect(fake.calls.complete).toHaveLength(1);
+			prompt = fake.calls.complete[0]!.systemPrompt;
+		} else {
+			const { fake } = await setupOmp({ branch });
+			await fake.handlers.get("agent_end")!({}, fake.ctx);
+			expect(fake.calls.ompComplete).toHaveLength(1);
+			const emitted = fake.calls.ompComplete[0]!.systemPrompt;
+			expect(Array.isArray(emitted)).toBe(true);
+			expect(emitted).toHaveLength(1);
+			prompt = (emitted as string[])[0];
+		}
+		expect(typeof prompt).toBe("string");
+		expect(prompt!.length).toBeGreaterThan(0);
+		expect(prompt).toContain("latest assistant message");
+		expect(prompt).toContain("never revive an earlier request");
+		expect(prompt).toContain("NONE unless");
+		expect(prompt).toContain("stated blocker or dependency");
+		expect(prompt).toContain("a required reply always wins");
+		expect(prompt).toContain("Never invent new work");
+		expect(prompt).toContain("up to three distinct replies");
+		expect(prompt).toContain("one per line");
+		expect(
+			prompt!.startsWith(
+				"Mandatory gate: first decide whether the latest assistant message",
+			),
+		).toBe(true);
+		expect(prompt!.indexOf("When a reply is required")).toBeGreaterThan(
+			prompt!.indexOf("This gate overrides any conflicting instruction."),
+		);
+		expect(prompt).toContain("offers an exact reply phrase");
+		expect(prompt).toContain("the first line must be that phrase exactly");
+		expect(prompt).toContain("without the surrounding quotes");
+		expect(prompt).toContain("shortest reply that carries the decision");
+		expect(prompt).toContain("1 to 6 words");
+		expect(prompt).toContain("Never add politeness");
+		expect(prompt).not.toContain("at most 12 words");
+		expect(prompt).not.toContain(
+			"Never copy a user or assistant sentence verbatim",
+		);
+	},
+);
 
 // ---------------------------------------------------------------------------
 // renderMode config + ghost editor install

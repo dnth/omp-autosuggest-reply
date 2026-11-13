@@ -110,7 +110,7 @@ jobs:
       - name: Install into an isolated OMP profile
         run: |
           mkdir -p /tmp/np-extracted
-          tar -xzf /tmp/np-pack/gamaraan-next-prompt-*.tgz -C /tmp/np-extracted
+          tar -xzf /tmp/np-pack/omp-autosuggest-reply-*.tgz -C /tmp/np-extracted
           OMP_PROFILE=next-prompt-ci ./node_modules/.bin/omp plugin install /tmp/np-extracted/package
 
       - name: Require zero plugin errors via omp plugin doctor
