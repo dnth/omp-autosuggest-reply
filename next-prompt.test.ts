@@ -1269,6 +1269,17 @@ describe("parseSuggestionBatch", () => {
 			),
 		).toEqual(["Commit the merge"]);
 	});
+	test("keeps an offered reply phrase embedded in an assistant line", () => {
+		const transcript =
+			'Assistant: The branch is green. Say "merge 304".';
+		expect(
+			parseSuggestionBatch("merge 304\nhold 304", {}, transcript),
+		).toEqual(["merge 304", "hold 304"]);
+		// A whole-line echo of that same phrase is still dropped.
+		expect(
+			parseSuggestionBatch("merge 304", {}, "Assistant: merge 304"),
+		).toEqual([]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -2648,6 +2659,13 @@ describe("controller wiring (agent_settled)", () => {
 		expect(fake.calls.complete[0]!.systemPrompt).toContain(
 			"This gate overrides any conflicting instruction",
 		);
+		// Exact shape: `${custom}\n\n${REQUIRED_REPLY_GATE}` — the default
+		// reply-shaping rules are replaced, the gate is appended.
+		const prompt = String(fake.calls.complete[0]!.systemPrompt);
+		expect(
+			prompt.startsWith("Always suggest another task.\n\nMandatory gate: first decide"),
+		).toBe(true);
+		expect(prompt).not.toContain("up to three distinct replies");
 	});
 
 	test("T74d: config acceptKey is reflected in the widget hint", async () => {
@@ -3207,7 +3225,27 @@ test("SYSTEM_PROMPT requires a decision-gated, concise reply batch", () => {
 	expect(SYSTEM_PROMPT).toContain("Never invent new work");
 	expect(SYSTEM_PROMPT).toContain("up to three distinct replies");
 	expect(SYSTEM_PROMPT).toContain("one per line");
-	expect(SYSTEM_PROMPT).toContain("at most 12 words");
+	// The gate stays first and is not reworded by the reply-shaping rules.
+	expect(
+		SYSTEM_PROMPT.startsWith(
+			"Mandatory gate: first decide whether the latest assistant message",
+		),
+	).toBe(true);
+	expect(SYSTEM_PROMPT.indexOf("When a reply is required")).toBeGreaterThan(
+		SYSTEM_PROMPT.indexOf("This gate overrides any conflicting instruction."),
+	);
+	// An offered reply phrase is reused verbatim as the first line.
+	expect(SYSTEM_PROMPT).toContain("offers an exact reply phrase");
+	expect(SYSTEM_PROMPT).toContain("the first line must be that phrase exactly");
+	expect(SYSTEM_PROMPT).toContain("without the surrounding quotes");
+	// Other replies stay terse and carry only the decision.
+	expect(SYSTEM_PROMPT).toContain("shortest reply that carries the decision");
+	expect(SYSTEM_PROMPT).toContain("1 to 6 words");
+	expect(SYSTEM_PROMPT).toContain("Never add politeness");
+	expect(SYSTEM_PROMPT).not.toContain("at most 12 words");
+	expect(SYSTEM_PROMPT).not.toContain(
+		"Never copy a user or assistant sentence verbatim",
+	);
 });
 
 // ---------------------------------------------------------------------------

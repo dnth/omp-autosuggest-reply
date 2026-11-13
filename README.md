@@ -76,9 +76,15 @@ otherwise the model returns one batch of up to three distinct one-line replies
 and shows the first. This is a semantic, model-evaluated gate, so classification
 quality depends on the selected model.
 
-Each reply is one clear action or decision and at most 12 words. Regardless of
-a custom `systemPrompt`, a reply that exactly repeats a user or assistant
-transcript line is dropped.
+Each reply is one clear action or decision, and the model reuses the agent's own
+wording instead of inventing its own. When the latest agent message offers an
+exact reply phrase — for example `Say "merge 304"` — the first suggestion is
+that phrase verbatim, without the quotes or the word `Say`. Otherwise replies
+stay terse: 1 to 6 words, imperative, reusing the agent's labels, numbers and
+option ids (`merge 304`, `BS1 yes`, `file it`). Regardless of a custom
+`systemPrompt`, a reply that exactly repeats a user or assistant transcript
+line is dropped; an offered phrase embedded inside a longer transcript line is
+not such an echo and survives.
 
 - **Right** / **Left**, or **Alt+>** / **Alt+<**, wrap through that turn's list.
   There is no extra model call and no browsing of previous turns.
