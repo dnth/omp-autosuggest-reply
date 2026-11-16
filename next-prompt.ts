@@ -133,6 +133,12 @@ export interface NextPromptConfig {
 	acceptKey?: string;
 	/** How the suggestion is shown. "widget" (default) = below-editor line; "ghost" = inline overlay in the input box. */
 	renderMode?: RenderMode;
+	/**
+	 * Whether the status-line badge (`↳ suggest`) is shown while suggestions are
+	 * on for the session. Defaults to true. Set false to keep the host status
+	 * line and footer clear — the extension still computes and renders normally.
+	 */
+	statusBadge?: boolean;
 	systemPrompt?: string;
 	maxTranscriptChars?: number;
 	maxSuggestionChars?: number;
@@ -245,6 +251,8 @@ export const DEFAULT_ENABLED = false;
 export const DEFAULT_AUTO_SUGGEST = true;
 /** Default keybinding that manually triggers suggestion compute. */
 export const DEFAULT_SUGGEST_KEY = "ctrl+down";
+/** Whether the status-line badge is shown while suggestions are on. */
+export const DEFAULT_STATUS_BADGE = true;
 /** Hard cap (code points) on an enhanced prompt written back to the editor. */
 const ENHANCE_MAX_CHARS = 4000;
 
@@ -582,6 +590,11 @@ function parseConfig(text: string): {
 				if (typeof value !== "boolean")
 					console.warn(`next-prompt: invalid autoSuggest in config; ignoring`);
 				else cfg.autoSuggest = value;
+				break;
+			case "statusBadge":
+				if (typeof value !== "boolean")
+					console.warn(`next-prompt: invalid statusBadge in config; ignoring`);
+				else cfg.statusBadge = value;
 				break;
 			case "suggestKey":
 				if (typeof value !== "string" || value.trim().length === 0)
@@ -2480,9 +2493,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.active = false;
 	}
 
-	// Status-line badge; best-effort (absent on hosts without setStatus).
+	// Status-line badge; best-effort (absent on hosts without setStatus). Gated by
+	// `statusBadge` so a host with a crowded status line can keep the extension
+	// chrome-free without turning suggestions off.
 	function updateStatusBadge(ctx: HostCtx): void {
-		const on = ref.sessionEnabled && ref.active;
+		const on =
+			ref.sessionEnabled &&
+			ref.active &&
+			(effective?.statusBadge ?? DEFAULT_STATUS_BADGE);
 		try {
 			ctx.ui.setStatus?.("next-prompt", on ? "↳ suggest" : undefined);
 		} catch {
@@ -2995,7 +3013,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				: `manual (${cfg.suggestKey ?? DEFAULT_SUGGEST_KEY})`;
 		const lines = [
 			`next-prompt: this session ${on ? "ON" : "OFF"} (default ${cfg.enabled ? "on" : "off"}) — /autosuggest-reply ${on ? "off" : "on"} to toggle`,
-			`  model ${model} · render ${cfg.renderMode ?? "widget"} · thinking ${cfg.thinking ?? "model default"}`,
+			`  model ${model} · render ${cfg.renderMode ?? "widget"} · thinking ${cfg.thinking ?? "model default"} · badge ${(cfg.statusBadge ?? DEFAULT_STATUS_BADGE) ? "on" : "off"}`,
 			`  trigger ${auto} · accept ${cfg.acceptKey ?? DEFAULT_ACCEPT_KEY} · enhance ${enhanceOn}`,
 		];
 		if (cfg.computeDisabled)
@@ -3242,6 +3260,13 @@ export async function configureInteractively(
 		current.suggestKey ?? DEFAULT_SUGGEST_KEY,
 	);
 	if (suggestKeyPick) update.suggestKey = suggestKeyPick.trim();
+
+	// 14. statusBadge (confirm) — chrome only: hiding it leaves suggestions on.
+	const badgeOn = await ctx.ui.confirm(
+		`next-prompt: show the status-line badge while suggestions are on? [${current.statusBadge ?? DEFAULT_STATUS_BADGE}]`,
+		'Yes = the status line shows "↳ suggest" whenever suggestions are on for the session. No = leave the status line and footer clear (suggestions are unaffected).',
+	);
+	update.statusBadge = badgeOn;
 
 	return update;
 }
