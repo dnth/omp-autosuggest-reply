@@ -105,10 +105,12 @@ Run each sequence in `widget`, `ghost`, and `both`:
 
 ### Enhance prompt (default key `Ctrl+Up`)
 
-- [ ] Type a prompt, press Ctrl+Up: the hint reads `↑ choosing mode…`, then
-  `↑ <enhancing|sharpening|reframing> prompt…`; the box is replaced by a rewrite
-  and the hint reads `↑ <enhanced|sharpened|reframed>  (auto · Ctrl-Up next mode
-  · Esc to revert)`; two model calls (classify, rewrite).
+- [ ] Press Ctrl+Up with an unprefixed draft. Expect `↑ choosing mode…`, then
+  a mode-specific progress hint, and two model calls (classify, rewrite).
+  For a rewrite, expect a hint naming the mode with the next action.
+  For an unchanged result, expect the draft to stay in place with the hint
+  `↑ <mode>: nothing to change`. Use a draft that yields a rewrite to check the
+  cycle below.
 - [ ] Press Ctrl+Up again on the same draft → the next mode's rewrite of the
   original (not of the previous rewrite); after the last mode → original text
   restored (`↑ original`); once more → the first rewrite replayed from cache with
@@ -120,9 +122,9 @@ Run each sequence in `widget`, `ghost`, and `both`:
   rewrites even while the agent is running.
 - [ ] Submit the enhanced prompt → it sends normally; an in-flight rewrite is
   aborted by submit/new turn/agent start with no stale replacement.
-- [ ] Only the typed line is sent (verify no transcript in the request); a
-  cross-destination enhance model follows `allowCrossProvider` without a
-  separate dialog.
+- [ ] Inspect both enhancement requests for the [draft-only disclosure
+  described in the README](README.md#enhance-prompt). Confirm a cross-destination
+  enhance model follows `allowCrossProvider` without a separate dialog.
 - [ ] `"enhanceEnabled": false` disables the key (falls through to the editor);
   `"enhanceKey": "enter"`/`"tab"` is rejected with a warning.
 - [ ] Type `/sharpen <prompt>`, `/reframe <description>`, or `/enhance <prompt>`
@@ -158,10 +160,10 @@ checks.
   enhancement use the configured model without a dialog; with `false`, they
   silently use the active model.
 - [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
-- [ ] Enhance prompt before and after `/new`. Type an unprefixed draft and press
-  Ctrl+Up. Expect two `completeSimple` calls, one to classify and one to rewrite,
-  each receiving only the redacted draft. Press Esc to restore the original
-  without another call. With `"enhanceEnabled": false`, Ctrl+Up makes no call.
+- [ ] Repeat the unprefixed [Enhance prompt](#enhance-prompt-default-key-ctrlup)
+  call and Esc checks before and after `/new`. Use a draft that yields a rewrite
+  and verify both requests go through `completeSimple`. Repeat the disabled-key
+  check as well.
 
 ## Record
 

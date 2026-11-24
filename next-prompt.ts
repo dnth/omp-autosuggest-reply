@@ -1753,7 +1753,7 @@ function enhanceCycleFrom(start: EnhanceMode): EnhanceMode[] {
 	return [...ENHANCE_MODE_LADDER.slice(i), ...ENHANCE_MODE_LADDER.slice(0, i)];
 }
 
-/** Which of the two texts the editor holds, and whether a rewrite is in flight. */
+/** The current editor view and cached results for an enhancement session. */
 export interface EnhanceRuntime {
 	/** The user's text before the last enhance (for revert). */
 	original?: string;
@@ -1957,9 +1957,8 @@ function makeInputHandler(
 
 		// Enhance: rewrite the current (non-empty) editor text in place. Placed
 		// before the empty-editor accept/carousel branches so it is never
-		// shadowed. The enhance key returns here, so it never bumps the input
-		// generation — an in-flight rewrite is invalidated only by a real edit
-		// or a lifecycle reset.
+		// shadowed. Enhancement tracks editor text separately from the
+		// suggestion input generation so cursor movement preserves the cycle.
 		if (enhance?.enabled) {
 			if (
 				matchesKey(data, enhance.key as KeyId) ||
@@ -3006,9 +3005,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	const CLASSIFY_TIMEOUT_MS = 8_000;
 
 	/**
-	 * One cheap call that picks the rewrite mode for a redacted draft. Minimal
-	 * reasoning, short timeout. Undefined (never an error) when the call fails,
-	 * times out, or names no mode, so the caller falls back to polish-only.
+	 * Pick the rewrite mode for a redacted draft. Race completion against
+	 * cancellation so a transport that ignores abort cannot delay fallback.
 	 */
 	async function classifyDraft(
 		ctx: HostCtx,
