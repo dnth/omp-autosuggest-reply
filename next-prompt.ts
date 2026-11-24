@@ -2305,7 +2305,7 @@ export interface HostCtx extends HostContextLike {
 		complete?: (
 			model: Model<Api>,
 			context: Context,
-			options?: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+			options?: CompletionOptions,
 		) => Promise<AssistantMessage>;
 		/** OMP auth resolver (absent on Pi). */
 		resolver?: (model: Model<Api>) => unknown;
@@ -2347,6 +2347,12 @@ export interface HostCtx extends HostContextLike {
 	};
 	sessionManager: { getBranch(): BranchEntry[] };
 	reload?: () => Promise<void>;
+}
+
+interface CompletionOptions {
+	signal?: AbortSignal;
+	reasoning?: ThinkingLevel;
+	reasoningEffort?: "minimal";
 }
 
 /**
@@ -3031,7 +3037,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 							host === "omp" ? [CLASSIFY_SYSTEM_PROMPT] : CLASSIFY_SYSTEM_PROMPT,
 						messages: buildMessages(body),
 					} as unknown as Context,
-					{ signal: cac.signal, reasoning: "minimal" },
+					// Pi's registry calls the provider directly. OpenAI Completions
+					// reads its native option, while OMP uses the simple options.
+					host === "pi" && model.api === "openai-completions"
+						? { signal: cac.signal, reasoningEffort: "minimal" }
+						: { signal: cac.signal, reasoning: "minimal" },
 					canDispatch,
 				),
 			]);
@@ -3250,7 +3260,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * Host-specific completion transport.
-	 *  - Pi: `ctx.modelRegistry.complete(model, context, { signal, reasoning })`.
+	 *  - Pi: `ctx.modelRegistry.complete(model, context, options)`.
 	 *  - OMP: `completeSimple` from the lazily imported (and OMP-remapped)
 	 *    legacy `@earendil-works/pi-ai` module, invoked with the registry's
 	 *    auth resolver as `apiKey`. The module import is cached at module
@@ -3265,7 +3275,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ctx: HostCtx,
 		model: Model<Api>,
 		context: Context,
-		options: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+		options: CompletionOptions,
 		canDispatch?: () => boolean,
 	): Promise<AssistantMessage | undefined> {
 		if (hostKind === "pi") {

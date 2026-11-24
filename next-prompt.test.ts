@@ -1904,7 +1904,7 @@ function makeFake(opts: {
 	completeError?: Error;
 	/** Throw on the Nth `complete` call (0-based) only. */
 	completeErrorAt?: number;
-	model?: { provider: string; id: string; baseUrl?: string };
+	model?: { provider: string; id: string; baseUrl?: string; api?: string };
 	findModel?: (p: string, m: string) => unknown;
 	mode?: string;
 	projectTrusted?: boolean;
@@ -1948,6 +1948,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
 		}>;
 		notifies: Array<[string, string]>;
 		confirms: string[];
@@ -1981,6 +1982,7 @@ function makeFake(opts: {
 			messages: unknown[];
 			signal?: AbortSignal;
 			reasoning?: string;
+			reasoningEffort?: string;
 		}>,
 		notifies: [] as Array<[string, string]>,
 		confirms: [] as string[],
@@ -2027,7 +2029,11 @@ function makeFake(opts: {
 			complete: async (
 				model: unknown,
 				context: { systemPrompt?: string; messages: unknown[] },
-				options?: { signal?: AbortSignal; reasoning?: string },
+				options?: {
+					signal?: AbortSignal;
+					reasoning?: string;
+					reasoningEffort?: string;
+				},
 			) => {
 				calls.complete.push({
 					model,
@@ -2035,6 +2041,7 @@ function makeFake(opts: {
 					messages: context.messages,
 					signal: options?.signal,
 					reasoning: options?.reasoning,
+					reasoningEffort: options?.reasoningEffort,
 				});
 				if (opts.completeError) throw opts.completeError;
 				if (opts.completeErrorAt === calls.complete.length - 1)
@@ -5169,13 +5176,14 @@ const textReply = (text: string) => ({
 });
 
 describe("enhance key handling (onTerminalInput)", () => {
-	test("EN9: classification uses minimal reasoning and the rewrite uses the configured level", async () => {
+	test("EN9: Pi OpenAI classifier requests minimal effort and preserves the rewrite options", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
 			JSON.stringify({ thinking: "high" }),
 		);
 		const { fake } = await setup({
+			model: { provider: "openai", id: "gpt", api: "openai-completions" },
 			completeResults: [textReply("enhance"), textReply("Fix the parser bug.")],
 		});
 		fake.setEditorText("fix teh parser bug");
@@ -5186,12 +5194,13 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(String(fake.calls.complete[0]!.systemPrompt)).toContain(
 			"route a draft prompt",
 		);
-		expect(fake.calls.complete[0]!.reasoning).toBe("minimal");
+		expect(fake.calls.complete[0]!.reasoningEffort).toBe("minimal");
 		expect(fake.editorText).toBe("Fix the parser bug.");
 		// Only the typed text is sent (no transcript); enhance system prompt used.
 		const call = fake.calls.complete[1]!;
 		expect(String(call.systemPrompt)).toContain("rewrite a single instruction");
 		expect(call.reasoning).toBe("high");
+		expect(call.reasoningEffort).toBeUndefined();
 		expect(JSON.stringify(call.messages)).toContain("fix teh parser bug");
 	});
 
