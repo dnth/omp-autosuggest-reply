@@ -5479,16 +5479,17 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 	});
 
 	test("EM8: a stripped-body echo removes the prefix without caching a rewrite", async () => {
+		const body = `\tWrite the migration guide\n${"Keep this example. ".repeat(240)}\n  `;
 		const { fake } = await setup({
-			completeResult: {
-				content: [{ type: "text", text: "Write the migration guide" }],
-				stopReason: "stop",
-			},
+			completeResults: [
+				{ content: [{ type: "text", text: body }], stopReason: "stop" },
+				{ content: [{ type: "text", text: "NONE" }], stopReason: "stop" },
+			],
 		});
-		fake.setEditorText("/sharpen Write the migration guide");
+		fake.setEditorText(`/sharpen\n${body}`);
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
-		expect(fake.editorText).toBe("Write the migration guide");
+		expect(fake.editorText).toBe(body);
 		expect(fake.calls.notifies).toContainEqual([
 			"next-prompt: prompt already clear",
 			"info",
@@ -5496,7 +5497,7 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
 		expect(fake.calls.complete).toHaveLength(2);
-		expect(fake.editorText).toBe("Write the migration guide");
+		expect(fake.editorText).toBe(body);
 	});
 
 	for (const reply of ["/reframe\nsettings page loses edits  ", "NONE"]) {
