@@ -5366,6 +5366,20 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(fake.calls.ompComplete[1]!.reasoning).toBe("high");
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
+
+	test("EN18-omp: Ctrl+Up skips a draft with a collapsed paste", async () => {
+		const { fake } = await setupOmp({});
+		const draft = "Review these notes:\n[Paste #2, +30 lines]";
+		fake.setEditorText(draft);
+		expect(fake.inputHandler!(ENHANCE_KEY)).toEqual({ consume: true });
+		await sleep(0);
+		expect(fake.calls.ompComplete).toHaveLength(0);
+		expect(fake.editorText).toBe(draft);
+		expect(fake.calls.notifies).toContainEqual([
+			"next-prompt: enhance skipped: the draft holds a collapsed paste; expand it first",
+			"info",
+		]);
+	});
 });
 
 describe("enhance modes (/sharpen, /reframe prefix)", () => {

@@ -3071,6 +3071,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const config = readConfig();
 		if (config.computeDisabled || config.enhanceEnabled === false) return;
 		const editorText = step?.editorText ?? text;
+		const collapsedPaste = /\[Paste #\d+(?:,[^\]\r\n]*)?\]/;
+		if (host === "omp" && (collapsedPaste.test(text) || collapsedPaste.test(editorText))) {
+			ctx.ui.notify(
+				"next-prompt: enhance skipped: the draft holds a collapsed paste; expand it first",
+				"info",
+			);
+			return;
+		}
 		let request = buildEnhanceRequest(
 			text,
 			config.enhanceSystemPrompt,
