@@ -2964,14 +2964,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
+		const trimmedReply = request.mode === "enhance" ? undefined : raw.trim();
+		const echoesEditor = trimmedReply === text.trim();
+		const echoesBody = trimmedReply === request.body.trim();
 		const enhanced = sanitizeEnhancedPrompt(raw);
-		const unchanged =
-			enhanced === text || (request.mode !== "enhance" && raw === text);
+		const unchanged = enhanced === text || echoesEditor;
 		const alreadyClear =
 			enhanced.length === 0 ||
 			unchanged ||
 			enhanced === request.body ||
-			(request.mode !== "enhance" && raw === request.body);
+			echoesBody;
 		if (enhanced.length > 0 && !unchanged && ctx.ui.getEditorText() === text) {
 			if (alreadyClear) {
 				ctx.ui.setEditorText(request.body);

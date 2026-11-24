@@ -5478,11 +5478,11 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		expect(fake.editorText).toBe("/reframe\n\t ");
 	});
 
-	test("EM8: a stripped-body echo removes the prefix without caching a rewrite", async () => {
+	test("EM8: a whitespace-normalized body echo removes only the prefix without caching", async () => {
 		const body = `\tWrite the migration guide\n${"Keep this example. ".repeat(240)}\n  `;
 		const { fake } = await setup({
 			completeResults: [
-				{ content: [{ type: "text", text: body }], stopReason: "stop" },
+				{ content: [{ type: "text", text: `${body}\n` }], stopReason: "stop" },
 				{ content: [{ type: "text", text: "NONE" }], stopReason: "stop" },
 			],
 		});
@@ -5500,19 +5500,22 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		expect(fake.editorText).toBe(body);
 	});
 
-	for (const reply of ["/reframe\nsettings page loses edits  ", "NONE"]) {
-		test(`EM9: a full-editor echo or NONE keeps the original (${JSON.stringify(reply)})`, async () => {
+	const reframeDraft = `/reframe\nsettings page loses edits\n${"Keep this example. ".repeat(240)}  `;
+	for (const [kind, reply] of [
+		["a whitespace-normalized full-editor echo", `\n${reframeDraft}\n`],
+		["NONE", "NONE"],
+	] as const) {
+		test(`EM9: ${kind} keeps the original`, async () => {
 			const { fake } = await setup({
 				completeResult: {
 					content: [{ type: "text", text: reply }],
 					stopReason: "stop",
 				},
 			});
-			const original = "/reframe\nsettings page loses edits  ";
-			fake.setEditorText(original);
+			fake.setEditorText(reframeDraft);
 			fake.inputHandler!(ENHANCE_KEY);
 			await sleep(30);
-			expect(fake.editorText).toBe(original);
+			expect(fake.editorText).toBe(reframeDraft);
 			expect(fake.calls.notifies).toContainEqual([
 				"next-prompt: prompt already clear",
 				"info",
