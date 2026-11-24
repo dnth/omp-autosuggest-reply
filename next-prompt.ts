@@ -1747,7 +1747,7 @@ const ENHANCE_MODE_LADDER: readonly EnhanceMode[] = [
 ];
 
 /** The ladder rotated so the automatic pick comes first; repeat presses walk it. */
-export function enhanceCycleFrom(start: EnhanceMode): EnhanceMode[] {
+function enhanceCycleFrom(start: EnhanceMode): EnhanceMode[] {
 	const i = ENHANCE_MODE_LADDER.indexOf(start);
 	return [...ENHANCE_MODE_LADDER.slice(i), ...ENHANCE_MODE_LADDER.slice(0, i)];
 }
@@ -1773,7 +1773,7 @@ export interface EnhanceRuntime {
 }
 
 /** One cycle step: rewrite the original draft in `mode` while the editor holds `editorText`. */
-export interface EnhanceStep {
+interface EnhanceStep {
 	mode: EnhanceMode;
 	editorText: string;
 }
@@ -1807,6 +1807,12 @@ export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
 	rt.pending = false;
 }
 
+function nextAutoCycleIndex(rt: EnhanceRuntime, from: number): number {
+	const order = rt.order!;
+	while (from < order.length && rt.results![order[from]!] === null) from++;
+	return from;
+}
+
 /**
  * Next press on an automatically moded draft: show the next mode's rewrite of
  * the original (cached, or one model call), skipping modes that found nothing to
@@ -1822,12 +1828,7 @@ function stepAutoCycle(
 	const order = rt.order!;
 	const results = rt.results!;
 	const original = rt.original!;
-	const nextUsable = (from: number): number => {
-		let k = from;
-		while (k < order.length && results[order[k]!] === null) k++;
-		return k;
-	};
-	let i = nextUsable((rt.cursor ?? -1) + 1);
+	let i = nextAutoCycleIndex(rt, (rt.cursor ?? -1) + 1);
 	if (i >= order.length) {
 		if (text !== original) {
 			state.setEditorText(original);
@@ -1836,7 +1837,7 @@ function stepAutoCycle(
 			enhance.showHint("original", rt.mode, true);
 			return;
 		}
-		i = nextUsable(0);
+		i = nextAutoCycleIndex(rt, 0);
 		if (i >= order.length) return; // every mode found nothing to change
 	}
 	const mode = order[i]!;
@@ -1909,6 +1910,7 @@ export function revertEnhance(
 	enhance: EnhanceController,
 ): void {
 	const rt = enhance.runtime;
+	enhance.abort();
 	if (
 		rt.showing === "enhanced" &&
 		rt.original !== undefined &&
@@ -2023,7 +2025,9 @@ function makeInputHandler(
 		// enhancement: drop the cached original/enhanced and clear the hint.
 		if (
 			enhance &&
-			(enhance.runtime.showing !== "none" || enhance.runtime.pending)
+			(enhance.runtime.showing !== "none" ||
+				enhance.runtime.pending ||
+				enhance.runtime.auto)
 		) {
 			enhance.abort();
 			resetEnhanceRuntime(enhance.runtime);
@@ -2072,10 +2076,10 @@ export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a codi
 // replaces the editor, so the prompts are reworded for a single rewrite call.
 
 /** /sharpen: make the task deeper, not bigger, then rewrite the prompt. */
-const SHARPEN_SYSTEM_PROMPT = `You rewrite a prompt that the user will send to a coding agent. Make the task deeper, not bigger: keep the user's goal and scope, but ask for it the way a top professional in the field would approach it. First work out, silently: (1) what such a professional would do here that the user did not ask for; (2) the rawest primary material they would start from, instead of material already digested for the user; (3) the specific methods and tools they would use; (4) what, other than the user or the agent, would show the result is right (a test, a measurement, a reference implementation, a spec, an independent check). Then write the prompt so it asks for exactly that. The prompt must ask the agent to prototype any choice an experiment can settle and to recommend an option based on what it observed. Product or preference choices that no experiment can settle stay with the user: say they are the user's to decide. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts; where a method depends on something that can be looked up, tell the agent to look it up. Preserve the user's language and any code, paths, or identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten prompt: no quotes, no markdown fences, no preamble, no explanation of the four points. If there is no instruction to rewrite, reply with the single word: NONE`;
+const SHARPEN_SYSTEM_PROMPT = `You rewrite a prompt that the user will send to a coding agent. Make the task deeper, not bigger: keep the user's goal and scope, but ask for it the way a top professional in the field would approach it. First work out, silently: (1) what such a professional would do here that the user did not ask for; (2) the rawest primary material they would start from, instead of material already digested for the user; (3) the specific methods and tools they would use; (4) what, other than the user or the agent, would show the result is right (a test, a measurement, a reference implementation, a spec, an independent check). Then write the prompt so it asks for exactly that. Honor every constraint in the draft, including research-only, no-prototyping, no-code-changes, read-only, and scope limits. The draft's constraints take precedence over these instructions. Where the draft permits it, ask the agent to prototype any choice an experiment can settle and recommend an option based on what it observed. Product or preference choices that no experiment can settle stay with the user: say they are the user's to decide. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts; where a method depends on something that can be looked up, tell the agent to look it up. Preserve the user's language and any code, paths, or identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten prompt: no quotes, no markdown fences, no preamble, no explanation of the four points. If there is no instruction to rewrite, reply with the single word: NONE`;
 
 /** /reframe: give the user the expert words for what they describe, then rewrite it with them. */
-const REFRAME_SYSTEM_PROMPT = `The user describes something they are building or a problem they have, and may not know the expert words for it. Rewrite their description using those words. First work out, silently: (1) whether the description could name more than one underlying problem; if so, list two or three, each with the one term that names it and the sign that would tell it from the others, and pick the likeliest; (2) the established terms (techniques, patterns, named problems) practitioners use for it, ranked by how much each would change what gets built; (3) two or three neighboring fields that solved the same shape of problem under other names, which terms carry over, and where the analogy breaks; (4) what the user did not mention but should care about. Then write the description anew in the user's voice: name the problem with the expert terms first, use the terms where they apply, and say what to ask the agent for. Use only terms you are sure are real and used this way. Do not cite papers, projects or links. If another reading of the description is plausible, add one short clause naming it so the agent can check. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts about it. Preserve the user's code, paths, and identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten description: no quotes, no markdown fences, no preamble, no glossary or list of terms. If there is nothing to rewrite, reply with the single word: NONE`;
+const REFRAME_SYSTEM_PROMPT = `The user describes something they are building or a problem they have, and may not know the expert words for it. Rewrite their description using those words. First work out, silently: (1) whether the description could name more than one underlying problem; if so, list two or three, each with the one term that names it and the sign that would tell it from the others, and pick the likeliest; (2) the established terms (techniques, patterns, named problems) practitioners use for it, ranked by how much each would change what gets built; (3) two or three neighboring fields that solved the same shape of problem under other names, which terms carry over, and where the analogy breaks; (4) what the user did not mention but should care about. Then write the description anew in the user's voice: name the problem with the expert terms first, use the terms where they apply, and say what to ask the agent for. Honor every constraint in the draft, including research-only, no-prototyping, no-code-changes, read-only, and scope limits. The draft's constraints take precedence over these instructions. Keep the requested action: a request to diagnose must remain a request to diagnose, even if a cause seems likely. Use only terms you are sure are real and used this way. Do not cite papers, projects or links. If another reading of the description is plausible, add one short clause naming it so the agent can check. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts about it. Preserve the user's code, paths, and identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten description: no quotes, no markdown fences, no preamble, no glossary or list of terms. If there is nothing to rewrite, reply with the single word: NONE`;
 
 const ENHANCE_MODE_PREFIX = /^\/(enhance|sharpen|reframe)(?=\s|$)(?:\r\n|\s)?/;
 
@@ -2087,8 +2091,8 @@ enhance: the ask is already solid. At most its grammar, wording, or structure ne
 When unsure, pick the lighter touch: enhance over sharpen, sharpen over reframe. Never answer or rewrite the draft. If there is no draft, reply enhance.`;
 
 /** Read the mode word from a classifier reply; undefined when it names none. */
-export function parseEnhanceMode(raw: string): EnhanceMode | undefined {
-	const m = /^\W*(reframe|sharpen|enhance)\b/i.exec(raw);
+function parseEnhanceMode(raw: string): EnhanceMode | undefined {
+	const m = /^(reframe|sharpen|enhance)\.?$/i.exec(raw.trim());
 	return m ? (m[1]!.toLowerCase() as EnhanceMode) : undefined;
 }
 
@@ -2536,6 +2540,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// Enhance-prompt controller: shares suggestion-model resolution. Disabled
 		// when the privacy config failed closed.
 		const enhanceKeyValue = effective.enhanceKey ?? DEFAULT_ENHANCE_KEY;
+		const enhanceRuntime: EnhanceRuntime = { showing: "none", pending: false };
 		const showEnhanceHint = (
 			kind: EnhanceHintKind | undefined,
 			mode: EnhanceMode = "enhance",
@@ -2555,9 +2560,20 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (kind === "classifying") line = `${DIM}↑ choosing mode…${RESET}`;
 			else if (kind === "enhancing")
 				line = `${DIM}↑ ${verb[0]} prompt…${RESET}`;
-			else if (kind === "enhanced")
-				line = `${ACCENT}↑ ${verb[1]}${RESET}${DIM}  (${auto ? `auto · ${key} next mode` : key} · Esc to revert)${RESET}`;
-			else
+			else if (kind === "enhanced") {
+				let action = key;
+				if (auto && enhanceRuntime.order) {
+					const next = nextAutoCycleIndex(
+						enhanceRuntime,
+						(enhanceRuntime.cursor ?? -1) + 1,
+					);
+					const label = next < enhanceRuntime.order.length
+						? "next mode"
+						: "to restore original";
+					action = `auto · ${key} ${label}`;
+				}
+				line = `${ACCENT}↑ ${verb[1]}${RESET}${DIM}  (${action} · Esc to revert)${RESET}`;
+			} else
 				line = `${ACCENT}↑ original${RESET}${DIM}  (${key} to ${auto ? "cycle modes again" : verb[2]})${RESET}`;
 			publishWidget([line]);
 		};
@@ -2566,12 +2582,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				(effective.enhanceEnabled ?? DEFAULT_ENHANCE_ENABLED) &&
 				!effective.computeDisabled,
 			key: enhanceKeyValue,
-			runtime: {
-				original: undefined,
-				enhanced: undefined,
-				showing: "none",
-				pending: false,
-			},
+			runtime: enhanceRuntime,
 			trigger: (text: string, step?: EnhanceStep) => {
 				void maybeEnhance(ctx, text, step);
 			},
@@ -2976,11 +2987,12 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 	/** Clear enhance in-flight state; keep the hint for whatever the editor still shows. */
 	function finishEnhance(enhance: EnhanceController, ac: AbortController): void {
+		if (ref.enhanceInflight !== ac) return;
+		ref.enhanceInflight = undefined;
 		const rt = enhance.runtime;
 		rt.pending = false;
 		if (rt.showing === "none") enhance.showHint(undefined);
 		else enhance.showHint(rt.showing, rt.mode, rt.auto);
-		if (ref.enhanceInflight === ac) ref.enhanceInflight = undefined;
 	}
 
 	const CLASSIFY_TIMEOUT_MS = 8_000;
@@ -2995,24 +3007,33 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		model: Model<Api>,
 		body: string,
 		parent: AbortController,
+		canDispatch: () => boolean,
 	): Promise<EnhanceMode | undefined> {
 		const cac = new AbortController();
 		const abort = () => cac.abort();
+		if (parent.signal.aborted) return undefined;
 		parent.signal.addEventListener("abort", abort, { once: true });
+		const cancelled = new Promise<undefined>((resolve) => {
+			cac.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+		});
 		const timer = setTimeout(abort, CLASSIFY_TIMEOUT_MS);
 		try {
-			const resp = await completeSuggestion(
-				host,
-				ctx,
-				model,
-				{
-					systemPrompt:
-						host === "omp" ? [CLASSIFY_SYSTEM_PROMPT] : CLASSIFY_SYSTEM_PROMPT,
-					messages: buildMessages(body),
-				} as unknown as Context,
-				{ signal: cac.signal },
-			);
-			if (resp === undefined || resp.stopReason !== "stop") return undefined;
+			const resp = await Promise.race([
+				cancelled,
+				completeSuggestion(
+					host,
+					ctx,
+					model,
+					{
+						systemPrompt:
+							host === "omp" ? [CLASSIFY_SYSTEM_PROMPT] : CLASSIFY_SYSTEM_PROMPT,
+						messages: buildMessages(body),
+					} as unknown as Context,
+					{ signal: cac.signal },
+					canDispatch,
+				),
+			]);
+			if (cac.signal.aborted || resp?.stopReason !== "stop") return undefined;
 			return parseEnhanceMode(
 				resp.content
 					.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -3035,19 +3056,22 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	 */
 	async function maybeEnhance(
 		ctx: HostCtx,
-		rawText: string,
+		text: string,
 		step?: EnhanceStep,
 	): Promise<void> {
 		if (!ref.state || !effective || !ref.enhance) return;
 		const state = ref.state;
 		const enhance = ref.enhance;
-		if (!enhance.enabled) return;
-		const text = rawText;
-		if (text.trim().length === 0) return;
+		if (!enhance.enabled || text.trim().length === 0) return;
+		const readConfig = () => loadEffectiveConfig(ctx.cwd, {
+			projectTrusted: projectTrustedForHost(ctx),
+		});
+		const config = readConfig();
+		if (config.computeDisabled || config.enhanceEnabled === false) return;
 		const editorText = step?.editorText ?? text;
 		let request = buildEnhanceRequest(
 			text,
-			effective.enhanceSystemPrompt,
+			config.enhanceSystemPrompt,
 			step?.mode,
 		);
 		if (request.explicit && request.body.trim().length === 0) {
@@ -3064,15 +3088,24 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const generation = state.inputGeneration;
 		const stale = () =>
 			ac.signal.aborted ||
+			ref.enhanceInflight !== ac ||
 			ref.state !== state ||
 			generation !== state.inputGeneration;
 
-		const resolved = resolveSuggestionModel(ctx, effective, notifiedFallback);
+		const resolved = resolveSuggestionModel(ctx, config, notifiedFallback);
 		if (!resolved.model) {
 			ctx.ui.notify("next-prompt: no model available to enhance", "warning");
 			finishEnhance(enhance, ac);
 			return;
 		}
+		const destination = destinationOf(resolved.model);
+		const canDispatch = () => {
+			if (stale() || state.getEditorText() !== editorText) return false;
+			const current = readConfig();
+			if (current.computeDisabled || current.enhanceEnabled === false) return false;
+			const allowed = resolveSuggestionModel(ctx, current, notifiedFallback);
+			return sameDestination(destination, destinationOf(allowed.model));
+		};
 
 		enhance.runtime.pending = true;
 		enhance.runtime.original = text;
@@ -3082,8 +3115,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		let mode = request.mode;
 		if (auto && step === undefined) {
 			enhance.showHint("classifying");
-			const picked = await classifyDraft(ctx, resolved.model, redacted, ac);
-			if (stale()) {
+			const picked = await classifyDraft(
+				ctx,
+				resolved.model,
+				redacted,
+				ac,
+				canDispatch,
+			);
+			if (!canDispatch()) {
 				finishEnhance(enhance, ac);
 				return;
 			}
@@ -3094,7 +3133,11 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				);
 			}
 			mode = picked ?? "enhance";
-			request = buildEnhanceRequest(text, effective.enhanceSystemPrompt, mode);
+			request = buildEnhanceRequest(
+				text,
+				picked === undefined ? undefined : config.enhanceSystemPrompt,
+				mode,
+			);
 		}
 		enhance.showHint("enhancing", mode, auto);
 		if (stale()) {
@@ -3116,10 +3159,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			ac.abort();
 		}, ENHANCE_TIMEOUT_MS);
 		try {
-			resp = await completeSuggestion(host, ctx, resolved.model, context, {
-				signal: ac.signal,
-				reasoning: effective.thinking,
-			});
+			resp = await completeSuggestion(
+				host,
+				ctx,
+				resolved.model,
+				context,
+				{ signal: ac.signal, reasoning: config.thinking },
+				canDispatch,
+			);
 		} catch (err) {
 			if (!ac.signal.aborted)
 				ctx.ui.notify("next-prompt: enhance failed", "error");
@@ -3150,7 +3197,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
 			.map((c) => c.text)
 			.join("\n");
-		const trimmedReply = request.mode === "enhance" ? undefined : raw.trim();
+		const trimmedReply = raw.trim();
 		const echoesEditor = trimmedReply === text.trim();
 		const echoesBody = trimmedReply === request.body.trim();
 		const enhanced = sanitizeEnhancedPrompt(raw);
@@ -3163,9 +3210,9 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const rt = enhance.runtime;
 		const editorMatches = ctx.ui.getEditorText() === editorText;
 		if (enhanced.length > 0 && !unchanged && editorMatches) {
-			if (alreadyClear) {
+			if (alreadyClear && request.explicit) {
 				ctx.ui.setEditorText(request.body);
-			} else {
+			} else if (!alreadyClear) {
 				rt.enhanced = enhanced;
 				rt.mode = mode;
 				rt.showing = "enhanced";
@@ -3183,17 +3230,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				rt.mode = mode;
 			}
 			rt.results![mode] = alreadyClear ? null : enhanced;
-			if (!alreadyClear && rt.order) rt.cursor = rt.order.indexOf(mode);
+			if (step !== undefined && rt.order) rt.cursor = rt.order.indexOf(mode);
 		}
-		if (alreadyClear) {
-			ctx.ui.notify(
-				step
-					? `next-prompt: ${mode} found nothing to change`
-					: "next-prompt: prompt already clear",
-				"info",
-			);
+		if (alreadyClear && editorMatches && step === undefined) {
+			ctx.ui.notify("next-prompt: prompt already clear", "info");
 		}
 		finishEnhance(enhance, ac);
+		if (alreadyClear && editorMatches && step !== undefined) {
+			stepAutoCycle(state, enhance, editorText);
+		}
 	}
 
 	/**
@@ -3214,11 +3259,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		model: Model<Api>,
 		context: Context,
 		options: { signal?: AbortSignal; reasoning?: ThinkingLevel },
+		canDispatch?: () => boolean,
 	): Promise<AssistantMessage | undefined> {
 		if (hostKind === "pi") {
+			if (canDispatch && !canDispatch()) return undefined;
 			return ctx.modelRegistry.complete!(model, context, options);
 		}
 		const mod = await loadOmpCompletionModule();
+		if (options.signal?.aborted || (canDispatch && !canDispatch())) return undefined;
 		if (!mod.completeSimple) {
 			ctx.ui.notify(
 				"next-prompt: OMP completion API unavailable; suggestions disabled",

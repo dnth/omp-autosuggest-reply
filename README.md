@@ -14,11 +14,11 @@ wrap that turn's list; **Enter** fills the box without sending.
 
 ![Pi 0.84.1: after a turn settles, arrows cycle through three next-prompt suggestions and Enter fills the editor without sending](pi-demo.gif)
 
-**Enhance prompt — Oh My Pi (OMP)**
+**Earlier enhance toggle — Oh My Pi (OMP)**
 
 ![Oh My Pi: Ctrl+Up rewrites the typed prompt for clarity without changing its intent; Ctrl+Up or Esc restores the original](enhance.gif)
 
-**Enhance prompt — Pi**
+**Earlier enhance toggle — Pi**
 
 ![Pi 0.84.1: Ctrl+Up rewrites the typed prompt for clarity without changing its intent and toggles between the original and enhanced text](pi-enhance.gif)
 
