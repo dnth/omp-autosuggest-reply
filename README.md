@@ -96,12 +96,13 @@ not such an echo and survives.
 
 ## Enhance prompt
 
-Type a prompt, press **Ctrl+Up** (configurable `enhanceKey`, default `ctrl+up`), and
-next-prompt rewrites what's in the box for clarity **without changing your intent
-or meaning** — grammar, ambiguity, and structure only. The rewrite replaces the
-box in place; press **Ctrl+Up** again or **Esc** to revert to your original (cached,
-no extra model call), and Ctrl+Up once more to re-apply. Editing the box commits the
-current text and drops the revert.
+Type a prompt and press **Ctrl+Up** (configurable `enhanceKey`, default
+`ctrl+up`). By default, next-prompt rewrites it for clarity **without changing
+your intent or meaning**, focusing on grammar, ambiguity, and structure. A
+rewrite replaces the text in place. Press **Ctrl+Up** again or **Esc** to restore
+the original. After restoring with Ctrl+Up, press it once more to reapply the
+cached rewrite without another model call. Editing the box commits the current
+text and drops the revert.
 
 - Only the text you typed is sent — never the conversation transcript. Secrets
   are redacted first; since the original is always one keystroke away, redaction
@@ -115,10 +116,12 @@ current text and drops the revert.
 
 ### Sharpen and reframe modes
 
-Start the prompt with `/sharpen` or `/reframe`, then press **Ctrl+Up**. The prefix
-picks the mode; with no prefix you get the default clarity rewrite above, unchanged.
-The model receives the text after the prefix. After a rewrite, Ctrl+Up or
-**Esc** restores your original text, prefix included.
+At the very start of the editor text, type `/sharpen` or `/reframe` followed by
+a space or newline and your draft, then press **Ctrl+Up**. The enhancer strips
+the command and one separator before redacting and sending the draft. Reverting
+a cached rewrite restores the original with its prefix. If the model echoes
+just the draft body, the enhancer can remove the prefix without caching a
+rewrite.
 
 | Prefix | Use it when | Result |
 |---|---|---|
@@ -131,8 +134,9 @@ The model receives the text after the prefix. After a rewrite, Ctrl+Up or
 /reframe the settings page saves some fields right away and others only on submit, and people lose edits
 ```
 
-A prefix with nothing after it makes no model call. `enhanceSystemPrompt` overrides
-the default mode only. The two prompts are adapted from
+A prefix followed only by whitespace or nothing prompts you to add text and
+makes no model call. See the [config file settings](#config-file) for
+`enhanceSystemPrompt`. The two prompts are adapted from
 [pstack](https://github.com/backnotprop/pstack)'s `/sharpen` and `/reframe` skills
 (MIT, © 2026 Lauren Tan). pstack runs them inside an agent that can read your files
 and the web; here the model sees only the typed text, so `/reframe` cites no links
@@ -281,7 +285,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply configure`). Overrides the instruction for the default enhance mode (not `/sharpen` or `/reframe`); see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `enhanceSystemPrompt` | built-in | Config-file only. Overrides `ENHANCE_SYSTEM_PROMPT` for the default clarity rewrite. Sharpen and reframe use their own instructions. |
 
 ### Why `enter` is the default accept key
 
@@ -395,14 +399,10 @@ to the configured default, then installs at most one listener and editor.
    re-arms the last suggestion after `rearmDelayMs` (no new model call).
    Dismissing via Escape/up/down never re-arms, and typing invalidates any
    in-flight suggestion request.
-5. The enhance key (`enhanceKey`, default `ctrl+up`) is intercepted the same way,
-   but acts on a **non-empty** editor: it sends only the typed text (redacted)
-   after any mode prefix to the resolved model. Sharpen and reframe use their own
-   instructions. The default mode uses `enhanceSystemPrompt` when configured and
-   `ENHANCE_SYSTEM_PROMPT` otherwise. A rewrite replaces the editor text via
-   `ctx.ui.setEditorText`. The same key or Escape restores the cached original.
-   Editing commits the rewrite and drops the cache. The input generation and
-   original editor text guard against stale replies.
+5. The enhance key is intercepted the same way and uses the resolved model for
+   the selected [enhance mode](#enhance-prompt). A rewrite replaces the editor
+   text via `ctx.ui.setEditorText`. The input generation and original editor
+   text guard against stale replies.
 
 ## Develop
 

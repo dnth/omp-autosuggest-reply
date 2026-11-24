@@ -177,7 +177,7 @@ export interface NextPromptConfig {
 	 * empty editor; "enter"/"tab" are rejected (submit/autocomplete conflicts).
 	 */
 	suggestKey?: string;
-	/** System-prompt override for the enhance model (config-file only). */
+	/** System-prompt override resolved by `buildEnhanceRequest`. */
 	enhanceSystemPrompt?: string;
 }
 
@@ -245,7 +245,7 @@ export const DEFAULT_ENABLED = false;
 export const DEFAULT_AUTO_SUGGEST = true;
 /** Default keybinding that manually triggers suggestion compute. */
 export const DEFAULT_SUGGEST_KEY = "ctrl+down";
-/** Hard cap (code points) on an enhanced prompt written back to the editor. */
+/** Hard cap (code points) on a sanitized model rewrite. */
 const ENHANCE_MAX_CHARS = 4000;
 
 const MIN_REARM_DELAY = 50;
@@ -1962,9 +1962,7 @@ function buildSuggestionSystemPrompt(customPrompt: string | undefined): string {
 }
 
 /**
- * System prompt for the enhance-prompt feature. The model rewrites a single
- * user instruction for clarity WITHOUT changing meaning, intent, or scope, and
- * replies with only the rewritten instruction.
+ * Built-in system prompt for the default enhance mode.
  */
 export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a coding agent so it is clearer and more precise, WITHOUT changing its meaning, intent, or scope. Fix grammar, ambiguity, and structure only. Do NOT add new requirements, remove details, answer the request, or invent specifics (names, paths, versions) the user did not provide. You have no other context, so never resolve references the user left implicit — keep them as written. Preserve the user's language and any code, paths, or identifiers verbatim. Reply with ONLY the rewritten instruction: no quotes, no markdown, no code fences, no preamble, no explanation. If it is already clear, reply with it unchanged. If there is no instruction to rewrite, reply with the single word: NONE`;
 
@@ -1985,15 +1983,13 @@ export interface EnhanceRequest {
 	mode: EnhanceMode;
 	/** System prompt for this mode. */
 	systemPrompt: string;
-	/** Text sent to the model: the editor text without any mode prefix. */
+	/** Draft body before secret redaction. */
 	body: string;
 }
 
 /**
- * Pick the rewrite mode from the editor text. A leading `/sharpen` or
- * `/reframe` selects that mode and is stripped from the text sent to the
- * model; anything else is the default clarity rewrite, sent verbatim with the
- * (optionally overridden) default system prompt.
+ * Select a rewrite mode and extract its draft body. Consume only one separator
+ * (including CRLF) so any indentation on the first body line reaches the model.
  */
 export function buildEnhanceRequest(
 	text: string,
@@ -2864,10 +2860,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Rewrite the current editor text for clarity and replace it in place. Sends
-	 * only the typed text (redacted), never the transcript. Staleness is guarded
-	 * by the input generation and by requiring the editor to still hold exactly
-	 * what was sent before the result is applied.
+	 * Apply a reply only while the input generation and full editor draft still
+	 * match. Compare against the captured draft before prefix removal and redaction.
 	 */
 	async function maybeEnhance(ctx: HostCtx, rawText: string): Promise<void> {
 		if (!ref.state || !effective || !ref.enhance) return;
