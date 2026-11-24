@@ -4591,13 +4591,49 @@ describe("OMP lifecycle (agent_end)", () => {
 		expect(fake.calls.ompComplete).toHaveLength(1);
 	});
 
-	test("L7: second OMP agent_end while first is pending → first aborted, stale cannot render", async () => {
+	test("L7a: second OMP agent_end before dispatch → only the latest request reaches transport", async () => {
 		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
 		const handler = fake.handlers.get("agent_end")!;
 		const p1 = handler({}, fake.ctx);
 		const p2 = handler({}, fake.ctx);
 		await Promise.all([p1, p2]);
-		expect(fake.calls.ompComplete.some((c) => c.signal?.aborted)).toBe(true);
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.calls.ompComplete[0]?.signal?.aborted).toBe(false);
+		expect(fake.widgetContent?.[0]).toContain("suggestion");
+	});
+
+	test("L7b: second OMP agent_end after dispatch → first aborted, late reply cannot render", async () => {
+		const { fake } = await setupOmp({ branch: [assistantEntry("a")] });
+		let markFirstDispatched!: (signal: AbortSignal | undefined) => void;
+		const firstDispatched = new Promise<AbortSignal | undefined>((resolve) => {
+			markFirstDispatched = resolve;
+		});
+		let finishFirst!: (reply: AssistantMessage) => void;
+		const firstReply = new Promise<AssistantMessage>((resolve) => {
+			finishFirst = resolve;
+		});
+		let first = true;
+		setOmpCompletionModuleForTests(async () => ({
+			completeSimple: async (_model, _context, options) => {
+				if (first) {
+					first = false;
+					markFirstDispatched(options?.signal);
+					return firstReply;
+				}
+				return textReply("current suggestion") as AssistantMessage;
+			},
+		}));
+		const handler = fake.handlers.get("agent_end")!;
+		const pending = Promise.resolve(handler({}, fake.ctx));
+		const signal = await Promise.race([firstDispatched, pending.then(() => undefined)]);
+		expect(signal?.aborted).toBe(false);
+		await handler({}, fake.ctx);
+		expect(signal?.aborted).toBe(true);
+		expect(fake.widgetContent?.[0]).toContain("current suggestion");
+
+		finishFirst(textReply("stale suggestion") as AssistantMessage);
+		await pending;
+		expect(fake.widgetContent?.[0]).toContain("current suggestion");
 	});
 
 	test("L6b: OMP compute-path render does NOT require real-time idle (session unwinds after agent_end)", async () => {
