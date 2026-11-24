@@ -1974,12 +1974,12 @@ export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a codi
 // replaces the editor, so the prompts are reworded for a single rewrite call.
 
 /** /sharpen: make the task deeper, not bigger, then rewrite the prompt. */
-export const SHARPEN_SYSTEM_PROMPT = `You rewrite a prompt that the user will send to a coding agent. Make the task deeper, not bigger: keep the user's goal and scope, but ask for it the way a top professional in the field would approach it. First work out, silently: (1) what such a professional would do here that the user did not ask for; (2) the rawest primary material they would start from, instead of material already digested for the user; (3) the specific methods and tools they would use; (4) what, other than the user or the agent, would show the result is right (a test, a measurement, a reference implementation, a spec, an independent check). Then write the prompt so it asks for exactly that. The prompt must ask the agent to prototype any choice an experiment can settle and to recommend an option based on what it observed. Product or preference choices that no experiment can settle stay with the user: say they are the user's to decide. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts; where a method depends on something that can be looked up, tell the agent to look it up. Preserve the user's language and any code, paths, or identifiers verbatim. Do not do the task or answer it. Keep the result short, at most three times the original length and never over 1500 characters. Reply with ONLY the rewritten prompt: no quotes, no markdown fences, no preamble, no explanation of the four points. If there is no instruction to rewrite, reply with the single word: NONE`;
+export const SHARPEN_SYSTEM_PROMPT = `You rewrite a prompt that the user will send to a coding agent. Make the task deeper, not bigger: keep the user's goal and scope, but ask for it the way a top professional in the field would approach it. First work out, silently: (1) what such a professional would do here that the user did not ask for; (2) the rawest primary material they would start from, instead of material already digested for the user; (3) the specific methods and tools they would use; (4) what, other than the user or the agent, would show the result is right (a test, a measurement, a reference implementation, a spec, an independent check). Then write the prompt so it asks for exactly that. The prompt must ask the agent to prototype any choice an experiment can settle and to recommend an option based on what it observed. Product or preference choices that no experiment can settle stay with the user: say they are the user's to decide. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts; where a method depends on something that can be looked up, tell the agent to look it up. Preserve the user's language and any code, paths, or identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten prompt: no quotes, no markdown fences, no preamble, no explanation of the four points. If there is no instruction to rewrite, reply with the single word: NONE`;
 
 /** /reframe: give the user the expert words for what they describe, then rewrite it with them. */
-export const REFRAME_SYSTEM_PROMPT = `The user describes something they are building or a problem they have, and may not know the expert words for it. Rewrite their description using those words. First work out, silently: (1) whether the description could name more than one underlying problem; if so, list two or three, each with the one term that names it and the sign that would tell it from the others, and pick the likeliest; (2) the established terms (techniques, patterns, named problems) practitioners use for it, ranked by how much each would change what gets built; (3) two or three neighboring fields that solved the same shape of problem under other names, which terms carry over, and where the analogy breaks; (4) what the user did not mention but should care about. Then write the description anew in the user's voice: name the problem with the expert terms first, use the terms where they apply, and say what to ask the agent for. Use only terms you are sure are real and used this way. Do not cite papers, projects or links. If another reading of the description is plausible, add one short clause naming it so the agent can check. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts about it. Preserve the user's code, paths, and identifiers verbatim. Do not do the task or answer it. Keep the result short, at most three times the original length and never over 1500 characters. Reply with ONLY the rewritten description: no quotes, no markdown fences, no preamble, no glossary or list of terms. If there is nothing to rewrite, reply with the single word: NONE`;
+export const REFRAME_SYSTEM_PROMPT = `The user describes something they are building or a problem they have, and may not know the expert words for it. Rewrite their description using those words. First work out, silently: (1) whether the description could name more than one underlying problem; if so, list two or three, each with the one term that names it and the sign that would tell it from the others, and pick the likeliest; (2) the established terms (techniques, patterns, named problems) practitioners use for it, ranked by how much each would change what gets built; (3) two or three neighboring fields that solved the same shape of problem under other names, which terms carry over, and where the analogy breaks; (4) what the user did not mention but should care about. Then write the description anew in the user's voice: name the problem with the expert terms first, use the terms where they apply, and say what to ask the agent for. Use only terms you are sure are real and used this way. Do not cite papers, projects or links. If another reading of the description is plausible, add one short clause naming it so the agent can check. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts about it. Preserve the user's code, paths, and identifiers verbatim. Do not do the task or answer it. Reply with ONLY the rewritten description: no quotes, no markdown fences, no preamble, no glossary or list of terms. If there is nothing to rewrite, reply with the single word: NONE`;
 
-const ENHANCE_MODE_PREFIX = /^\s*\/(sharpen|reframe)(?=\s|$)\s*([\s\S]*)$/;
+const ENHANCE_MODE_PREFIX = /^\/(sharpen|reframe)(?=\s|$)(?:\r\n|\s)?/;
 
 export interface EnhanceRequest {
 	mode: EnhanceMode;
@@ -2011,7 +2011,7 @@ export function buildEnhanceRequest(
 	return {
 		mode,
 		systemPrompt: mode === "sharpen" ? SHARPEN_SYSTEM_PROMPT : REFRAME_SYSTEM_PROMPT,
-		body: m[2]!.trim(),
+		body: text.slice(m[0].length),
 	};
 }
 
@@ -2877,7 +2877,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const text = rawText;
 		if (text.trim().length === 0) return;
 		const request = buildEnhanceRequest(text, effective.enhanceSystemPrompt);
-		if (request.body.length === 0) {
+		if (request.body.trim().length === 0) {
 			ctx.ui.notify(
 				`next-prompt: type your prompt after /${request.mode}`,
 				"info",
@@ -2965,23 +2965,28 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			.map((c) => c.text)
 			.join("\n");
 		const enhanced = sanitizeEnhancedPrompt(raw);
-		if (
-			enhanced.length > 0 &&
-			enhanced !== request.body &&
-			ctx.ui.getEditorText() === text
-		) {
-			enhance.runtime.enhanced = enhanced;
-			enhance.runtime.showing = "enhanced";
-			enhance.runtime.pending = false;
-			ctx.ui.setEditorText(enhanced);
-			enhance.showHint("enhanced", request.mode);
-		} else {
-			if (enhanced.length === 0 || enhanced === request.body) {
-				ctx.ui.notify("next-prompt: prompt already clear", "info");
+		const unchanged =
+			enhanced === text || (request.mode !== "enhance" && raw === text);
+		const alreadyClear =
+			enhanced.length === 0 ||
+			unchanged ||
+			enhanced === request.body ||
+			(request.mode !== "enhance" && raw === request.body);
+		if (enhanced.length > 0 && !unchanged && ctx.ui.getEditorText() === text) {
+			if (alreadyClear) {
+				ctx.ui.setEditorText(enhanced);
+			} else {
+				enhance.runtime.enhanced = enhanced;
+				enhance.runtime.showing = "enhanced";
+				enhance.runtime.pending = false;
+				ctx.ui.setEditorText(enhanced);
+				enhance.showHint("enhanced", request.mode);
 			}
-			finishEnhance(enhance, ac);
 		}
-		if (ref.enhanceInflight === ac) ref.enhanceInflight = undefined;
+		if (alreadyClear) {
+			ctx.ui.notify("next-prompt: prompt already clear", "info");
+		}
+		finishEnhance(enhance, ac);
 	}
 
 	/**

@@ -32,9 +32,6 @@ import {
 	buildMessages,
 	buildTranscript,
 	buildEnhanceRequest,
-	ENHANCE_SYSTEM_PROMPT,
-	REFRAME_SYSTEM_PROMPT,
-	SHARPEN_SYSTEM_PROMPT,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
 	DEFAULT_AUTO_SUGGEST,
@@ -5356,31 +5353,20 @@ describe("enhance key handling (onTerminalInput)", () => {
 });
 
 describe("enhance modes (/sharpen, /reframe prefix)", () => {
-	test("EM1: no prefix selects the default mode, text and prompt unchanged", () => {
+	test("EM1: no prefix selects the default mode and preserves the text", () => {
 		const req = buildEnhanceRequest("fix teh parser bug");
-		expect(req).toEqual({
-			mode: "enhance",
-			systemPrompt: ENHANCE_SYSTEM_PROMPT,
-			body: "fix teh parser bug",
-		});
-		// enhanceSystemPrompt config still overrides the default mode only.
+		expect(req.mode).toBe("enhance");
+		expect(req.body).toBe("fix teh parser bug");
 		expect(buildEnhanceRequest("x", "custom").systemPrompt).toBe("custom");
 	});
 
-	test("EM2: /sharpen and /reframe pick their prompt and strip the prefix", () => {
-		const sharpen = buildEnhanceRequest("/sharpen write a migration guide", "custom");
-		expect(sharpen).toEqual({
-			mode: "sharpen",
-			systemPrompt: SHARPEN_SYSTEM_PROMPT,
-			body: "write a migration guide",
-		});
-		const reframe = buildEnhanceRequest("  /reframe\nsettings lose edits");
-		expect(reframe).toEqual({
-			mode: "reframe",
-			systemPrompt: REFRAME_SYSTEM_PROMPT,
-			body: "settings lose edits",
-		});
-		expect(SHARPEN_SYSTEM_PROMPT).not.toBe(REFRAME_SYSTEM_PROMPT);
+	test("EM2: strip a single separator and preserve the remaining body", () => {
+		const sharpen = buildEnhanceRequest("/sharpen  write a migration guide ");
+		expect(sharpen.mode).toBe("sharpen");
+		expect(sharpen.body).toBe(" write a migration guide ");
+		const reframe = buildEnhanceRequest("/reframe\r\n\tsettings lose edits\n");
+		expect(reframe.mode).toBe("reframe");
+		expect(reframe.body).toBe("\tsettings lose edits\n");
 	});
 
 	test("EM3: only a whole leading word selects a mode", () => {
@@ -5389,13 +5375,15 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 			"please /sharpen this",
 			"/sharpen-x foo",
 			"/Sharpen foo",
+			" /sharpen write a migration guide",
+			"\n  /reframe\nsettings lose edits",
 		]) {
 			const req = buildEnhanceRequest(text);
 			expect(req.mode).toBe("enhance");
 			expect(req.body).toBe(text);
 		}
 		expect(buildEnhanceRequest("/sharpen").body).toBe("");
-		expect(buildEnhanceRequest("/reframe   ").body).toBe("");
+		expect(buildEnhanceRequest("/reframe   ").body).toBe("  ");
 	});
 
 	test("EM4: /sharpen sends the sharpen prompt with the prefix stripped, toggles back to the prefixed original", async () => {
@@ -5405,28 +5393,43 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 				stopReason: "stop",
 			},
 		});
-		fake.setEditorText("/sharpen write a migration guide");
+		const original = "/sharpen\n\twrite a migration guide\nfrom the v2 schema  ";
+		fake.setEditorText(original);
 		fake.inputHandler!(ENHANCE_KEY);
 		expect(fake.widgetContent?.[0] ?? "").toContain("sharpening");
 		await sleep(30);
 		expect(fake.calls.complete).toHaveLength(1);
 		const call = fake.calls.complete[0]!;
-		expect(String(call.systemPrompt)).toBe(SHARPEN_SYSTEM_PROMPT);
-		expect(JSON.stringify(call.messages)).toContain("write a migration guide");
-		expect(JSON.stringify(call.messages)).not.toContain("/sharpen");
+		expect(call.systemPrompt).toContain("professional");
+		expect(call.systemPrompt).toContain("methods and tools");
+		expect(call.systemPrompt).toContain("independent check");
+		expect(call.systemPrompt).toMatch(/prototype .* an experiment can settle/);
+		expect(call.systemPrompt).not.toContain("another reading");
+		expect(call.messages).toEqual([
+			{
+				role: "user",
+				content: [{ type: "text", text: "\twrite a migration guide\nfrom the v2 schema  " }],
+				timestamp: expect.any(Number),
+			},
+		]);
 		expect(fake.editorText).toBe(
 			"Write the v2 config migration guide from the real v1/v2 schemas.",
 		);
 		expect(fake.widgetContent?.[0] ?? "").toContain("sharpened");
 		fake.inputHandler!(ENHANCE_KEY);
-		expect(fake.editorText).toBe("/sharpen write a migration guide");
+		expect(fake.editorText).toBe(original);
 		expect(fake.widgetContent?.[0] ?? "").toContain("re-sharpen");
 		expect(fake.calls.complete).toHaveLength(1);
 	});
 
 	test("EM5: /reframe sends the reframe prompt and Esc restores the prefixed original", async () => {
-		const { fake } = await setup({
-			completeResult: {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ enhanceSystemPrompt: "custom default instruction" }),
+		);
+		const { fake } = await setupOmp({
+			completeSimpleResult: {
 				content: [{ type: "text", text: "Fix lost edits from mixed autosave and submit-on-save (optimistic UI)." }],
 				stopReason: "stop",
 			},
@@ -5434,9 +5437,23 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		fake.setEditorText("/reframe settings page loses edits");
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
-		const call = fake.calls.complete[0]!;
-		expect(String(call.systemPrompt)).toBe(REFRAME_SYSTEM_PROMPT);
-		expect(JSON.stringify(call.messages)).toContain("settings page loses edits");
+		expect(fake.calls.ompComplete).toHaveLength(1);
+		const call = fake.calls.ompComplete[0]!;
+		expect(call.systemPrompt).toEqual([expect.any(String)]);
+		const prompt = call.systemPrompt![0];
+		expect(prompt).toContain("name the problem with the expert terms");
+		expect(prompt).toContain("another reading");
+		expect(prompt).not.toContain("independent check");
+		expect(call.messages).toEqual([
+			{
+				role: "user",
+				content: [{ type: "text", text: "settings page loses edits" }],
+				timestamp: expect.any(Number),
+			},
+		]);
+		expect(fake.editorText).toBe(
+			"Fix lost edits from mixed autosave and submit-on-save (optimistic UI).",
+		);
 		expect(fake.widgetContent?.[0] ?? "").toContain("reframed");
 		fake.inputHandler!("\x1b");
 		expect(fake.editorText).toBe("/reframe settings page loses edits");
@@ -5451,6 +5468,56 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		expect(fake.editorText).toBe("/sharpen");
 		expect(fake.calls.notifies.some(([m]) => m.includes("after /sharpen"))).toBe(true);
 	});
+
+	test("EM7: whitespace after a prefix makes no model call", async () => {
+		const { fake } = await setup({});
+		fake.setEditorText("/reframe\n\t ");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(20);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.editorText).toBe("/reframe\n\t ");
+	});
+
+	test("EM8: a stripped-body echo removes the prefix without caching a rewrite", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Write the migration guide" }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("/sharpen Write the migration guide");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("Write the migration guide");
+		expect(fake.calls.notifies).toContainEqual([
+			"next-prompt: prompt already clear",
+			"info",
+		]);
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(2);
+		expect(fake.editorText).toBe("Write the migration guide");
+	});
+
+	for (const reply of ["/reframe\nsettings page loses edits  ", "NONE"]) {
+		test(`EM9: a full-editor echo or NONE keeps the original (${JSON.stringify(reply)})`, async () => {
+			const { fake } = await setup({
+				completeResult: {
+					content: [{ type: "text", text: reply }],
+					stopReason: "stop",
+				},
+			});
+			const original = "/reframe\nsettings page loses edits  ";
+			fake.setEditorText(original);
+			fake.inputHandler!(ENHANCE_KEY);
+			await sleep(30);
+			expect(fake.editorText).toBe(original);
+			expect(fake.calls.notifies).toContainEqual([
+				"next-prompt: prompt already clear",
+				"info",
+			]);
+		});
+	}
 });
 
 describe("enhance key encoding under enhanced keyboard protocols", () => {

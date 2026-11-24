@@ -117,14 +117,14 @@ current text and drops the revert.
 
 Start the prompt with `/sharpen` or `/reframe`, then press **Ctrl+Up**. The prefix
 picks the mode; with no prefix you get the default clarity rewrite above, unchanged.
-The prefix is not sent to the model, and Ctrl+Up / **Esc** restore your original
-text, prefix included.
+The model receives the text after the prefix. After a rewrite, Ctrl+Up or
+**Esc** restores your original text, prefix included.
 
 | Prefix | Use it when | Result |
 |---|---|---|
 | *(none)* | the request is clear but sloppy | same meaning, cleaner wording |
 | `/sharpen <prompt>` | you know what you want and want a better prompt | same goal, deeper: what a top professional would also do, the raw material they would start from, their methods and tools, and an outside check that the result is right. Asks the agent to prototype what an experiment can settle and leaves preference calls to you |
-| `/reframe <description>` | you can't name what you're after | the description rewritten in expert terms: it names the problem, ranks the terms that would change what gets built, borrows terms from neighboring fields, and flags another plausible reading |
+| `/reframe <description>` | you can't name what you're after | a rewritten description that names the problem in expert terms and adds a short clause for another plausible reading when the description is ambiguous |
 
 ```text
 /sharpen write a migration guide for the v2 config format
@@ -397,10 +397,12 @@ to the configured default, then installs at most one listener and editor.
    in-flight suggestion request.
 5. The enhance key (`enhanceKey`, default `ctrl+up`) is intercepted the same way,
    but acts on a **non-empty** editor: it sends only the typed text (redacted)
-   to the resolved model with `ENHANCE_SYSTEM_PROMPT`, then replaces the box with
-   the rewrite via `ctx.ui.setEditorText`. The same key or Escape restores the
-   cached original; editing commits and drops the cache. Staleness is guarded by
-   the input generation and by requiring the editor to still hold the sent text.
+   after any mode prefix to the resolved model. Sharpen and reframe use their own
+   instructions. The default mode uses `enhanceSystemPrompt` when configured and
+   `ENHANCE_SYSTEM_PROMPT` otherwise. A rewrite replaces the editor text via
+   `ctx.ui.setEditorText`. The same key or Escape restores the cached original.
+   Editing commits the rewrite and drops the cache. The input generation and
+   original editor text guard against stale replies.
 
 ## Develop
 
