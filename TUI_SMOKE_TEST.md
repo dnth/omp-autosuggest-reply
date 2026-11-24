@@ -105,11 +105,16 @@ Run each sequence in `widget`, `ghost`, and `both`:
 
 ### Enhance prompt (default key `Ctrl+Up`)
 
-- [ ] Type a prompt, press Ctrl+Up: the box is replaced by a clearer rewrite with
-  the same meaning; a below-editor `↳ enhanced (Ctrl-Up · Esc to revert)` hint
-  shows; exactly one model call.
-- [ ] Press Ctrl+Up again → original text restored (`↳ original`); Ctrl+Up once
-  more → enhanced text restored; NO additional model call on either toggle.
+- [ ] Press Ctrl+Up with an unprefixed draft. Expect `↑ choosing mode…`, then
+  a mode-specific progress hint, and two model calls (classify, rewrite).
+  For a rewrite, expect a hint naming the mode with the next action.
+  For an unchanged result, expect the draft to stay in place with the hint
+  `↑ <mode>: nothing to change`. Use a draft that yields a rewrite to check the
+  cycle below.
+- [ ] Press Ctrl+Up again on the same draft → the next mode's rewrite of the
+  original (not of the previous rewrite); after the last mode → original text
+  restored (`↑ original`); once more → the first rewrite replayed from cache with
+  NO model call.
 - [ ] Press Esc while enhanced → original restored, hint cleared.
 - [ ] Edit the box after enhancing → the revert hint clears and Ctrl+Up starts a
   fresh rewrite of the edited text.
@@ -117,11 +122,15 @@ Run each sequence in `widget`, `ghost`, and `both`:
   rewrites even while the agent is running.
 - [ ] Submit the enhanced prompt → it sends normally; an in-flight rewrite is
   aborted by submit/new turn/agent start with no stale replacement.
-- [ ] Only the typed line is sent (verify no transcript in the request); a
-  cross-destination enhance model follows `allowCrossProvider` without a
-  separate dialog.
+- [ ] Inspect both enhancement requests for the [draft-only disclosure
+  described in the README](README.md#enhance-prompt). Confirm a cross-destination
+  enhance model follows `allowCrossProvider` without a separate dialog.
 - [ ] `"enhanceEnabled": false` disables the key (falls through to the editor);
   `"enhanceKey": "enter"`/`"tab"` is rejected with a warning.
+- [ ] Type `/sharpen <prompt>`, `/reframe <description>`, or `/enhance <prompt>`
+  and press Ctrl+Up: no classification call; the hint names the mode; the box
+  holds a rewrite without the prefix; Ctrl+Up toggles the original (with the
+  prefix) and Esc restores it; a bare `/sharpen` makes no model call.
 
 ## OMP smoke cases
 
@@ -151,10 +160,10 @@ checks.
   enhancement use the configured model without a dialog; with `false`, they
   silently use the active model.
 - [ ] Widget renders correctly at narrow and wide terminal sizes; no overflow.
-- [ ] Enhance prompt before and after `/new`: type a prompt, press Ctrl+Up →
-  box replaced by a clearer rewrite (one `completeSimple` call, only the typed
-  text sent); Ctrl+Up or Esc revert to the original with no extra call; disabled
-  cleanly with `"enhanceEnabled": false`.
+- [ ] Repeat the unprefixed [Enhance prompt](#enhance-prompt-default-key-ctrlup)
+  call and Esc checks before and after `/new`. Use a draft that yields a rewrite
+  and verify both requests go through `completeSimple`. Repeat the disabled-key
+  check as well.
 
 ## Record
 

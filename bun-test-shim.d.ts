@@ -24,6 +24,7 @@ declare module "bun:test" {
 		toBeFalse(): void;
 		toContain(s: string): void;
 		toContainEqual(item: unknown): void;
+		toMatch(expected: string | RegExp): void;
 		not: {
 			toBe(expected: T): void;
 			toEqual(expected: unknown): void;
@@ -38,6 +39,11 @@ declare module "bun:test" {
 			toContainEqual(item: unknown): void;
 		};
 	};
+	export namespace expect {
+		function any(
+			constructor: ((...args: never[]) => unknown) | (new (...args: never[]) => unknown),
+		): unknown;
+	}
 	export function beforeEach(fn: () => void): void;
 	export function afterEach(fn: () => void): void;
 	export function mock<T extends (...args: never[]) => unknown>(fn: T): T;
