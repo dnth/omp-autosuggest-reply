@@ -1729,6 +1729,9 @@ function scheduleRearmCheck(
 
 export type EnhanceHintKind = "enhancing" | "enhanced" | "original";
 
+/** Rewrite style: default clarity pass, or a pstack-derived /sharpen or /reframe. */
+export type EnhanceMode = "enhance" | "sharpen" | "reframe";
+
 /** Which of the two texts the editor holds, and whether a rewrite is in flight. */
 export interface EnhanceRuntime {
 	/** The user's text before the last enhance (for revert). */
@@ -1736,6 +1739,8 @@ export interface EnhanceRuntime {
 	/** The last enhanced result (cached so toggling never re-calls the model). */
 	enhanced?: string;
 	showing: "none" | "enhanced" | "original";
+	/** Mode of the last rewrite, so hints name it. */
+	mode?: EnhanceMode;
 	pending: boolean;
 }
 
@@ -1747,7 +1752,7 @@ export interface EnhanceController {
 	/** Kick off an async rewrite of `text` (fire-and-forget). */
 	trigger: (text: string) => void;
 	/** Publish (or clear, with undefined) the below-editor enhance hint. */
-	showHint: (kind: EnhanceHintKind | undefined) => void;
+	showHint: (kind: EnhanceHintKind | undefined, mode?: EnhanceMode) => void;
 	/** Abort an in-flight rewrite. */
 	abort: () => void;
 }
@@ -1755,6 +1760,7 @@ export interface EnhanceController {
 export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
 	rt.original = undefined;
 	rt.enhanced = undefined;
+	rt.mode = undefined;
 	rt.showing = "none";
 	rt.pending = false;
 }
@@ -1778,7 +1784,7 @@ export function handleEnhanceKey(
 	) {
 		state.setEditorText(rt.original);
 		rt.showing = "original";
-		enhance.showHint("original");
+		enhance.showHint("original", rt.mode);
 		return;
 	}
 	if (
@@ -1789,7 +1795,7 @@ export function handleEnhanceKey(
 	) {
 		state.setEditorText(rt.enhanced);
 		rt.showing = "enhanced";
-		enhance.showHint("enhanced");
+		enhance.showHint("enhanced", rt.mode);
 		return;
 	}
 	if (text.trim().length === 0) return;
@@ -1961,6 +1967,53 @@ function buildSuggestionSystemPrompt(customPrompt: string | undefined): string {
  * replies with only the rewritten instruction.
  */
 export const ENHANCE_SYSTEM_PROMPT = `You rewrite a single instruction to a coding agent so it is clearer and more precise, WITHOUT changing its meaning, intent, or scope. Fix grammar, ambiguity, and structure only. Do NOT add new requirements, remove details, answer the request, or invent specifics (names, paths, versions) the user did not provide. You have no other context, so never resolve references the user left implicit — keep them as written. Preserve the user's language and any code, paths, or identifiers verbatim. Reply with ONLY the rewritten instruction: no quotes, no markdown, no code fences, no preamble, no explanation. If it is already clear, reply with it unchanged. If there is no instruction to rewrite, reply with the single word: NONE`;
+
+// Adapted from pstack's /sharpen and /reframe skills (MIT, (c) 2026 Lauren Tan;
+// https://github.com/backnotprop/pstack). pstack runs them inside an agent with
+// the repo and web; here the model sees only the typed text and its reply
+// replaces the editor, so the prompts are reworded for a single rewrite call.
+
+/** /sharpen: make the task deeper, not bigger, then rewrite the prompt. */
+export const SHARPEN_SYSTEM_PROMPT = `You rewrite a prompt that the user will send to a coding agent. Make the task deeper, not bigger: keep the user's goal and scope, but ask for it the way a top professional in the field would approach it. First work out, silently: (1) what such a professional would do here that the user did not ask for; (2) the rawest primary material they would start from, instead of material already digested for the user; (3) the specific methods and tools they would use; (4) what, other than the user or the agent, would show the result is right (a test, a measurement, a reference implementation, a spec, an independent check). Then write the prompt so it asks for exactly that. The prompt must ask the agent to prototype any choice an experiment can settle and to recommend an option based on what it observed. Product or preference choices that no experiment can settle stay with the user: say they are the user's to decide. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts; where a method depends on something that can be looked up, tell the agent to look it up. Preserve the user's language and any code, paths, or identifiers verbatim. Do not do the task or answer it. Keep the result short, at most three times the original length and never over 1500 characters. Reply with ONLY the rewritten prompt: no quotes, no markdown fences, no preamble, no explanation of the four points. If there is no instruction to rewrite, reply with the single word: NONE`;
+
+/** /reframe: give the user the expert words for what they describe, then rewrite it with them. */
+export const REFRAME_SYSTEM_PROMPT = `The user describes something they are building or a problem they have, and may not know the expert words for it. Rewrite their description using those words. First work out, silently: (1) whether the description could name more than one underlying problem; if so, list two or three, each with the one term that names it and the sign that would tell it from the others, and pick the likeliest; (2) the established terms (techniques, patterns, named problems) practitioners use for it, ranked by how much each would change what gets built; (3) two or three neighboring fields that solved the same shape of problem under other names, which terms carry over, and where the analogy breaks; (4) what the user did not mention but should care about. Then write the description anew in the user's voice: name the problem with the expert terms first, use the terms where they apply, and say what to ask the agent for. Use only terms you are sure are real and used this way. Do not cite papers, projects or links. If another reading of the description is plausible, add one short clause naming it so the agent can check. You know nothing about the user's project beyond this text, so never invent names, paths, versions, numbers or facts about it. Preserve the user's code, paths, and identifiers verbatim. Do not do the task or answer it. Keep the result short, at most three times the original length and never over 1500 characters. Reply with ONLY the rewritten description: no quotes, no markdown fences, no preamble, no glossary or list of terms. If there is nothing to rewrite, reply with the single word: NONE`;
+
+const ENHANCE_MODE_PREFIX = /^\s*\/(sharpen|reframe)(?=\s|$)\s*([\s\S]*)$/;
+
+export interface EnhanceRequest {
+	mode: EnhanceMode;
+	/** System prompt for this mode. */
+	systemPrompt: string;
+	/** Text sent to the model: the editor text without any mode prefix. */
+	body: string;
+}
+
+/**
+ * Pick the rewrite mode from the editor text. A leading `/sharpen` or
+ * `/reframe` selects that mode and is stripped from the text sent to the
+ * model; anything else is the default clarity rewrite, sent verbatim with the
+ * (optionally overridden) default system prompt.
+ */
+export function buildEnhanceRequest(
+	text: string,
+	defaultSystemPrompt?: string,
+): EnhanceRequest {
+	const m = ENHANCE_MODE_PREFIX.exec(text);
+	if (!m) {
+		return {
+			mode: "enhance",
+			systemPrompt: defaultSystemPrompt ?? ENHANCE_SYSTEM_PROMPT,
+			body: text,
+		};
+	}
+	const mode = m[1] as "sharpen" | "reframe";
+	return {
+		mode,
+		systemPrompt: mode === "sharpen" ? SHARPEN_SYSTEM_PROMPT : REFRAME_SYSTEM_PROMPT,
+		body: m[2]!.trim(),
+	};
+}
 
 // ---------------------------------------------------------------------------
 // Ghost editor (inline overlay mode — renderMode: "ghost")
@@ -2369,17 +2422,25 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		// Enhance-prompt controller: shares suggestion-model resolution. Disabled
 		// when the privacy config failed closed.
 		const enhanceKeyValue = effective.enhanceKey ?? DEFAULT_ENHANCE_KEY;
-		const showEnhanceHint = (kind: EnhanceHintKind | undefined) => {
+		const showEnhanceHint = (
+			kind: EnhanceHintKind | undefined,
+			mode: EnhanceMode = "enhance",
+		) => {
 			if (kind === undefined) {
 				publishWidget(undefined);
 				return;
 			}
 			const key = humanizeKey(enhanceKeyValue);
+			const verb = {
+				enhance: ["enhancing", "enhanced", "re-enhance"],
+				sharpen: ["sharpening", "sharpened", "re-sharpen"],
+				reframe: ["reframing", "reframed", "re-reframe"],
+			}[mode];
 			let line: string;
-			if (kind === "enhancing") line = `${DIM}↳ enhancing prompt…${RESET}`;
+			if (kind === "enhancing") line = `${DIM}↳ ${verb[0]} prompt…${RESET}`;
 			else if (kind === "enhanced")
-				line = `${ACCENT}↳ enhanced${RESET}${DIM}  (${key} · Esc to revert)${RESET}`;
-			else line = `${ACCENT}↳ original${RESET}${DIM}  (${key} to re-enhance)${RESET}`;
+				line = `${ACCENT}↳ ${verb[1]}${RESET}${DIM}  (${key} · Esc to revert)${RESET}`;
+			else line = `${ACCENT}↳ original${RESET}${DIM}  (${key} to ${verb[2]})${RESET}`;
 			publishWidget([line]);
 		};
 		const enhance: EnhanceController = {
@@ -2815,6 +2876,14 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		if (!enhance.enabled) return;
 		const text = rawText;
 		if (text.trim().length === 0) return;
+		const request = buildEnhanceRequest(text, effective.enhanceSystemPrompt);
+		if (request.body.length === 0) {
+			ctx.ui.notify(
+				`next-prompt: type your prompt after /${request.mode}`,
+				"info",
+			);
+			return;
+		}
 
 		ref.enhanceInflight?.abort();
 		const ac = new AbortController();
@@ -2830,9 +2899,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 
 		enhance.runtime.pending = true;
 		enhance.runtime.original = text;
-		enhance.showHint("enhancing");
+		enhance.runtime.mode = request.mode;
+		enhance.showHint("enhancing", request.mode);
 
-		const redacted = redactSecrets(text);
+		const redacted = redactSecrets(request.body);
 		if (
 			ac.signal.aborted ||
 			ref.state !== state ||
@@ -2842,7 +2912,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const systemPrompt = effective.enhanceSystemPrompt ?? ENHANCE_SYSTEM_PROMPT;
+		const systemPrompt = request.systemPrompt;
 		const context = {
 			systemPrompt: host === "omp" ? [systemPrompt] : systemPrompt,
 			messages: buildMessages(redacted),
@@ -2897,16 +2967,16 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const enhanced = sanitizeEnhancedPrompt(raw);
 		if (
 			enhanced.length > 0 &&
-			enhanced !== text &&
+			enhanced !== request.body &&
 			ctx.ui.getEditorText() === text
 		) {
 			enhance.runtime.enhanced = enhanced;
 			enhance.runtime.showing = "enhanced";
 			enhance.runtime.pending = false;
 			ctx.ui.setEditorText(enhanced);
-			enhance.showHint("enhanced");
+			enhance.showHint("enhanced", request.mode);
 		} else {
-			if (enhanced.length === 0 || enhanced === text) {
+			if (enhanced.length === 0 || enhanced === request.body) {
 				ctx.ui.notify("next-prompt: prompt already clear", "info");
 			}
 			finishEnhance(enhance, ac);

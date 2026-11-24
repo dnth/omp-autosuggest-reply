@@ -122,6 +122,10 @@ Run each sequence in `widget`, `ghost`, and `both`:
   separate dialog.
 - [ ] `"enhanceEnabled": false` disables the key (falls through to the editor);
   `"enhanceKey": "enter"`/`"tab"` is rejected with a warning.
+- [ ] Type `/sharpen <prompt>` or `/reframe <description>` and press Ctrl+Up: the
+  hint reads `↳ sharpening prompt…` / `↳ reframing prompt…` then `↳ sharpened` /
+  `↳ reframed`; the box holds a rewrite without the prefix; Ctrl+Up or Esc
+  restores the text with the prefix; a bare `/sharpen` makes no model call.
 
 ## OMP smoke cases
 

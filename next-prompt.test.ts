@@ -31,6 +31,10 @@ import type { Api, AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	buildMessages,
 	buildTranscript,
+	buildEnhanceRequest,
+	ENHANCE_SYSTEM_PROMPT,
+	REFRAME_SYSTEM_PROMPT,
+	SHARPEN_SYSTEM_PROMPT,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
 	DEFAULT_AUTO_SUGGEST,
@@ -5348,6 +5352,104 @@ describe("enhance key handling (onTerminalInput)", () => {
 		await sleep(30);
 		expect(fake.calls.ompComplete).toHaveLength(1);
 		expect(fake.editorText).toBe("Fix the parser bug.");
+	});
+});
+
+describe("enhance modes (/sharpen, /reframe prefix)", () => {
+	test("EM1: no prefix selects the default mode, text and prompt unchanged", () => {
+		const req = buildEnhanceRequest("fix teh parser bug");
+		expect(req).toEqual({
+			mode: "enhance",
+			systemPrompt: ENHANCE_SYSTEM_PROMPT,
+			body: "fix teh parser bug",
+		});
+		// enhanceSystemPrompt config still overrides the default mode only.
+		expect(buildEnhanceRequest("x", "custom").systemPrompt).toBe("custom");
+	});
+
+	test("EM2: /sharpen and /reframe pick their prompt and strip the prefix", () => {
+		const sharpen = buildEnhanceRequest("/sharpen write a migration guide", "custom");
+		expect(sharpen).toEqual({
+			mode: "sharpen",
+			systemPrompt: SHARPEN_SYSTEM_PROMPT,
+			body: "write a migration guide",
+		});
+		const reframe = buildEnhanceRequest("  /reframe\nsettings lose edits");
+		expect(reframe).toEqual({
+			mode: "reframe",
+			systemPrompt: REFRAME_SYSTEM_PROMPT,
+			body: "settings lose edits",
+		});
+		expect(SHARPEN_SYSTEM_PROMPT).not.toBe(REFRAME_SYSTEM_PROMPT);
+	});
+
+	test("EM3: only a whole leading word selects a mode", () => {
+		for (const text of [
+			"/sharpener the saw",
+			"please /sharpen this",
+			"/sharpen-x foo",
+			"/Sharpen foo",
+		]) {
+			const req = buildEnhanceRequest(text);
+			expect(req.mode).toBe("enhance");
+			expect(req.body).toBe(text);
+		}
+		expect(buildEnhanceRequest("/sharpen").body).toBe("");
+		expect(buildEnhanceRequest("/reframe   ").body).toBe("");
+	});
+
+	test("EM4: /sharpen sends the sharpen prompt with the prefix stripped, toggles back to the prefixed original", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Write the v2 config migration guide from the real v1/v2 schemas." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("/sharpen write a migration guide");
+		fake.inputHandler!(ENHANCE_KEY);
+		expect(fake.widgetContent?.[0] ?? "").toContain("sharpening");
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(1);
+		const call = fake.calls.complete[0]!;
+		expect(String(call.systemPrompt)).toBe(SHARPEN_SYSTEM_PROMPT);
+		expect(JSON.stringify(call.messages)).toContain("write a migration guide");
+		expect(JSON.stringify(call.messages)).not.toContain("/sharpen");
+		expect(fake.editorText).toBe(
+			"Write the v2 config migration guide from the real v1/v2 schemas.",
+		);
+		expect(fake.widgetContent?.[0] ?? "").toContain("sharpened");
+		fake.inputHandler!(ENHANCE_KEY);
+		expect(fake.editorText).toBe("/sharpen write a migration guide");
+		expect(fake.widgetContent?.[0] ?? "").toContain("re-sharpen");
+		expect(fake.calls.complete).toHaveLength(1);
+	});
+
+	test("EM5: /reframe sends the reframe prompt and Esc restores the prefixed original", async () => {
+		const { fake } = await setup({
+			completeResult: {
+				content: [{ type: "text", text: "Fix lost edits from mixed autosave and submit-on-save (optimistic UI)." }],
+				stopReason: "stop",
+			},
+		});
+		fake.setEditorText("/reframe settings page loses edits");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		const call = fake.calls.complete[0]!;
+		expect(String(call.systemPrompt)).toBe(REFRAME_SYSTEM_PROMPT);
+		expect(JSON.stringify(call.messages)).toContain("settings page loses edits");
+		expect(fake.widgetContent?.[0] ?? "").toContain("reframed");
+		fake.inputHandler!("\x1b");
+		expect(fake.editorText).toBe("/reframe settings page loses edits");
+	});
+
+	test("EM6: a bare /sharpen makes no model call and says what to type", async () => {
+		const { fake } = await setup({});
+		fake.setEditorText("/sharpen");
+		expect(fake.inputHandler!(ENHANCE_KEY)).toEqual({ consume: true });
+		await sleep(20);
+		expect(fake.calls.complete).toHaveLength(0);
+		expect(fake.editorText).toBe("/sharpen");
+		expect(fake.calls.notifies.some(([m]) => m.includes("after /sharpen"))).toBe(true);
 	});
 });
 

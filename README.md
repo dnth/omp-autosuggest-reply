@@ -113,6 +113,31 @@ current text and drops the revert.
   rewrite.
 - Disable with `"enhanceEnabled": false`.
 
+### Sharpen and reframe modes
+
+Start the prompt with `/sharpen` or `/reframe`, then press **Ctrl+Up**. The prefix
+picks the mode; with no prefix you get the default clarity rewrite above, unchanged.
+The prefix is not sent to the model, and Ctrl+Up / **Esc** restore your original
+text, prefix included.
+
+| Prefix | Use it when | Result |
+|---|---|---|
+| *(none)* | the request is clear but sloppy | same meaning, cleaner wording |
+| `/sharpen <prompt>` | you know what you want and want a better prompt | same goal, deeper: what a top professional would also do, the raw material they would start from, their methods and tools, and an outside check that the result is right. Asks the agent to prototype what an experiment can settle and leaves preference calls to you |
+| `/reframe <description>` | you can't name what you're after | the description rewritten in expert terms: it names the problem, ranks the terms that would change what gets built, borrows terms from neighboring fields, and flags another plausible reading |
+
+```text
+/sharpen write a migration guide for the v2 config format
+/reframe the settings page saves some fields right away and others only on submit, and people lose edits
+```
+
+A prefix with nothing after it makes no model call. `enhanceSystemPrompt` overrides
+the default mode only. The two prompts are adapted from
+[pstack](https://github.com/backnotprop/pstack)'s `/sharpen` and `/reframe` skills
+(MIT, © 2026 Lauren Tan). pstack runs them inside an agent that can read your files
+and the web; here the model sees only the typed text, so `/reframe` cites no links
+and does not read your code.
+
 ## Install
 
 Pi and OMP auto-discover extensions from standard locations. Install this fork
@@ -256,7 +281,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply configure`). Overrides the enhance instruction; see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
+| `enhanceSystemPrompt` | built-in | Config-file only (not prompted by `/autosuggest-reply configure`). Overrides the instruction for the default enhance mode (not `/sharpen` or `/reframe`); see `ENHANCE_SYSTEM_PROMPT` in `next-prompt.ts`. |
 
 ### Why `enter` is the default accept key
 
