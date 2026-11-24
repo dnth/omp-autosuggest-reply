@@ -5169,7 +5169,7 @@ const textReply = (text: string) => ({
 });
 
 describe("enhance key handling (onTerminalInput)", () => {
-	test("EN9: classification uses no reasoning and the rewrite uses the configured level", async () => {
+	test("EN9: classification uses minimal reasoning and the rewrite uses the configured level", async () => {
 		writeFile(
 			process.env.PI_CODING_AGENT_DIR!,
 			"next-prompt.json",
@@ -5183,11 +5183,10 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(result).toEqual({ consume: true });
 		await sleep(30);
 		expect(fake.calls.complete).toHaveLength(2);
-		// Call 1 routes the draft (cheap, no reasoning); call 2 rewrites it.
 		expect(String(fake.calls.complete[0]!.systemPrompt)).toContain(
 			"route a draft prompt",
 		);
-		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
+		expect(fake.calls.complete[0]!.reasoning).toBe("minimal");
 		expect(fake.editorText).toBe("Fix the parser bug.");
 		// Only the typed text is sent (no transcript); enhance system prompt used.
 		const call = fake.calls.complete[1]!;
@@ -5315,7 +5314,7 @@ describe("enhance key handling (onTerminalInput)", () => {
 		});
 		fake.setEditorText("original text");
 		fake.inputHandler!(ENHANCE_KEY); // start async enhance
-		fake.inputHandler!("x"); // user edits: bumps generation + aborts enhance
+		fake.inputHandler!("x");
 		fake.setEditorText("edited text");
 		await sleep(30);
 		expect(fake.editorText).toBe("edited text");
@@ -5344,6 +5343,11 @@ describe("enhance key handling (onTerminalInput)", () => {
 	});
 
 	test("EN17-omp: same press/release on the OMP fixture still completes", async () => {
+		writeFile(
+			process.env.PI_CODING_AGENT_DIR!,
+			"next-prompt.json",
+			JSON.stringify({ thinking: "high" }),
+		);
 		const { fake } = await setupOmp({
 			completeSimpleResults: [
 				textReply("enhance"),
@@ -5355,8 +5359,11 @@ describe("enhance key handling (onTerminalInput)", () => {
 		const release = "\x1b[1;5:3A";
 		expect(fake.inputHandler!(press)).toEqual({ consume: true });
 		expect(fake.inputHandler!(release)).toBeUndefined();
+		expect(fake.inputHandler!("\x1b[D")).toBeUndefined();
 		await sleep(30);
 		expect(fake.calls.ompComplete).toHaveLength(2);
+		expect(fake.calls.ompComplete[0]!.reasoning).toBe("minimal");
+		expect(fake.calls.ompComplete[1]!.reasoning).toBe("high");
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 });
@@ -5568,6 +5575,12 @@ describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
 				expect(fake.editorText).toBe(`Result: ${hints[index]}`);
 				expect(fake.widgetContent?.[0]).toContain(`↑ ${hints[index]}`);
 				expect(fake.widgetContent?.[0]).toContain(index === 2 ? "to restore original" : "next mode");
+				fake.editor.setText(fake.editorText);
+				for (const key of ["\x1b[D", "\x1b[C", "\x1b[H", "\x1b[F", "\x1b[A", "\x1b[B"]) {
+					fake.deliverInput(key);
+				}
+				await Promise.resolve();
+				expect(fake.widgetContent?.[0]).toContain(`↑ ${hints[index]}`);
 			}
 			expect(fake.calls.complete[0]!.messages).toEqual([outboundDraft]);
 			expect(fake.calls.complete[0]!.systemPrompt).toContain("route a draft prompt");
@@ -5660,6 +5673,9 @@ describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
 		await sleep(30);
 		expect(fake.editorText).toBe(original);
 		expect(fake.calls.notifies).toContainEqual(["next-prompt: prompt already clear", "info"]);
+		expect(fake.widgetContent?.[0]).toContain("↑ enhance: nothing to change");
+		expect(fake.widgetContent?.[0]).toContain("Ctrl-Up next mode");
+		expect(fake.inputHandler!("\x1b[D")).toBeUndefined();
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
 		expect(fake.editorText).toBe("REFRAMED");
@@ -5687,7 +5703,7 @@ describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
 		expect(fake.calls.notifies).toContainEqual(["next-prompt: prompt already clear", "info"]);
 	});
 
-	test("AM8: terminal edits discard a hidden cycle and classify the current draft", async () => {
+	test("AM8: terminal edits discard an unchanged cycle and classify the current draft", async () => {
 		const { fake } = await setup({
 			completeResults: [
 				textReply("sharpen"),
@@ -5701,7 +5717,7 @@ describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
 		fake.setEditorText(draft);
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
-		expect(fake.widgetContent).toBeUndefined();
+		expect(fake.widgetContent?.[0]).toContain("↑ sharpen: nothing to change");
 
 		fake.inputHandler!("!");
 		fake.setEditorText(`${draft}!`);
@@ -5717,6 +5733,8 @@ describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
 
 		fake.inputHandler!("s");
 		fake.setEditorText("fix signup instead");
+		await Promise.resolve();
+		expect(fake.widgetContent).toBeUndefined();
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
 		expect(fake.calls.complete[4]!.messages).toEqual([

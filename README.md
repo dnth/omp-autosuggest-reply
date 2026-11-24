@@ -109,11 +109,13 @@ mode, for example `↑ sharpened  (auto · Ctrl-Up next mode · Esc to revert)`.
 
 How the mode is picked:
 
-- One small model call classifies the draft first (same model as the rewrite, no
-  reasoning, 8 second timeout). It sees only the draft, never the transcript. When
-  unsure it picks the lighter touch (`enhance` over `sharpen` over `reframe`).
-- If that call fails, times out, or names no mode, the mode falls back to `enhance`
-  (polish only, never changes intent) and a notice says so.
+- One small model call classifies the draft first (same model as the rewrite,
+  minimum reasoning effort, 8-second timeout). It sees only the draft, never
+  the transcript. When unsure it picks the lighter touch (`enhance` over
+  `sharpen` over `reframe`).
+- If that call fails, times out, or names no mode, a notice appears and the
+  rewrite uses the built-in `enhance` prompt for polish only, even when
+  `enhanceSystemPrompt` is configured.
 - The classifier changes nothing in the editor; only the rewrite does, and Esc
   restores your original.
 
@@ -303,7 +305,7 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
 | `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text and, on repeat presses, cycles the auto-picked mode. Esc reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only. Overrides `ENHANCE_SYSTEM_PROMPT` for the `enhance` mode (auto-picked or `/enhance`). `sharpen`, `reframe`, and the mode classifier use their own instructions. |
+| `enhanceSystemPrompt` | built-in | Config-file only. Overrides `ENHANCE_SYSTEM_PROMPT` for `enhance` when picked by the classifier, reached by cycling, or selected with `/enhance`. The classification-failure fallback uses built-in polish. `sharpen`, `reframe`, and the classifier use their own instructions. |
 
 ### Why `enter` is the default accept key
 

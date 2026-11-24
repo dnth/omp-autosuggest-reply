@@ -1731,6 +1731,7 @@ export type EnhanceHintKind =
 	| "classifying"
 	| "enhancing"
 	| "enhanced"
+	| "unchanged"
 	| "original";
 
 /**
@@ -1759,10 +1760,8 @@ export interface EnhanceRuntime {
 	/** The rewrite currently on offer (cached so toggling never re-calls the model). */
 	enhanced?: string;
 	showing: "none" | "enhanced" | "original";
-	/** Mode of `enhanced`, so hints name it. */
+	/** Mode of the completed result, so hints name it. */
 	mode?: EnhanceMode;
-	/** True when the mode was picked automatically: repeat presses cycle `order`. */
-	auto?: boolean;
 	/** Cycle order for an automatic pick, starting at the pick. */
 	order?: EnhanceMode[];
 	/** Rewrite per mode; null means that mode found nothing to change. */
@@ -1789,7 +1788,6 @@ export interface EnhanceController {
 	showHint: (
 		kind: EnhanceHintKind | undefined,
 		mode?: EnhanceMode,
-		auto?: boolean,
 	) => void;
 	/** Abort an in-flight rewrite. */
 	abort: () => void;
@@ -1799,7 +1797,6 @@ export function resetEnhanceRuntime(rt: EnhanceRuntime): void {
 	rt.original = undefined;
 	rt.enhanced = undefined;
 	rt.mode = undefined;
-	rt.auto = undefined;
 	rt.order = undefined;
 	rt.results = undefined;
 	rt.cursor = undefined;
@@ -1834,7 +1831,7 @@ function stepAutoCycle(
 			state.setEditorText(original);
 			rt.showing = "original";
 			rt.cursor = order.length;
-			enhance.showHint("original", rt.mode, true);
+			enhance.showHint("original", rt.mode);
 			return;
 		}
 		i = nextAutoCycleIndex(rt, 0);
@@ -1848,7 +1845,7 @@ function stepAutoCycle(
 		rt.mode = mode;
 		rt.cursor = i;
 		rt.showing = "enhanced";
-		enhance.showHint("enhanced", mode, true);
+		enhance.showHint("enhanced", mode);
 		return;
 	}
 	enhance.trigger(original, { mode, editorText: text });
@@ -1868,7 +1865,6 @@ export function handleEnhanceKey(
 	if (rt.pending) return;
 	const text = state.getEditorText();
 	if (
-		rt.auto &&
 		rt.order &&
 		rt.results &&
 		rt.original !== undefined &&
@@ -1937,6 +1933,16 @@ function makeInputHandler(
 	enhance?: EnhanceController,
 	recordGlobalInput = true,
 ): (data: string) => { consume?: boolean } | undefined {
+	const checkEnhanceEdit = () => {
+		if (!enhance) return;
+		const rt = enhance.runtime;
+		if (rt.showing === "none" && !rt.pending && !rt.order) return;
+		const displayed = rt.showing === "enhanced" ? rt.enhanced : rt.original;
+		if (state.getEditorText() === displayed) return;
+		enhance.abort();
+		resetEnhanceRuntime(rt);
+		enhance.showHint(undefined);
+	};
 	return (data: string) => {
 		const markGlobalInput = () => {
 			if (!recordGlobalInput) return;
@@ -1946,6 +1952,8 @@ function makeInputHandler(
 
 		// Kitty protocol sends press then release. Release is not a real edit.
 		if (isKittyKeyRelease(data)) return undefined;
+
+		checkEnhanceEdit();
 
 		// Enhance: rewrite the current (non-empty) editor text in place. Placed
 		// before the empty-editor accept/carousel branches so it is never
@@ -1960,9 +1968,11 @@ function makeInputHandler(
 				handleEnhanceKey(state, enhance);
 				return { consume: true };
 			}
-			if (data === "\x1b" && enhance.runtime.showing !== "none") {
-				revertEnhance(state, enhance);
-				return { consume: true };
+			if (data === "\x1b") {
+				const rt = enhance.runtime;
+				const hasResult = rt.showing !== "none" || rt.order !== undefined;
+				if (hasResult || rt.pending) revertEnhance(state, enhance);
+				if (hasResult) return { consume: true };
 			}
 		}
 
@@ -2021,18 +2031,7 @@ function makeInputHandler(
 			return { consume: true };
 		}
 
-		// A real edit (or any other key) commits/aborts a pending or shown
-		// enhancement: drop the cached original/enhanced and clear the hint.
-		if (
-			enhance &&
-			(enhance.runtime.showing !== "none" ||
-				enhance.runtime.pending ||
-				enhance.runtime.auto)
-		) {
-			enhance.abort();
-			resetEnhanceRuntime(enhance.runtime);
-			enhance.showHint(undefined);
-		}
+		if (enhance?.runtime.original !== undefined) queueMicrotask(checkEnhanceEdit);
 
 		// Non-accept key: dismiss any active suggestion, abort in-flight work,
 		// and pass the key through to the editor. A delete key arriving on an
@@ -2544,7 +2543,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		const showEnhanceHint = (
 			kind: EnhanceHintKind | undefined,
 			mode: EnhanceMode = "enhance",
-			auto = false,
 		) => {
 			if (kind === undefined) {
 				publishWidget(undefined);
@@ -2560,21 +2558,24 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			if (kind === "classifying") line = `${DIM}↑ choosing mode…${RESET}`;
 			else if (kind === "enhancing")
 				line = `${DIM}↑ ${verb[0]} prompt…${RESET}`;
-			else if (kind === "enhanced") {
-				let action = key;
-				if (auto && enhanceRuntime.order) {
-					const next = nextAutoCycleIndex(
+			else if (kind === "enhanced" || kind === "unchanged") {
+				const order = enhanceRuntime.order;
+				const hasNext =
+					order && nextAutoCycleIndex(
 						enhanceRuntime,
 						(enhanceRuntime.cursor ?? -1) + 1,
-					);
-					const label = next < enhanceRuntime.order.length
-						? "next mode"
-						: "to restore original";
-					action = `auto · ${key} ${label}`;
+					) < order.length;
+				if (kind === "unchanged") {
+					const nextHint = hasNext ? `  (${key} next mode)` : "";
+					line = `${ACCENT}↑ ${mode}: nothing to change${RESET}${DIM}${nextHint}${RESET}`;
+				} else {
+					const action = order
+						? `auto · ${key} ${hasNext ? "next mode" : "to restore original"}`
+						: key;
+					line = `${ACCENT}↑ ${verb[1]}${RESET}${DIM}  (${action} · Esc to revert)${RESET}`;
 				}
-				line = `${ACCENT}↑ ${verb[1]}${RESET}${DIM}  (${action} · Esc to revert)${RESET}`;
 			} else
-				line = `${ACCENT}↑ original${RESET}${DIM}  (${key} to ${auto ? "cycle modes again" : verb[2]})${RESET}`;
+				line = `${ACCENT}↑ original${RESET}${DIM}  (${key} to ${enhanceRuntime.order ? "cycle modes again" : verb[2]})${RESET}`;
 			publishWidget([line]);
 		};
 		const enhance: EnhanceController = {
@@ -2991,14 +2992,15 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.enhanceInflight = undefined;
 		const rt = enhance.runtime;
 		rt.pending = false;
-		if (rt.showing === "none") enhance.showHint(undefined);
-		else enhance.showHint(rt.showing, rt.mode, rt.auto);
+		if (rt.showing !== "none") enhance.showHint(rt.showing, rt.mode);
+		else if (rt.order) enhance.showHint("unchanged", rt.mode);
+		else enhance.showHint(undefined);
 	}
 
 	const CLASSIFY_TIMEOUT_MS = 8_000;
 
 	/**
-	 * One cheap call that picks the rewrite mode for a redacted draft. No
+	 * One cheap call that picks the rewrite mode for a redacted draft. Minimal
 	 * reasoning, short timeout. Undefined (never an error) when the call fails,
 	 * times out, or names no mode, so the caller falls back to polish-only.
 	 */
@@ -3029,7 +3031,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 							host === "omp" ? [CLASSIFY_SYSTEM_PROMPT] : CLASSIFY_SYSTEM_PROMPT,
 						messages: buildMessages(body),
 					} as unknown as Context,
-					{ signal: cac.signal },
+					{ signal: cac.signal, reasoning: "minimal" },
 					canDispatch,
 				),
 			]);
@@ -3051,8 +3053,8 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 	/**
 	 * Rewrite a draft and replace the editor text in place. With no `/mode`
 	 * prefix the mode is picked by classifyDraft (fallback: enhance); `step`
-	 * forces a mode when cycling. Apply a reply only while the input generation
-	 * and the editor text (`step.editorText`, else the draft) still match.
+	 * forces a mode when cycling. Apply a reply only while the request still
+	 * owns the editor and its text (`step.editorText`, else the draft) matches.
 	 */
 	async function maybeEnhance(
 		ctx: HostCtx,
@@ -3085,12 +3087,10 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		ref.enhanceInflight?.abort();
 		const ac = new AbortController();
 		ref.enhanceInflight = ac;
-		const generation = state.inputGeneration;
 		const stale = () =>
 			ac.signal.aborted ||
 			ref.enhanceInflight !== ac ||
-			ref.state !== state ||
-			generation !== state.inputGeneration;
+			ref.state !== state;
 
 		const resolved = resolveSuggestionModel(ctx, config, notifiedFallback);
 		if (!resolved.model) {
@@ -3139,7 +3139,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 				mode,
 			);
 		}
-		enhance.showHint("enhancing", mode, auto);
+		enhance.showHint("enhancing", mode);
 		if (stale()) {
 			finishEnhance(enhance, ac);
 			return;
@@ -3170,7 +3170,7 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 		} catch (err) {
 			if (!ac.signal.aborted)
 				ctx.ui.notify("next-prompt: enhance failed", "error");
-			else if (timedOut && generation === state.inputGeneration)
+			else if (timedOut && ref.enhanceInflight === ac)
 				ctx.ui.notify("next-prompt: enhance timed out", "warning");
 			finishEnhance(enhance, ac);
 			return;
@@ -3223,7 +3223,6 @@ export default function nextPromptExtension(pi: ExtensionAPI): void {
 			// Remember the pick so the next press cycles instead of re-classifying,
 			// even when this mode found nothing to change.
 			if (step === undefined) {
-				rt.auto = true;
 				rt.order = enhanceCycleFrom(mode);
 				rt.results = {};
 				rt.cursor = 0;
