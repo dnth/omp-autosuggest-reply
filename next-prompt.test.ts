@@ -31,6 +31,8 @@ import type { Api, AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	buildMessages,
 	buildTranscript,
+	enhanceCycleFrom,
+	parseEnhanceMode,
 	buildEnhanceRequest,
 	configureInteractively,
 	DEFAULT_ACCEPT_KEY,
@@ -1905,6 +1907,8 @@ function makeFake(opts: {
 		stopReason: string;
 	}>;
 	completeError?: Error;
+	/** Throw on the Nth `complete` call (0-based) only. */
+	completeErrorAt?: number;
 	model?: { provider: string; id: string; baseUrl?: string };
 	findModel?: (p: string, m: string) => unknown;
 	mode?: string;
@@ -2038,6 +2042,8 @@ function makeFake(opts: {
 					reasoning: options?.reasoning,
 				});
 				if (opts.completeError) throw opts.completeError;
+				if (opts.completeErrorAt === calls.complete.length - 1)
+					throw new Error("classifier boom");
 				const queued = opts.completeResults?.[calls.complete.length - 1];
 				return (
 					queued ??
@@ -2250,6 +2256,11 @@ function makeOmpFake(opts: {
 		content: Array<{ type: "text"; text: string }>;
 		stopReason: string;
 	};
+	/** Per-call replies for `completeSimple`, indexed by call order. */
+	completeSimpleResults?: Array<{
+		content: Array<{ type: "text"; text: string }>;
+		stopReason: string;
+	}>;
 	completeSimpleError?: Error;
 	/** The loaded module lacks `completeSimple` entirely (C9). */
 	completeSimpleUnavailable?: boolean;
@@ -2375,7 +2386,8 @@ function makeOmpFake(opts: {
 					});
 					if (opts.completeSimpleError) throw opts.completeSimpleError;
 					return (
-						(opts.completeSimpleResult ?? {
+						(opts.completeSimpleResults?.[calls.ompComplete.length - 1] ??
+							opts.completeSimpleResult ?? {
 							content: [{ type: "text" as const, text: "suggestion" }],
 							stopReason: "stop",
 						}) as unknown as AssistantMessage
@@ -4468,10 +4480,10 @@ describe("host compatibility boundary", () => {
 
 	test("B8b: OMP /new reinstalls prompt enhancement on session_switch", async () => {
 		const { fake } = await setupOmp({
-			completeSimpleResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeSimpleResults: [
+				textReply("enhance"),
+				textReply("Fix the parser bug."),
+			],
 		});
 		// OMP's /new flow clears extension terminal listeners before AgentSession
 		// emits session_switch with reason "new".
@@ -4489,7 +4501,7 @@ describe("host compatibility boundary", () => {
 		fake.setEditorText("fix teh parser bug");
 		fake.deliverInput("\x1b[1;5A");
 		await sleep(30);
-		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.calls.ompComplete).toHaveLength(2);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 
@@ -5156,22 +5168,29 @@ describe("enhance config parsing", () => {
 
 const ENHANCE_KEY = "\x1b[1;5A"; // ctrl+up default (xterm modified-arrow form)
 
+const textReply = (text: string) => ({
+	content: [{ type: "text" as const, text }],
+	stopReason: "stop",
+});
+
 describe("enhance key handling (onTerminalInput)", () => {
 	test("EN9: enhance rewrites the editor in place with one model call", async () => {
 		const { fake } = await setup({
-			completeResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeResults: [textReply("enhance"), textReply("Fix the parser bug.")],
 		});
 		fake.setEditorText("fix teh parser bug");
 		const result = fake.inputHandler!(ENHANCE_KEY);
 		expect(result).toEqual({ consume: true });
 		await sleep(30);
-		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
+		// Call 1 routes the draft (cheap, no reasoning); call 2 rewrites it.
+		expect(String(fake.calls.complete[0]!.systemPrompt)).toContain(
+			"route a draft prompt",
+		);
+		expect(fake.calls.complete[0]!.reasoning).toBeUndefined();
 		expect(fake.editorText).toBe("Fix the parser bug.");
 		// Only the typed text is sent (no transcript); enhance system prompt used.
-		const call = fake.calls.complete[0]!;
+		const call = fake.calls.complete[1]!;
 		expect(String(call.systemPrompt)).toContain("rewrite a single instruction");
 		expect(JSON.stringify(call.messages)).toContain("fix teh parser bug");
 	});
@@ -5192,33 +5211,28 @@ describe("enhance key handling (onTerminalInput)", () => {
 				provider === "anthropic" && model === "haiku"
 					? configured
 					: undefined,
-			completeResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeResults: [textReply("enhance"), textReply("Fix the parser bug.")],
 		});
 		fake.setEditorText("fix teh parser bug");
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
 		expect(fake.calls.selects).toHaveLength(0);
 		expect(fake.calls.confirms).toHaveLength(0);
-		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
 		expect(fake.calls.complete[0]!.model).toBe(configured);
+		expect(fake.calls.complete[1]!.model).toBe(configured);
 	});
 
-	test("EN10: same key toggles to original and re-applies (no new call)", async () => {
+	test("EN10: an explicit /enhance draft toggles to the original and re-applies (no new call)", async () => {
 		const { fake } = await setup({
-			completeResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeResult: textReply("Fix the parser bug."),
 		});
-		fake.setEditorText("fix teh parser bug");
+		fake.setEditorText("/enhance fix teh parser bug");
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 		fake.inputHandler!(ENHANCE_KEY);
-		expect(fake.editorText).toBe("fix teh parser bug");
+		expect(fake.editorText).toBe("/enhance fix teh parser bug");
 		fake.inputHandler!(ENHANCE_KEY);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 		expect(fake.calls.complete).toHaveLength(1);
@@ -5250,17 +5264,14 @@ describe("enhance key handling (onTerminalInput)", () => {
 
 	test("EN13: active agent does not block enhancement", async () => {
 		const { fake } = await setup({
-			completeResult: {
-				content: [{ type: "text", text: "Do the thing." }],
-				stopReason: "stop",
-			},
+			completeResults: [textReply("enhance"), textReply("Do the thing.")],
 		});
 		fake.setIdle(false);
 		fake.setEditorText("do the thing");
 		const result = fake.inputHandler!(ENHANCE_KEY);
 		expect(result).toEqual({ consume: true });
 		await sleep(30);
-		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
 		expect(fake.editorText).toBe("Do the thing.");
 	});
 
@@ -5311,10 +5322,7 @@ describe("enhance key handling (onTerminalInput)", () => {
 
 	test("EN17: kitty Ctrl+Up release after press does not abort enhance", async () => {
 		const { fake } = await setup({
-			completeResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeResults: [textReply("enhance"), textReply("Fix the parser bug.")],
 		});
 		fake.setEditorText("fix teh parser bug");
 		const press = "\x1b[1;5:1A"; // kitty Ctrl+Up press
@@ -5330,16 +5338,16 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(fake.inputHandler!(press)).toEqual({ consume: true });
 		expect(fake.inputHandler!(release)).toBeUndefined();
 		await sleep(30);
-		expect(fake.calls.complete).toHaveLength(1);
+		expect(fake.calls.complete).toHaveLength(2);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 
 	test("EN17-omp: same press/release on the OMP fixture still completes", async () => {
 		const { fake } = await setupOmp({
-			completeSimpleResult: {
-				content: [{ type: "text", text: "Fix the parser bug." }],
-				stopReason: "stop",
-			},
+			completeSimpleResults: [
+				textReply("enhance"),
+				textReply("Fix the parser bug."),
+			],
 		});
 		fake.setEditorText("fix teh parser bug");
 		const press = "\x1b[1;5:1A";
@@ -5347,7 +5355,7 @@ describe("enhance key handling (onTerminalInput)", () => {
 		expect(fake.inputHandler!(press)).toEqual({ consume: true });
 		expect(fake.inputHandler!(release)).toBeUndefined();
 		await sleep(30);
-		expect(fake.calls.ompComplete).toHaveLength(1);
+		expect(fake.calls.ompComplete).toHaveLength(2);
 		expect(fake.editorText).toBe("Fix the parser bug.");
 	});
 });
@@ -5483,7 +5491,8 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		const { fake } = await setup({
 			completeResults: [
 				{ content: [{ type: "text", text: `${body}\n` }], stopReason: "stop" },
-				{ content: [{ type: "text", text: "NONE" }], stopReason: "stop" },
+				textReply("sharpen"),
+				textReply("NONE"),
 			],
 		});
 		fake.setEditorText(`/sharpen\n${body}`);
@@ -5496,7 +5505,7 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 		]);
 		fake.inputHandler!(ENHANCE_KEY);
 		await sleep(30);
-		expect(fake.calls.complete).toHaveLength(2);
+		expect(fake.calls.complete).toHaveLength(3);
 		expect(fake.editorText).toBe(body);
 	});
 
@@ -5522,6 +5531,163 @@ describe("enhance modes (/sharpen, /reframe prefix)", () => {
 			]);
 		});
 	}
+});
+
+describe("enhance auto mode (Ctrl+Up picks the mode)", () => {
+	test("AM1: parseEnhanceMode reads the first word, not prose", () => {
+		expect(parseEnhanceMode("reframe")).toBe("reframe");
+		expect(parseEnhanceMode("  Sharpen.\n")).toBe("sharpen");
+		expect(parseEnhanceMode("ENHANCE")).toBe("enhance");
+		expect(parseEnhanceMode("I would sharpen this")).toBeUndefined();
+		expect(parseEnhanceMode("")).toBeUndefined();
+	});
+
+	test("AM2: the cycle starts at the pick and walks reframe > sharpen > enhance", () => {
+		expect(enhanceCycleFrom("reframe")).toEqual(["reframe", "sharpen", "enhance"]);
+		expect(enhanceCycleFrom("sharpen")).toEqual(["sharpen", "enhance", "reframe"]);
+		expect(enhanceCycleFrom("enhance")).toEqual(["enhance", "reframe", "sharpen"]);
+	});
+
+	for (const [pick, hint, contract] of [
+		["reframe", "reframed", "expert words"],
+		["sharpen", "sharpened", "top professional"],
+		["enhance", "enhanced", "rewrite a single instruction"],
+	] as const) {
+		test(`AM3: classifier says ${pick} -> ${pick} prompt, hint names it`, async () => {
+			const { fake } = await setup({
+				completeResults: [textReply(pick), textReply("REWRITTEN")],
+			});
+			fake.setEditorText("fix login");
+			fake.inputHandler!(ENHANCE_KEY);
+			await sleep(30);
+			expect(fake.calls.complete).toHaveLength(2);
+			const [classify, rewrite] = fake.calls.complete;
+			// The classifier sees only the draft; the rewrite uses the picked mode's prompt.
+			expect(JSON.stringify(classify!.messages)).toContain("fix login");
+			expect(String(rewrite!.systemPrompt)).toContain(contract);
+			expect(JSON.stringify(rewrite!.messages)).toContain("fix login");
+			expect(fake.editorText).toBe("REWRITTEN");
+			expect(fake.widgetContent?.[0] ?? "").toContain(`↑ ${hint}`);
+		});
+	}
+
+	test("AM4: an unparseable or failed classification falls back to polish-only and says so", async () => {
+		for (const opts of [
+			{ completeResults: [textReply("banana"), textReply("Fix login.")] },
+			{
+				completeErrorAt: 0,
+				completeResults: [textReply("x"), textReply("Fix login.")],
+			},
+		]) {
+			const { fake } = await setup(opts);
+			fake.setEditorText("fix login");
+			fake.inputHandler!(ENHANCE_KEY);
+			await sleep(30);
+			expect(String(fake.calls.complete[1]!.systemPrompt)).toContain(
+				"rewrite a single instruction",
+			);
+			expect(fake.editorText).toBe("Fix login.");
+			expect(
+				fake.calls.notifies.some(([m]) => m.includes("could not pick a mode")),
+			).toBe(true);
+		}
+	});
+
+	test("AM5: repeat presses cycle the modes on the original draft, then restore it, then replay from cache", async () => {
+		const { fake } = await setup({
+			completeResults: [
+				textReply("sharpen"),
+				textReply("SHARPENED"),
+				textReply("POLISHED"),
+				textReply("REFRAMED"),
+			],
+		});
+		fake.setEditorText("fix login");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("SHARPENED");
+
+		fake.inputHandler!(ENHANCE_KEY); // next: enhance, rewritten from the original
+		await sleep(30);
+		expect(fake.editorText).toBe("POLISHED");
+		expect(String(fake.calls.complete[2]!.systemPrompt)).toContain(
+			"rewrite a single instruction",
+		);
+		const sent = JSON.stringify(fake.calls.complete[2]!.messages);
+		expect(sent).toContain("fix login");
+		expect(sent).not.toContain("SHARPENED");
+		expect(fake.widgetContent?.[0] ?? "").toContain("↑ enhanced");
+
+		fake.inputHandler!(ENHANCE_KEY); // next: reframe
+		await sleep(30);
+		expect(fake.editorText).toBe("REFRAMED");
+
+		fake.inputHandler!(ENHANCE_KEY); // cycle done: the user's own text
+		expect(fake.editorText).toBe("fix login");
+		expect(fake.widgetContent?.[0] ?? "").toContain("↑ original");
+
+		fake.inputHandler!(ENHANCE_KEY); // start over from the cache
+		expect(fake.editorText).toBe("SHARPENED");
+		expect(fake.calls.complete).toHaveLength(4);
+	});
+
+	test("AM6: a pick that finds nothing to change still lets the next press move on", async () => {
+		const { fake } = await setup({
+			completeResults: [
+				textReply("enhance"),
+				textReply("fix login"),
+				textReply("REFRAMED"),
+			],
+		});
+		fake.setEditorText("fix login");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("fix login");
+		expect(
+			fake.calls.notifies.some(([m]) => m.includes("already clear")),
+		).toBe(true);
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.editorText).toBe("REFRAMED");
+		expect(String(fake.calls.complete[2]!.systemPrompt)).toContain(
+			"expert words",
+		);
+		expect(fake.calls.complete).toHaveLength(3);
+	});
+
+	test("AM7: /enhance is an explicit override: no classification, default prompt, prefix stripped", async () => {
+		const { fake } = await setup({ completeResult: textReply("Fix login.") });
+		fake.setEditorText("/enhance fix login");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(1);
+		expect(String(fake.calls.complete[0]!.systemPrompt)).toContain(
+			"rewrite a single instruction",
+		);
+		expect(JSON.stringify(fake.calls.complete[0]!.messages)).not.toContain(
+			"/enhance",
+		);
+		expect(fake.editorText).toBe("Fix login.");
+	});
+
+	test("AM8: editing the draft after a pick starts a fresh classification", async () => {
+		const { fake } = await setup({
+			completeResults: [
+				textReply("sharpen"),
+				textReply("SHARPENED"),
+				textReply("reframe"),
+				textReply("REFRAMED"),
+			],
+		});
+		fake.setEditorText("fix login");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		fake.setEditorText("fix signup instead");
+		fake.inputHandler!(ENHANCE_KEY);
+		await sleep(30);
+		expect(fake.calls.complete).toHaveLength(4);
+		expect(fake.editorText).toBe("REFRAMED");
+	});
 });
 
 describe("enhance key encoding under enhanced keyboard protocols", () => {

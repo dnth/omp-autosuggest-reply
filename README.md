@@ -66,7 +66,7 @@ agent starts.
 > computes on settle — press **Ctrl+Down** (configurable `suggestKey`) on an
 > empty editor or run `/autosuggest-reply suggest` to compute one batch on
 > demand. While it runs, the widget shows `↳ suggesting…` (mirroring the
-> enhance `↳ enhancing prompt…` hint). No background model calls otherwise.
+> enhance `↑ enhancing prompt…` hint). No background model calls otherwise.
 
 Each settled turn is one model call. The built-in prompt asks the model whether
 the latest agent message requires a user reply. It instructs the model to return
@@ -96,13 +96,35 @@ not such an echo and survives.
 
 ## Enhance prompt
 
-Type a prompt and press **Ctrl+Up** (configurable `enhanceKey`, default
-`ctrl+up`). By default, next-prompt rewrites it for clarity **without changing
-your intent or meaning**, focusing on grammar, ambiguity, and structure. A
-rewrite replaces the text in place. Press **Ctrl+Up** again or **Esc** to restore
-the original. After restoring with Ctrl+Up, press it once more to reapply the
-cached rewrite without another model call. Editing the box commits the current
-text and drops the revert.
+**Ctrl+Up is the only key you need** (configurable `enhanceKey`, default
+`ctrl+up`). Type a draft and press it. next-prompt reads the draft, picks a
+rewrite mode, and replaces the text in place. The line under the editor names the
+mode, for example `↑ sharpened  (auto · Ctrl-Up next mode · Esc to revert)`.
+
+| Mode | Picked when the draft is | Result |
+|---|---|---|
+| `reframe` | unclear, or aimed at the wrong problem | a rewritten description that names the problem in expert terms and adds a short clause for another plausible reading when the description is ambiguous |
+| `sharpen` | clear but loose: missing constraints, scope, or success criteria | same goal, deeper: what a top professional would also do, the raw material they would start from, their methods and tools, and an outside check that the result is right. Asks the agent to prototype what an experiment can settle and leaves preference calls to you |
+| `enhance` | already solid | same meaning, cleaner grammar, wording, and structure |
+
+How the mode is picked:
+
+- One small model call classifies the draft first (same model as the rewrite, no
+  reasoning, 8 second timeout). It sees only the draft, never the transcript. When
+  unsure it picks the lighter touch (`enhance` over `sharpen` over `reframe`).
+- If that call fails, times out, or names no mode, the mode falls back to `enhance`
+  (polish only, never changes intent) and a notice says so.
+- The classifier changes nothing in the editor; only the rewrite does, and Esc
+  restores your original.
+
+Press **Ctrl+Up** again on the same draft to cycle to the next mode. Each mode
+rewrites your original draft, not the previous rewrite. The order starts at the
+pick and follows reframe, sharpen, enhance, wrapping around (a pick of `sharpen`
+goes to `enhance`, then `reframe`). A mode that finds nothing to change is skipped.
+After the last mode the press restores your original, and the next press replays
+the cached rewrites without another model call. **Esc** restores the original at
+any point. Editing the box commits the current text and drops the revert; the next
+press classifies the edited draft.
 
 - Only the text you typed is sent — never the conversation transcript. Secrets
   are redacted first; since the original is always one keystroke away, redaction
@@ -114,29 +136,25 @@ text and drops the revert.
   rewrite.
 - Disable with `"enhanceEnabled": false`.
 
-### Sharpen and reframe modes
+### Override the mode
 
-At the very start of the editor text, type `/sharpen` or `/reframe` followed by
-a space or newline and your draft, then press **Ctrl+Up**. The enhancer strips
-the command and one separator before redacting and sending the draft. Reverting
-a cached rewrite restores the original with its prefix. If the model echoes
-just the draft body, the enhancer can remove the prefix without caching a
-rewrite.
-
-| Prefix | Use it when | Result |
-|---|---|---|
-| *(none)* | the request is clear but sloppy | same meaning, cleaner wording |
-| `/sharpen <prompt>` | you know what you want and want a better prompt | same goal, deeper: what a top professional would also do, the raw material they would start from, their methods and tools, and an outside check that the result is right. Asks the agent to prototype what an experiment can settle and leaves preference calls to you |
-| `/reframe <description>` | you can't name what you're after | a rewritten description that names the problem in expert terms and adds a short clause for another plausible reading when the description is ambiguous |
+To force a mode, start the editor text with `/enhance`, `/sharpen`, or `/reframe`
+followed by a space or newline and your draft, then press **Ctrl+Up**. No
+classification call is made, and the mode is not cycled: Ctrl+Up toggles between
+the rewrite and your original. The enhancer strips the command and one separator
+before redacting and sending the draft. Reverting restores the original with its
+prefix. If the model echoes just the draft body, the enhancer removes the prefix
+without caching a rewrite.
 
 ```text
 /sharpen write a migration guide for the v2 config format
 /reframe the settings page saves some fields right away and others only on submit, and people lose edits
+/enhance fix teh parser bug i think its in the tokenizer
 ```
 
 A prefix followed only by whitespace or nothing prompts you to add text and
 makes no model call. See the [config file settings](#config-file) for
-`enhanceSystemPrompt`. The two prompts are adapted from
+`enhanceSystemPrompt`. The `sharpen` and `reframe` prompts are adapted from
 [pstack](https://github.com/backnotprop/pstack)'s `/sharpen` and `/reframe` skills
 (MIT, © 2026 Lauren Tan). pstack runs them inside an agent that can read your files
 and the web; here the model sees only the typed text, so `/reframe` cites no links
@@ -284,8 +302,8 @@ comes from the host's `CONFIG_DIR_NAME`:
 | `maxSuggestionChars` | `120` | Cap on the returned suggestion length (visible width; a hard code-point bound of 4× this value also applies, so zero-width payloads cannot bypass the cap). |
 | `allowCrossProvider` | `false` | Global cross-destination opt-in. When `true`, the configured suggestion model may receive text even when its provider, endpoint, or model route differs from the active model; no per-project consent dialog appears. When `false`, the extension silently falls back to the active model. Project config can never loosen a global `false`. |
 | `enhanceEnabled` | `true` | Enables the enhance-prompt keybinding (rewrite the typed prompt in place). Fires on a non-empty editor even while the agent is active; sends only the typed text, never the transcript. Disabled automatically when a privacy-invalid config fails closed. |
-| `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text. Same key (or Esc) reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
-| `enhanceSystemPrompt` | built-in | Config-file only. Overrides `ENHANCE_SYSTEM_PROMPT` for the default clarity rewrite. Sharpen and reframe use their own instructions. |
+| `enhanceKey` | `"ctrl+up"` | Any pi-tui `KeyId` that enhances the current editor text and, on repeat presses, cycles the auto-picked mode. Esc reverts to the original; editing commits. Must differ from `acceptKey`; `"enter"`/`"tab"` are rejected. Prefer a non-shift key — a shift-bearing symbol like `alt+?` cannot match under terminals' enhanced keyboard protocols (xterm modifyOtherKeys / kitty). |
+| `enhanceSystemPrompt` | built-in | Config-file only. Overrides `ENHANCE_SYSTEM_PROMPT` for the `enhance` mode (auto-picked or `/enhance`). `sharpen`, `reframe`, and the mode classifier use their own instructions. |
 
 ### Why `enter` is the default accept key
 
@@ -399,10 +417,11 @@ to the configured default, then installs at most one listener and editor.
    re-arms the last suggestion after `rearmDelayMs` (no new model call).
    Dismissing via Escape/up/down never re-arms, and typing invalidates any
    in-flight suggestion request.
-5. The enhance key is intercepted the same way and uses the resolved model for
-   the selected [enhance mode](#enhance-prompt). A rewrite replaces the editor
-   text via `ctx.ui.setEditorText`. The input generation and original editor
-   text guard against stale replies.
+5. The enhance key is intercepted the same way. With no `/mode` prefix it makes one
+   small classification call, then rewrites with the resolved model in the picked
+   [enhance mode](#enhance-prompt). A rewrite replaces the editor text via
+   `ctx.ui.setEditorText`. The input generation and original editor text guard
+   against stale replies.
 
 ## Develop
 

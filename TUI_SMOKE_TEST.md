@@ -105,11 +105,14 @@ Run each sequence in `widget`, `ghost`, and `both`:
 
 ### Enhance prompt (default key `Ctrl+Up`)
 
-- [ ] Type a prompt, press Ctrl+Up: the box is replaced by a clearer rewrite with
-  the same meaning; a below-editor `↳ enhanced (Ctrl-Up · Esc to revert)` hint
-  shows; exactly one model call.
-- [ ] Press Ctrl+Up again → original text restored (`↳ original`); Ctrl+Up once
-  more → enhanced text restored; NO additional model call on either toggle.
+- [ ] Type a prompt, press Ctrl+Up: the hint reads `↑ choosing mode…`, then
+  `↑ <enhancing|sharpening|reframing> prompt…`; the box is replaced by a rewrite
+  and the hint reads `↑ <enhanced|sharpened|reframed>  (auto · Ctrl-Up next mode
+  · Esc to revert)`; two model calls (classify, rewrite).
+- [ ] Press Ctrl+Up again on the same draft → the next mode's rewrite of the
+  original (not of the previous rewrite); after the last mode → original text
+  restored (`↑ original`); once more → the first rewrite replayed from cache with
+  NO model call.
 - [ ] Press Esc while enhanced → original restored, hint cleared.
 - [ ] Edit the box after enhancing → the revert hint clears and Ctrl+Up starts a
   fresh rewrite of the edited text.
@@ -122,10 +125,10 @@ Run each sequence in `widget`, `ghost`, and `both`:
   separate dialog.
 - [ ] `"enhanceEnabled": false` disables the key (falls through to the editor);
   `"enhanceKey": "enter"`/`"tab"` is rejected with a warning.
-- [ ] Type `/sharpen <prompt>` or `/reframe <description>` and press Ctrl+Up: the
-  hint reads `↳ sharpening prompt…` / `↳ reframing prompt…` then `↳ sharpened` /
-  `↳ reframed`; the box holds a rewrite without the prefix; Ctrl+Up or Esc
-  restores the text with the prefix; a bare `/sharpen` makes no model call.
+- [ ] Type `/sharpen <prompt>`, `/reframe <description>`, or `/enhance <prompt>`
+  and press Ctrl+Up: no classification call; the hint names the mode; the box
+  holds a rewrite without the prefix; Ctrl+Up toggles the original (with the
+  prefix) and Esc restores it; a bare `/sharpen` makes no model call.
 
 ## OMP smoke cases
 
